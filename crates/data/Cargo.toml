@@ -10,3 +10,12 @@ categories = ["finance"]
 readme = false
 
 [dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "rust_decimal"] }
+arrow = "54.0"
+parquet = "54.0"
+polars = { version = "0.43", features = ["lazy", "parquet", "temporal"] }
+rust_decimal = "1.33"
+chrono = "0.4"
