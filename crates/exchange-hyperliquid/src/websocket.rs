@@ -9,13 +9,19 @@ pub struct HyperliquidWebSocket {
 }
 
 impl HyperliquidWebSocket {
-    pub fn new(ws_url: String) -> Self {
+    /// Creates a new Hyperliquid WebSocket client
+    #[must_use]
+    pub const fn new(ws_url: String) -> Self {
         Self {
             ws_url,
             stream: None,
         }
     }
 
+    /// Connects to the WebSocket server
+    ///
+    /// # Errors
+    /// Returns error if connection fails or server is unreachable
     pub async fn connect(&mut self) -> Result<()> {
         let (ws_stream, _) = connect_async(&self.ws_url)
             .await
@@ -25,6 +31,10 @@ impl HyperliquidWebSocket {
         Ok(())
     }
 
+    /// Subscribes to market data updates
+    ///
+    /// # Errors
+    /// Returns error if WebSocket is not connected or send fails
     pub async fn subscribe(&mut self, subscription: serde_json::Value) -> Result<()> {
         if let Some(stream) = &mut self.stream {
             let msg = Message::Text(subscription.to_string());
@@ -35,6 +45,10 @@ impl HyperliquidWebSocket {
         }
     }
 
+    /// Receives the next message from the WebSocket
+    ///
+    /// # Errors
+    /// Returns error if WebSocket is not connected or receive fails
     pub async fn next_message(&mut self) -> Result<Option<serde_json::Value>> {
         if let Some(stream) = &mut self.stream {
             if let Some(msg) = stream.next().await {

@@ -11,6 +11,11 @@ pub struct HyperliquidClient {
 }
 
 impl HyperliquidClient {
+    /// Creates a new Hyperliquid HTTP client
+    ///
+    /// # Panics
+    /// Panics if rate limiter quota cannot be created
+    #[must_use]
     pub fn new(base_url: String) -> Self {
         // 1200 requests per minute = 20 per second
         let quota = Quota::per_second(NonZeroU32::new(20).unwrap());
@@ -23,6 +28,10 @@ impl HyperliquidClient {
         }
     }
 
+    /// Sends a GET request to the specified endpoint
+    ///
+    /// # Errors
+    /// Returns error if HTTP request fails or response cannot be parsed as JSON
     pub async fn get(&self, endpoint: &str) -> Result<serde_json::Value> {
         self.rate_limiter.until_ready().await;
         let url = format!("{}{}", self.base_url, endpoint);
@@ -31,6 +40,10 @@ impl HyperliquidClient {
         Ok(json)
     }
 
+    /// Sends a POST request to the specified endpoint with JSON body
+    ///
+    /// # Errors
+    /// Returns error if HTTP request fails or response cannot be parsed as JSON
     pub async fn post(&self, endpoint: &str, body: serde_json::Value) -> Result<serde_json::Value> {
         self.rate_limiter.until_ready().await;
         let url = format!("{}{}", self.base_url, endpoint);

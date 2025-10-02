@@ -13,7 +13,9 @@ pub struct LiveExecutionHandler {
 }
 
 impl LiveExecutionHandler {
-    pub fn new(client: HyperliquidClient) -> Self {
+    /// Creates a new live execution handler
+    #[must_use]
+    pub const fn new(client: HyperliquidClient) -> Self {
         Self { client }
     }
 }

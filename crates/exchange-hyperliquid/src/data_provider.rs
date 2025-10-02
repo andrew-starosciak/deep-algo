@@ -13,6 +13,10 @@ pub struct LiveDataProvider {
 }
 
 impl LiveDataProvider {
+    /// Creates a new live data provider connected to Hyperliquid WebSocket
+    ///
+    /// # Errors
+    /// Returns error if WebSocket connection fails or subscription fails
     pub async fn new(ws_url: String, symbols: Vec<String>) -> Result<Self> {
         let mut ws = HyperliquidWebSocket::new(ws_url);
         ws.connect().await?;
