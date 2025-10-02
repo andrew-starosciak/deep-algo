@@ -1,0 +1,21 @@
+[package]
+name = "algo-trade-hyperliquid"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+algo-trade-core = { path = "../core" }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+governor = "0.6"
+ethers = "2.0"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+url = "2.5"
+async-trait = "0.1.89"
+chrono = "0.4.42"
+rust_decimal = "1.38.0"

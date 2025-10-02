@@ -94,6 +94,36 @@ After ALL tasks completed:
 - [ ] No new functions/structs added (unless listed in MUST DO)
 - [ ] Git diff shows ONLY changes listed in atomic tasks
 - [ ] Total lines changed ≤ [estimated total]
+
+### Karen Quality Gate (MANDATORY)
+
+Invoke Karen agent for comprehensive quality review:
+
+```bash
+Task(
+  subagent_type: "general-purpose",
+  description: "Karen code quality review Phase [N]",
+  prompt: "Act as Karen agent from .claude/agents/karen.md. Review package [package-name] following ALL 6 phases. Include actual terminal outputs for: Phase 0 (Compilation), Phase 1 (Clippy all levels), Phase 2 (rust-analyzer), Phase 3 (Cross-file), Phase 4 (Per-file), Phase 5 (Report), Phase 6 (Final verification)."
+)
+```
+
+**Karen Success Criteria (Zero Tolerance):**
+- [ ] Phase 0: Compilation check passes (`cargo build --package [pkg] --lib`)
+- [ ] Phase 1: Clippy (default + pedantic + nursery) - ZERO warnings
+- [ ] Phase 2: rust-analyzer diagnostics - ZERO issues (if available)
+- [ ] Phase 3: Cross-file validation - All references valid
+- [ ] Phase 4: Per-file verification - Each file passes individually
+- [ ] Phase 5: Report includes actual terminal outputs
+- [ ] Phase 6: Final verification passes (release build + tests compile)
+
+**If Karen Fails:**
+1. STOP - Do not proceed to next phase
+2. Document all findings from Karen's report
+3. Fix each issue as atomic task following TaskMaster rules
+4. Re-run Karen after fixes
+5. Iterate until Karen passes with zero issues
+
+**Phase is ONLY complete after Karen review passes.**
 ```
 
 #### 5. Rollback Plan
@@ -180,6 +210,55 @@ Each task MUST be:
 1. **Save to `.claude/playbooks/YYYY-MM-DD_feature-name.md`**
 2. **Present to user for approval**
 3. **Wait for confirmation before executing**
+
+### Phase 6: Quality Assurance with Karen Agent
+
+**MANDATORY**: After completing all atomic tasks in a phase, invoke Karen agent for comprehensive quality review following Anthropic's 3-step orchestration: Information Gathering → Task Creation → **Quality Assurance**.
+
+#### Karen Integration Process:
+1. **Complete Phase Tasks** - Execute all atomic tasks in current phase
+2. **Run Phase Verification** - Execute phase-specific checklist
+3. **Invoke Karen Agent** - Mandatory quality review (blocking requirement)
+4. **Review Karen Report** - Analyze all findings with actual terminal outputs
+5. **Fix or Proceed** - Either fix issues atomically or advance to next phase
+
+#### Karen Invocation Command:
+After completing Phase N, invoke Karen using the Task tool:
+
+```bash
+Task(
+  subagent_type: "general-purpose",
+  description: "Karen code quality review",
+  prompt: "Act as Karen agent from .claude/agents/karen.md. Review package <package-name> following ALL 6 phases (Phase 0: Compilation, Phase 1: Clippy, Phase 2: rust-analyzer, Phase 3: Cross-file, Phase 4: Per-file, Phase 5: Report, Phase 6: Final verification). Include actual terminal outputs for each phase."
+)
+```
+
+#### Karen Success Criteria (Zero Tolerance):
+- ✅ **Phase 0**: Code compiles (`cargo build --package <pkg> --lib`)
+- ✅ **Phase 1**: Zero clippy warnings at ALL levels (default + pedantic + nursery)
+- ✅ **Phase 2**: rust-analyzer finds no issues (if available)
+- ✅ **Phase 3**: Cross-file references valid (no broken method calls)
+- ✅ **Phase 4**: Per-file verification clean (each file passes individually)
+- ✅ **Phase 5**: Complete report with actual command outputs included
+- ✅ **Phase 6**: Final build verification passes (release build + tests compile)
+
+#### If Karen Finds Issues:
+1. **STOP** - Do not proceed to next phase (blocking failure)
+2. **Document** - Record all Karen findings in playbook notes
+3. **Fix Atomically** - Address each issue as atomic task following TaskMaster rules
+4. **Re-verify** - Run Karen again after ALL fixes applied
+5. **Iterate** - Repeat fix→verify cycle until Karen passes with zero issues
+
+#### Integration with Playbook Lifecycle:
+```
+Draft → Review → Approved → In Progress → Phase Complete → Karen Review
+                                                                ↓
+                                                         Pass?  →  YES → Mark Complete
+                                                                ↓
+                                                               NO → Fix → Re-run Karen
+```
+
+**Critical Rule**: A phase is ONLY considered "Completed" after Karen review passes. TaskMaster must enforce this gate at every phase boundary.
 
 ## Example Playbook
 
@@ -286,9 +365,9 @@ If verification fails:
 ```
 User Request
      ↓
-TaskMaster Analysis
+TaskMaster Analysis (Step 1: Information Gathering)
      ↓
-Generate Playbook
+Generate Playbook (Step 2: Task Creation)
      ↓
 User Reviews & Approves
      ↓
@@ -298,10 +377,19 @@ Execute Task 2 → Verify → Continue
      ↓
 Execute Task N → Verify → Continue
      ↓
-Final Verification Checklist
+Phase Verification Checklist
      ↓
-Done (or Rollback)
+Karen Quality Review (Step 3: Quality Assurance) ← MANDATORY
+     ↓
+Karen Pass?
+     ├─ YES → Phase Complete → Next Phase or Done
+     └─ NO → Fix Issues Atomically → Re-run Karen → Retry
 ```
+
+**Anthropic's 3-Step AI Orchestration Cycle:**
+1. **Information Gathering** - TaskMaster analyzes requirements and codebase
+2. **Task Creation** - TaskMaster generates atomic playbook
+3. **Quality Assurance** - Karen enforces zero-tolerance quality gates
 
 ### Playbook Lifecycle
 

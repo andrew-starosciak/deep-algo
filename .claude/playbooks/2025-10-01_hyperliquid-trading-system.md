@@ -397,6 +397,34 @@ pub use traits::{DataProvider, ExecutionHandler, RiskManager, Strategy};
 - [ ] Traits are async and Send + Sync
 - [ ] TradingSystem is generic over providers
 
+### Karen Quality Gate (MANDATORY)
+
+**Invoke Karen agent for Phase 1 quality review:**
+
+```bash
+Task(
+  subagent_type: "general-purpose",
+  description: "Karen quality review - Phase 1",
+  prompt: "Act as Karen agent from .claude/agents/karen.md. Review package algo-trade-core following ALL 6 phases. Include actual terminal outputs for: Phase 0 (Compilation), Phase 1 (Clippy all levels including pedantic/nursery), Phase 2 (rust-analyzer), Phase 3 (Cross-file), Phase 4 (Per-file), Phase 5 (Report), Phase 6 (Final verification)."
+)
+```
+
+**Karen Success Criteria (Zero Tolerance):**
+- [ ] Phase 0: `cargo build -p algo-trade-core --lib` succeeds with zero errors
+- [ ] Phase 1: `cargo clippy -p algo-trade-core --all-targets -- -W clippy::all -W clippy::pedantic -W clippy::nursery -D warnings` - ZERO warnings
+- [ ] Phase 2: rust-analyzer diagnostics show zero issues
+- [ ] Phase 3: Cross-file validation passes (no broken references)
+- [ ] Phase 4: Each file (events.rs, traits.rs, engine.rs, lib.rs) passes individually
+- [ ] Phase 5: Karen report includes actual terminal outputs
+- [ ] Phase 6: Final verification - `cargo build -p algo-trade-core --release` succeeds
+
+**If Karen Fails:**
+1. STOP - Do not proceed to Phase 2
+2. Create atomic tasks to fix each Karen finding
+3. Execute fixes following TaskMaster methodology
+4. Re-run Karen until zero issues
+5. Only then mark Phase 1 as Complete
+
 **Estimated Total Lines**: ~190
 
 ---
@@ -780,6 +808,13 @@ pub use websocket::HyperliquidWebSocket;
 - [ ] Rate limiting enforced at 1200 req/min
 - [ ] WebSocket auto-reconnects on disconnect
 
+### Karen Quality Gate (MANDATORY - Phase 2)
+- [ ] Invoke Karen for algo-trade-hyperliquid package
+- [ ] Karen Phase 0-6 all pass with zero issues
+- [ ] All clippy warnings (including pedantic/nursery) fixed
+- [ ] Cross-file validation passes (traits properly implemented)
+- [ ] Final verification: release build + tests compile
+
 **Estimated Total Lines**: ~255
 
 ---
@@ -1147,6 +1182,11 @@ pub use metrics::{MetricsCalculator, PerformanceMetrics};
 - [ ] Performance metrics calculate correctly
 - [ ] Can use same TradingSystem with backtest providers
 
+### Karen Quality Gate (MANDATORY - Phase 3)
+- [ ] Invoke Karen for algo-trade-backtest package
+- [ ] All 6 Karen phases pass with zero tolerance
+- [ ] Backtest-live parity verified (same traits used)
+
 **Estimated Total Lines**: ~253
 
 ---
@@ -1398,6 +1438,10 @@ pub use risk_manager::SimpleRiskManager;
 - [ ] MaCrossoverStrategy implements Strategy trait
 - [ ] SimpleRiskManager implements RiskManager trait
 - [ ] Strategies are stateful and work in event-driven context
+
+### Karen Quality Gate (MANDATORY - Phase 4)
+- [ ] Karen review for algo-trade-strategy package passes
+- [ ] Strategy logic verified for correctness and safety
 
 **Estimated Total Lines**: ~166
 
@@ -1775,6 +1819,11 @@ pub use parquet_storage::ParquetStorage;
 - [ ] Parquet storage uses Arrow format
 - [ ] DECIMAL types used for financial precision
 
+### Karen Quality Gate (MANDATORY - Phase 5)
+- [ ] Karen review for algo-trade-data package passes
+- [ ] SQL schema validated for correctness
+- [ ] Arrow/Parquet usage verified for performance
+
 **Estimated Total Lines**: ~258
 
 ---
@@ -2142,6 +2191,11 @@ pub use registry::BotRegistry;
 - [ ] Registry manages multiple bots concurrently
 - [ ] Graceful shutdown supported
 
+### Karen Quality Gate (MANDATORY - Phase 6)
+- [ ] Karen review for algo-trade-bot-orchestrator passes
+- [ ] Actor pattern verified for correctness and thread safety
+- [ ] Channel usage validated (no deadlocks/leaks)
+
 **Estimated Total Lines**: ~245
 
 ---
@@ -2493,6 +2547,11 @@ pub use server::ApiServer;
 - [ ] CORS enabled for cross-origin requests
 - [ ] Shared BotRegistry state via Arc
 
+### Karen Quality Gate (MANDATORY - Phase 7)
+- [ ] Karen review for algo-trade-web-api passes
+- [ ] API security and error handling verified
+- [ ] WebSocket implementation validated
+
 **Estimated Total Lines**: ~233
 
 ---
@@ -2773,6 +2832,11 @@ ws_url = "wss://api.hyperliquid.xyz/ws"
 - [ ] Watch channel broadcasts config updates
 - [ ] Example config files created
 
+### Karen Quality Gate (MANDATORY - Phase 8)
+- [ ] Karen review for updated algo-trade-core passes
+- [ ] Config hot-reload mechanism verified for safety
+- [ ] No race conditions in config updates
+
 **Estimated Total Lines**: ~175
 
 ---
@@ -2994,6 +3058,11 @@ async fn run_server(addr: &str) -> anyhow::Result<()> {
 - [ ] CLI help shows all commands: `cargo run -p algo-trade-cli -- --help`
 - [ ] All workspace crates integrate successfully
 - [ ] Logging outputs to console
+
+### Karen Quality Gate (MANDATORY - Phase 9)
+- [ ] Karen review for algo-trade-cli passes
+- [ ] CLI integration verified (all crates work together)
+- [ ] Main binary compiles and runs correctly
 
 **Estimated Total Lines**: ~147
 
@@ -3530,6 +3599,12 @@ Strategy implementation likely has look-ahead bias. Ensure all logic works event
 - [ ] All documentation references correct file paths
 - [ ] Project is ready for handoff to TaskMaster agent
 
+### Karen Quality Gate (MANDATORY - Phase 10 - FINAL)
+- [ ] Karen review for ENTIRE workspace (`--workspace` flag)
+- [ ] All 9 crates pass Karen's zero-tolerance review
+- [ ] Integration test passes with zero warnings
+- [ ] Final workspace-level verification complete
+
 **Estimated Total Lines**: ~465
 
 ---
@@ -3559,6 +3634,14 @@ Strategy implementation likely has look-ahead bias. Ensure all logic works event
 - [ ] Logging with tracing throughout
 - [ ] Rate limiting enforced (governor)
 - [ ] Graceful shutdown implemented
+
+### Karen Quality Assurance (FINAL GATE)
+- [ ] **All 10 phase Karen reviews passed**
+- [ ] **Workspace-level Karen review passed**
+- [ ] **Zero clippy warnings at all levels (default + pedantic + nursery)**
+- [ ] **Zero rustc warnings/errors**
+- [ ] **All cross-file references validated**
+- [ ] **Complete quality reports generated for all phases**
 
 ## Rollback Plan
 

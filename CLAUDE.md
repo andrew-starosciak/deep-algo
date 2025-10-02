@@ -275,6 +275,54 @@ The complete implementation plan is available in `.claude/playbooks/2025-10-01_h
 - Exact file paths and line-by-line code specifications
 - Verification steps for each phase
 - Architecture decisions based on research-validated patterns
+- **Karen quality gates at every phase boundary (mandatory)**
+
+## Quality Assurance with Karen Agent
+
+This project follows **Anthropic's 3-step AI Orchestration Cycle**:
+1. **Information Gathering** - Research and analysis
+2. **Task Creation** - TaskMaster generates atomic playbooks
+3. **Quality Assurance** - Karen enforces zero-tolerance quality
+
+### Karen Integration
+
+**After completing each phase, Karen agent MUST review the code before proceeding to the next phase.**
+
+#### Karen Review Process:
+```bash
+# Invoke Karen after completing Phase N:
+Task(
+  subagent_type: "general-purpose",
+  description: "Karen code quality review Phase N",
+  prompt: "Act as Karen agent from .claude/agents/karen.md. Review package <package-name> following ALL 6 phases. Include actual terminal outputs."
+)
+```
+
+#### Karen's 6 Review Phases:
+1. **Phase 0: Compilation Check** - `cargo build --package <pkg> --lib` must succeed
+2. **Phase 1: Clippy Analysis** - Zero warnings at ALL levels (default + pedantic + nursery)
+3. **Phase 2: rust-analyzer** - Deep diagnostics with zero issues
+4. **Phase 3: Cross-file Validation** - No broken references after API changes
+5. **Phase 4: Per-file Verification** - Each file passes individually
+6. **Phase 5: Report Generation** - Complete report with actual terminal outputs
+7. **Phase 6: Final Verification** - Release build + tests compile
+
+#### Zero Tolerance Standard:
+- ✅ Zero rustc errors/warnings
+- ✅ Zero clippy warnings (including pedantic/nursery)
+- ✅ Zero unused imports or dead code
+- ✅ All public APIs documented
+- ✅ All unsafe blocks justified
+- ✅ Consistent patterns throughout
+
+#### Blocking Failures:
+If Karen finds issues:
+1. **STOP** - Do not proceed to next phase
+2. **Fix Atomically** - Address each issue following TaskMaster methodology
+3. **Re-verify** - Run Karen again after fixes
+4. **Iterate** - Repeat until Karen passes with zero issues
+
+**A phase is ONLY complete after Karen review passes.**
 
 ## References
 

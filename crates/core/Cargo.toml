@@ -1,0 +1,13 @@
+[package]
+name = "algo-trade-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+rust_decimal = "1.33"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1.89"
+tracing.workspace = true

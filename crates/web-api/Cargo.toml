@@ -1,0 +1,6 @@
+[package]
+name = "algo-trade-web-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
