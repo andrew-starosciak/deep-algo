@@ -27,6 +27,9 @@ impl BotActor {
     ///
     /// # Errors
     /// Returns an error if command processing fails.
+    // Allow cognitive_complexity: This is a simple event loop with a match statement.
+    // The complexity calculation is inflated by the match arms, but the logic is straightforward.
+    #[allow(clippy::cognitive_complexity)]
     pub async fn run(mut self) -> Result<()> {
         tracing::info!("Bot {} starting", self.config.bot_id);
 
