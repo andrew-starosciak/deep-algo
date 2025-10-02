@@ -33,6 +33,18 @@ where
         }
     }
 
+    /// Runs the trading system event loop.
+    ///
+    /// Processes market events from the data provider, generates signals from strategies,
+    /// evaluates them through risk management, and executes orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Data provider fails to fetch next event
+    /// - Strategy signal generation fails
+    /// - Risk manager evaluation fails
+    /// - Order execution fails
     pub async fn run(&mut self) -> Result<()> {
         while let Some(market_event) = self.data_provider.next_event().await? {
             // Generate signals from all strategies
