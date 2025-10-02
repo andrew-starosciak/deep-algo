@@ -2,11 +2,18 @@
 name = "algo-trade-bot-orchestrator"
 version = "0.1.0"
 edition = "2021"
-description = "Bot orchestration and management for algorithmic trading"
-license = "MIT"
+description = "Multi-bot orchestration using actor pattern with Tokio channels"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/yourusername/algo-trade"
-keywords = ["trading", "bot", "orchestration", "management"]
-categories = ["finance"]
-readme = false
+readme = "README.md"
+keywords = ["trading", "bot", "orchestration", "actor", "async"]
+categories = ["asynchronous", "concurrency"]
 
 [dependencies]
+algo-trade-core = { path = "../core" }
+algo-trade-strategy = { path = "../strategy" }
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
