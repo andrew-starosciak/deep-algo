@@ -2,11 +2,26 @@
 name = "algo-trade-cli"
 version = "0.1.0"
 edition = "2021"
-description = "Command-line interface for algorithmic trading system"
+description = "Command-line interface for the Hyperliquid algorithmic trading system"
 license = "MIT"
 repository = "https://github.com/yourusername/algo-trade"
-keywords = ["trading", "cli", "command-line"]
-categories = ["finance", "command-line-utilities"]
 readme = false
+keywords = ["trading", "cli", "cryptocurrency", "hyperliquid"]
+categories = ["command-line-utilities", "finance"]
+
+[[bin]]
+name = "algo-trade"
+path = "src/main.rs"
 
 [dependencies]
+algo-trade-core = { path = "../core" }
+algo-trade-hyperliquid = { path = "../exchange-hyperliquid" }
+algo-trade-backtest = { path = "../backtest" }
+algo-trade-strategy = { path = "../strategy" }
+algo-trade-bot-orchestrator = { path = "../bot-orchestrator" }
+algo-trade-web-api = { path = "../web-api" }
+tokio = { workspace = true }
+clap = { version = "4.5", features = ["derive"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
