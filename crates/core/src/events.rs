@@ -17,7 +17,7 @@ pub struct SignalEvent {
     pub timestamp: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SignalDirection {
     Long,
     Short,

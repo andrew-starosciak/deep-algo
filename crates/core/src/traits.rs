@@ -10,7 +10,7 @@ pub trait DataProvider: Send + Sync {
 #[async_trait]
 pub trait Strategy: Send + Sync {
     async fn on_market_event(&mut self, event: &MarketEvent) -> Result<Option<SignalEvent>>;
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 }
 
 #[async_trait]

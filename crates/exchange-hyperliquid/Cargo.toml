@@ -2,6 +2,12 @@
 name = "algo-trade-hyperliquid"
 version = "0.1.0"
 edition = "2021"
+description = "Hyperliquid exchange integration for algorithmic trading"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "hyperliquid", "exchange", "cryptocurrency"]
+categories = ["finance"]
+readme = false
 
 [dependencies]
 algo-trade-core = { path = "../core" }

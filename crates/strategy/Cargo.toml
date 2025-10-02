@@ -2,5 +2,19 @@
 name = "algo-trade-strategy"
 version = "0.1.0"
 edition = "2021"
+description = "Trading strategy framework with pluggable strategy implementations"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "strategy", "algorithmic", "finance"]
+categories = ["finance"]
+readme = false
 
 [dependencies]
+algo-trade-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+yata = "0.7"
+rust_decimal = "1.33"
+async-trait = "0.1.89"
+chrono = { version = "0.4", features = ["serde"] }

@@ -2,5 +2,11 @@
 name = "algo-trade-bot-orchestrator"
 version = "0.1.0"
 edition = "2021"
+description = "Bot orchestration and management for algorithmic trading"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "bot", "orchestration", "management"]
+categories = ["finance"]
+readme = false
 
 [dependencies]

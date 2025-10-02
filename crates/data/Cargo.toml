@@ -2,5 +2,11 @@
 name = "algo-trade-data"
 version = "0.1.0"
 edition = "2021"
+description = "Data storage and management for algorithmic trading"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "data", "storage", "timeseries"]
+categories = ["finance"]
+readme = false
 
 [dependencies]

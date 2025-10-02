@@ -2,5 +2,11 @@
 name = "algo-trade-web-api"
 version = "0.1.0"
 edition = "2021"
+description = "REST API for algorithmic trading system"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "api", "rest", "web"]
+categories = ["finance"]
+readme = false
 
 [dependencies]

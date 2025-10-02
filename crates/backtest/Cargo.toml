@@ -2,6 +2,12 @@
 name = "algo-trade-backtest"
 version = "0.1.0"
 edition = "2021"
+description = "Backtesting engine for algorithmic trading strategies"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "backtest", "simulation", "strategy"]
+categories = ["finance"]
+readme = false
 
 [dependencies]
 algo-trade-core = { path = "../core" }

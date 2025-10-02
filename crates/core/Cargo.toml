@@ -2,6 +2,12 @@
 name = "algo-trade-core"
 version = "0.1.0"
 edition = "2021"
+description = "Core types, traits, and event system for algorithmic trading"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "core", "events", "algorithmic", "finance"]
+categories = ["finance"]
+readme = false
 
 [dependencies]
 tokio = { workspace = true }

@@ -2,5 +2,11 @@
 name = "algo-trade-cli"
 version = "0.1.0"
 edition = "2021"
+description = "Command-line interface for algorithmic trading system"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "cli", "command-line"]
+categories = ["finance", "command-line-utilities"]
+readme = false
 
 [dependencies]

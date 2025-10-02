@@ -2,5 +2,11 @@
 name = "algo-trade-execution"
 version = "0.1.0"
 edition = "2021"
+description = "Order execution and position management for algorithmic trading"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "execution", "orders", "positions"]
+categories = ["finance"]
+readme = false
 
 [dependencies]
