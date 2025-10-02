@@ -17,3 +17,5 @@ rust_decimal = "1.33"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1.89"
 tracing.workspace = true
+figment = { version = "0.10.19", features = ["toml", "json", "env"] }
+notify = "8.2.0"

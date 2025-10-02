@@ -1,0 +1,11 @@
+[server]
+host = "0.0.0.0"
+port = 8080
+
+[database]
+url = "postgresql://localhost/algo_trade"
+max_connections = 10
+
+[hyperliquid]
+api_url = "https://api.hyperliquid.xyz"
+ws_url = "wss://api.hyperliquid.xyz/ws"
