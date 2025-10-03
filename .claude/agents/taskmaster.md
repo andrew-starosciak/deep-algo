@@ -180,11 +180,54 @@ Each task MUST be:
 ## Playbook Generation Process
 
 ### Phase 1: Requirements Analysis
+
+**Option A: Context Gatherer Available** (Preferred for complex features)
+
+If a Context Gatherer report exists for this feature:
+
+1. **Read Context Report** - Load `.claude/context/YYYY-MM-DD_feature-name.md`
+2. **Extract Section 6** - "TaskMaster Handoff Package" contains:
+   - MUST DO / MUST NOT DO lists (explicit scope boundaries)
+   - Exact file paths with line numbers
+   - Task dependencies mapped
+   - Verification criteria pre-defined
+   - Edge cases documented
+3. **Validate Completeness** - Ensure report answers all questions:
+   - No ambiguous file paths
+   - No missing integration points
+   - No undefined edge cases
+4. **Skip external research** - Context Gatherer already completed this
+5. **Proceed to Phase 3** - Use Section 6 for task decomposition
+
+**Benefits**: Zero ambiguity, all research complete, minimal playbook generation time
+
+**Option B: No Context Report** (Fallback for simple tasks)
+
+If no Context Gatherer report exists:
+
 1. **Read user request verbatim**
 2. **Identify explicit requirements** - What they asked for
 3. **Identify implicit scope** - What they didn't ask for
 4. **Estimate complexity** - How many files/functions affected
 5. **Decide if playbook needed** - Skip for trivial changes (< 3 atomic tasks)
+6. **Perform minimal research** - Only what's needed for atomic tasks (file paths, line numbers)
+
+**When to Request Context Gatherer**:
+- Feature requires external research (new crate, API integration)
+- Multiple design patterns possible (need architectural decision)
+- User request is vague or has missing requirements
+- Feature affects >5 files or >3 modules
+
+**How to Request**:
+```
+"This feature requires comprehensive research. I recommend invoking Context Gatherer first to:
+1. Research [external dependencies/APIs/patterns]
+2. Analyze existing [module/pattern] in codebase
+3. Generate architectural recommendations
+4. Create TaskMaster Handoff Package
+
+Would you like me to proceed with Context Gatherer?"
+```
 
 ### Phase 2: Codebase Analysis
 1. **Locate exact files** - Find all files that need changes
@@ -362,14 +405,26 @@ If verification fails:
 
 ### Execution Workflow
 
+**Full 3-Agent Workflow** (with Context Gatherer):
+
 ```
 User Request
      ↓
-TaskMaster Analysis (Step 1: Information Gathering)
+Context Gatherer (Step 1: Information Gathering)
+     │ - External research (crates, APIs, patterns)
+     │ - Codebase reconnaissance (existing architecture)
+     │ - Architectural recommendations
+     │ - Edge case identification
      ↓
-Generate Playbook (Step 2: Task Creation)
+Context Report Generated (.claude/context/YYYY-MM-DD_feature-name.md)
+     │ - Section 6: TaskMaster Handoff Package
      ↓
-User Reviews & Approves
+TaskMaster (Step 2: Task Creation)
+     │ - Read Section 6 from Context Report
+     │ - Generate atomic playbook
+     │ - Use pre-defined scope boundaries
+     ↓
+User Reviews & Approves Playbook
      ↓
 Execute Task 1 → Verify → Continue
      ↓
@@ -379,15 +434,35 @@ Execute Task N → Verify → Continue
      ↓
 Phase Verification Checklist
      ↓
-Karen Quality Review (Step 3: Quality Assurance) ← MANDATORY
+Karen (Step 3: Quality Assurance) ← MANDATORY
+     │ - Phase 0-6 review
+     │ - Zero tolerance enforcement
      ↓
 Karen Pass?
      ├─ YES → Phase Complete → Next Phase or Done
      └─ NO → Fix Issues Atomically → Re-run Karen → Retry
 ```
 
+**Simplified Workflow** (without Context Gatherer for simple tasks):
+
+```
+User Request
+     ↓
+TaskMaster (Steps 1 & 2: Information Gathering + Task Creation)
+     │ - Minimal requirements analysis
+     │ - Generate atomic playbook
+     ↓
+User Reviews & Approves
+     ↓
+Execute Tasks → Verify
+     ↓
+Karen (Step 3: Quality Assurance) ← MANDATORY
+     ↓
+Complete
+```
+
 **Anthropic's 3-Step AI Orchestration Cycle:**
-1. **Information Gathering** - TaskMaster analyzes requirements and codebase
+1. **Information Gathering** - Context Gatherer (comprehensive research) OR TaskMaster (minimal analysis)
 2. **Task Creation** - TaskMaster generates atomic playbook
 3. **Quality Assurance** - Karen enforces zero-tolerance quality gates
 

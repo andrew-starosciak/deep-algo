@@ -31,6 +31,24 @@ enum Commands {
         #[arg(short, long, default_value = "0.0.0.0:8080")]
         addr: String,
     },
+    /// Fetch historical OHLCV data from Hyperliquid
+    FetchData {
+        /// Symbol/coin to fetch (e.g., "BTC", "ETH")
+        #[arg(long)]
+        symbol: String,
+        /// Candle interval (1m, 5m, 15m, 1h, 4h, 1d, etc.)
+        #[arg(long)]
+        interval: String,
+        /// Start time in ISO 8601 format (e.g., "2025-01-01T00:00:00Z")
+        #[arg(long)]
+        start: String,
+        /// End time in ISO 8601 format (e.g., "2025-02-01T00:00:00Z")
+        #[arg(long)]
+        end: String,
+        /// Output CSV file path
+        #[arg(short, long)]
+        output: String,
+    },
 }
 
 #[tokio::main]
@@ -54,6 +72,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Server { addr } => {
             run_server(&addr).await?;
+        }
+        Commands::FetchData { symbol, interval, start, end, output } => {
+            run_fetch_data(&symbol, &interval, &start, &end, &output).await?;
         }
     }
 
@@ -127,6 +148,55 @@ async fn run_server(addr: &str) -> anyhow::Result<()> {
     let server = algo_trade_web_api::ApiServer::new(registry);
 
     server.serve(addr).await?;
+
+    Ok(())
+}
+
+async fn run_fetch_data(
+    symbol: &str,
+    interval: &str,
+    start_str: &str,
+    end_str: &str,
+    output_path: &str,
+) -> anyhow::Result<()> {
+    use algo_trade_hyperliquid::HyperliquidClient;
+    use algo_trade_data::CsvStorage;
+    use chrono::{DateTime, Utc};
+    use anyhow::Context;
+
+    tracing::info!("Fetching OHLCV data for {} ({} interval)", symbol, interval);
+
+    // Parse timestamps
+    let start: DateTime<Utc> = start_str.parse()
+        .context("Invalid start time. Use ISO 8601 format (e.g., 2025-01-01T00:00:00Z)")?;
+    let end: DateTime<Utc> = end_str.parse()
+        .context("Invalid end time. Use ISO 8601 format (e.g., 2025-02-01T00:00:00Z)")?;
+
+    if start >= end {
+        anyhow::bail!("Start time must be before end time");
+    }
+
+    // Create client (no auth needed for public candle data)
+    let api_url = std::env::var("HYPERLIQUID_API_URL")
+        .unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string());
+
+    let client = HyperliquidClient::new(api_url);
+
+    // Fetch candles
+    let records = client.fetch_candles(symbol, interval, start, end).await?;
+
+    if records.is_empty() {
+        tracing::warn!("No candle data returned. Symbol may not exist or date range may be invalid.");
+        anyhow::bail!("No data fetched for {} {}", symbol, interval);
+    }
+
+    tracing::info!("Fetched {} candles, writing to {}", records.len(), output_path);
+
+    // Write to CSV
+    CsvStorage::write_ohlcv(output_path, &records)?;
+
+    tracing::info!("✅ Successfully wrote {} candles to {}", records.len(), output_path);
+    tracing::info!("You can now run: algo-trade backtest --data {} --strategy <strategy>", output_path);
 
     Ok(())
 }

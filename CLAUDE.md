@@ -277,52 +277,329 @@ The complete implementation plan is available in `.claude/playbooks/2025-10-01_h
 - Architecture decisions based on research-validated patterns
 - **Karen quality gates at every phase boundary (mandatory)**
 
-## Quality Assurance with Karen Agent
+## Agent Orchestration Workflow
 
-This project follows **Anthropic's 3-step AI Orchestration Cycle**:
-1. **Information Gathering** - Research and analysis
-2. **Task Creation** - TaskMaster generates atomic playbooks
-3. **Quality Assurance** - Karen enforces zero-tolerance quality
+This project follows **Anthropic's 3-step AI Orchestration Cycle** with three specialized agents:
 
-### Karen Integration
+### The Three Agents
 
-**After completing each phase, Karen agent MUST review the code before proceeding to the next phase.**
+1. **Context Gatherer** (Information Gathering)
+   - **Purpose**: Front-load comprehensive research before implementation
+   - **When**: New features, external integrations, architectural decisions
+   - **Output**: Context reports in `.claude/context/YYYY-MM-DD_feature-name.md`
+   - **Specification**: `.claude/agents/context-gatherer.md`
 
-#### Karen Review Process:
+2. **TaskMaster** (Task Creation)
+   - **Purpose**: Break work into atomic, verifiable tasks
+   - **When**: All medium/large features (3+ file changes)
+   - **Output**: Playbooks in `.claude/playbooks/YYYY-MM-DD_feature-name.md`
+   - **Specification**: `.claude/agents/taskmaster.md`
+
+3. **Karen** (Quality Assurance)
+   - **Purpose**: Enforce zero-tolerance quality standards
+   - **When**: After every phase completion (MANDATORY)
+   - **Output**: Quality review reports with terminal outputs
+   - **Specification**: `.claude/agents/karen.md`
+
+### Full Workflow (Complex Features)
+
+```
+User Request: "Add support for trading futures on Hyperliquid"
+     │
+     ▼
+┌────────────────────────────────────────────────────────┐
+│ STEP 1: Information Gathering (Context Gatherer)       │
+├────────────────────────────────────────────────────────┤
+│ • Research Hyperliquid futures API                     │
+│ • Analyze existing spot trading implementation         │
+│ • Evaluate design patterns (futures vs spot)           │
+│ • Identify edge cases (funding, expiry)                │
+│ • Generate architectural recommendations               │
+└────────────┬───────────────────────────────────────────┘
+             │
+             ▼ Produces: .claude/context/2025-10-02_hyperliquid-futures.md
+             │           (Section 6: TaskMaster Handoff Package)
+             │
+┌────────────▼───────────────────────────────────────────┐
+│ STEP 2: Task Creation (TaskMaster)                     │
+├────────────────────────────────────────────────────────┤
+│ • Read Context Report Section 6                        │
+│ • Extract MUST DO / MUST NOT DO                        │
+│ • Convert to atomic tasks (~50 LOC each)               │
+│ • Add verification criteria per task                   │
+│ • Define task dependencies                             │
+└────────────┬───────────────────────────────────────────┘
+             │
+             ▼ Produces: .claude/playbooks/2025-10-02_hyperliquid-futures.md
+             │
+┌────────────▼───────────────────────────────────────────┐
+│ Execution: Complete all atomic tasks in playbook       │
+└────────────┬───────────────────────────────────────────┘
+             │
+             ▼
+┌────────────▼───────────────────────────────────────────┐
+│ STEP 3: Quality Assurance (Karen) ← MANDATORY          │
+├────────────────────────────────────────────────────────┤
+│ • Phase 0: Compilation check                           │
+│ • Phase 1: Clippy (default + pedantic + nursery)       │
+│ • Phase 2: rust-analyzer diagnostics                   │
+│ • Phase 3: Cross-file validation                       │
+│ • Phase 4: Per-file verification                       │
+│ • Phase 5: Report generation                           │
+│ • Phase 6: Final verification                          │
+└────────────┬───────────────────────────────────────────┘
+             │
+             ▼
+        Pass? ┬─ YES → Feature Complete
+              └─ NO  → Fix Issues → Re-run Karen
+```
+
+### Simplified Workflow (Simple Features)
+
+For changes affecting <5 files with clear requirements:
+
+```
+User Request
+     ↓
+TaskMaster (minimal analysis + playbook generation)
+     ↓
+Execute Tasks
+     ↓
+Karen Review ← MANDATORY
+     ↓
+Complete
+```
+
+**Skip Context Gatherer when**:
+- No external research needed
+- Clear, specific user request
+- Affects <5 files
+- No architectural decisions
+
+### Context Gatherer Deep Dive
+
+**7-Phase Process**:
+1. **Request Analysis** - Extract explicit/implicit requirements
+2. **Codebase Reconnaissance** - Map existing patterns, find integration points
+3. **External Research** - Evaluate crates, APIs, design patterns
+4. **Analysis & Synthesis** - Architectural recommendations with rationale
+5. **Edge Case Identification** - Document error scenarios, constraints
+6. **TaskMaster Package Creation** - MUST DO/MUST NOT DO with exact file paths
+7. **Report Generation** - Save to `.claude/context/`
+
+**Example Report Structure**:
+- Section 1: Request Analysis
+- Section 2: Codebase Context (files with line numbers)
+- Section 3: External Research (crate comparison tables)
+- Section 4: Architectural Recommendations (proposed design)
+- Section 5: Edge Cases & Constraints
+- **Section 6: TaskMaster Handoff Package** ← This feeds directly into TaskMaster
+
+**Invoke Context Gatherer when**:
 ```bash
-# Invoke Karen after completing Phase N:
+# User says: "Add support for perpetual futures on Hyperliquid"
+
+# Response:
+"This feature requires comprehensive research. I recommend invoking Context Gatherer first to:
+1. Research Hyperliquid perpetual futures API (funding rates, margin)
+2. Analyze existing spot trading architecture (integration points)
+3. Evaluate design patterns (extend OrderEvent vs new FuturesOrder type)
+4. Identify edge cases (funding payments, position rollovers)
+5. Generate TaskMaster Handoff Package with exact scope
+
+Would you like me to proceed with Context Gatherer?"
+```
+
+### TaskMaster Deep Dive
+
+**Atomic Task Specification**:
+- **One change per task** (single file, function, or struct)
+- **Exact locations** (file path + line numbers)
+- **Clear verification** (cargo check, cargo test command)
+- **< 50 LOC per task** (prevents scope creep)
+
+**With Context Report** (preferred):
+1. Read `.claude/context/YYYY-MM-DD_feature-name.md` Section 6
+2. Extract pre-defined scope boundaries (MUST DO / MUST NOT DO)
+3. Use exact file paths and line numbers from report
+4. Generate playbook with minimal additional research
+
+**Without Context Report** (fallback):
+1. Analyze user request
+2. Locate files with Glob/Grep/Read
+3. Define minimal scope
+4. Generate playbook (may need to request Context Gatherer if complex)
+
+**Playbook Structure**:
+```markdown
+## User Request
+[Verbatim request]
+
+## Scope Boundaries
+### MUST DO
+- [ ] Task 1 (file: path, lines: 10-50)
+### MUST NOT DO
+- No new features beyond request
+
+## Atomic Tasks
+### Task 1: [Specific Goal]
+**File**: /path/to/file.rs
+**Location**: Function `foo()` (lines 100-120)
+**Action**: Change parameter type from String to &str
+**Verification**: cargo check -p package-name
+**Estimated LOC**: 3
+
+## Verification Checklist
+- [ ] cargo build succeeds
+- [ ] cargo clippy passes
+- [ ] Karen review passes ← MANDATORY
+```
+
+### Karen Agent Deep Dive
+
+**Zero Tolerance Quality Enforcement** - Karen blocks phase progression until all issues fixed.
+
+**Karen's 6-Phase Review**:
+1. **Phase 0**: Compilation check (`cargo build --package <pkg> --lib`)
+2. **Phase 1**: Clippy at ALL levels (default + pedantic + nursery) - Zero warnings
+3. **Phase 2**: rust-analyzer diagnostics - Zero issues
+4. **Phase 3**: Cross-file validation - No broken references
+5. **Phase 4**: Per-file verification - Each file passes individually
+6. **Phase 5**: Report generation with actual terminal outputs
+7. **Phase 6**: Final verification (release build + tests compile)
+
+**Invocation**:
+```bash
 Task(
   subagent_type: "general-purpose",
-  description: "Karen code quality review Phase N",
-  prompt: "Act as Karen agent from .claude/agents/karen.md. Review package <package-name> following ALL 6 phases. Include actual terminal outputs."
+  description: "Karen code quality review",
+  prompt: "Act as Karen agent from .claude/agents/karen.md. Review package <package-name> following ALL 6 phases. Include actual terminal outputs for each phase."
 )
 ```
 
-#### Karen's 6 Review Phases:
-1. **Phase 0: Compilation Check** - `cargo build --package <pkg> --lib` must succeed
-2. **Phase 1: Clippy Analysis** - Zero warnings at ALL levels (default + pedantic + nursery)
-3. **Phase 2: rust-analyzer** - Deep diagnostics with zero issues
-4. **Phase 3: Cross-file Validation** - No broken references after API changes
-5. **Phase 4: Per-file Verification** - Each file passes individually
-6. **Phase 5: Report Generation** - Complete report with actual terminal outputs
-7. **Phase 6: Final Verification** - Release build + tests compile
-
-#### Zero Tolerance Standard:
+**Zero Tolerance Standard**:
 - ✅ Zero rustc errors/warnings
 - ✅ Zero clippy warnings (including pedantic/nursery)
 - ✅ Zero unused imports or dead code
-- ✅ All public APIs documented
-- ✅ All unsafe blocks justified
-- ✅ Consistent patterns throughout
+- ✅ All public APIs documented with `# Errors` and `# Panics`
+- ✅ All financial values use `rust_decimal::Decimal` (never f64)
+- ✅ Consistent patterns throughout codebase
 
-#### Blocking Failures:
+**Blocking Requirement**:
 If Karen finds issues:
-1. **STOP** - Do not proceed to next phase
-2. **Fix Atomically** - Address each issue following TaskMaster methodology
-3. **Re-verify** - Run Karen again after fixes
-4. **Iterate** - Repeat until Karen passes with zero issues
+1. **STOP** - Do not proceed to next phase (blocking failure)
+2. **Fix Atomically** - Address each issue as atomic task (follow TaskMaster rules)
+3. **Re-verify** - Run Karen again after ALL fixes applied
+4. **Iterate** - Repeat fix → verify cycle until zero issues
 
-**A phase is ONLY complete after Karen review passes.**
+**A phase is ONLY complete after Karen review passes with zero issues.**
+
+---
+
+## Agent Interaction Examples
+
+### Example 1: Complex Feature with Research Needed
+
+**User**: "Add support for Binance Futures integration"
+
+**Claude Response**:
+```
+This feature requires comprehensive research. I recommend the 3-agent workflow:
+
+STEP 1: Context Gatherer
+- Research Binance Futures API (authentication, WebSocket feeds, margin types)
+- Analyze existing Hyperliquid integration (reusable patterns)
+- Evaluate design: New crate vs extend existing?
+- Document edge cases: funding rates, position modes, liquidation
+
+STEP 2: TaskMaster
+- Read Context Report Section 6 (pre-defined scope)
+- Generate atomic playbook with exact file paths
+- Estimated: 8 tasks, ~400 LOC
+
+STEP 3: Karen
+- Review after implementation
+- Enforce zero-tolerance quality
+
+Proceed with Context Gatherer?
+```
+
+**User**: "Yes"
+
+**Claude**: [Invokes Context Gatherer agent, generates `.claude/context/2025-10-02_binance-futures.md`]
+
+### Example 2: Simple Feature, No Research Needed
+
+**User**: "Add a timeout field to the bot configuration"
+
+**Claude Response**:
+```
+This is a simple feature affecting 2 files. Skipping Context Gatherer.
+
+Invoking TaskMaster to generate playbook...
+
+[Generates .claude/playbooks/2025-10-02_add-bot-timeout.md with 3 atomic tasks:
+ Task 1: Add timeout field to BotConfig struct (core/src/config.rs:25)
+ Task 2: Use timeout in BotActor::new() (bot-orchestrator/src/bot_actor.rs:50)
+ Task 3: Update Config.toml example (config/Config.toml:15)]
+
+Ready to execute. Approve?
+```
+
+**User**: "Approved"
+
+**Claude**: [Executes tasks, then invokes Karen for review]
+
+### Example 3: TaskMaster Recommends Context Gatherer Mid-Stream
+
+**User**: "Add support for options trading"
+
+**Claude**: [Starts TaskMaster analysis, realizes complexity]
+
+**Claude Response**:
+```
+While analyzing this request, I found:
+- Options require new order types (calls, puts, strikes, expiry)
+- Margin calculations differ significantly from spot/futures
+- Multiple design patterns possible (extend OrderEvent vs new OptionsOrder type)
+
+This requires architectural decisions. I recommend Context Gatherer:
+1. Research options trading APIs (strike selection, Greeks calculation)
+2. Analyze margin requirements vs existing risk management
+3. Evaluate design patterns (integration points)
+4. Document edge cases (assignment, exercise, expiry)
+
+Proceed with Context Gatherer before TaskMaster?
+```
+
+---
+
+## When to Use Each Agent
+
+### Use Context Gatherer When:
+- ✅ New exchange integration (research API, auth, rate limits)
+- ✅ Adding asset type (futures, options, perpetuals - requires margin research)
+- ✅ External crate evaluation needed (multiple options to compare)
+- ✅ Architectural decision (multiple design patterns possible)
+- ✅ User request is vague ("make it better", "add trading features")
+
+### Use TaskMaster When:
+- ✅ All medium/large features (3+ file changes)
+- ✅ Any refactoring work
+- ✅ Performance optimization
+- ✅ Bug fixes affecting multiple files
+- ✅ ALWAYS after Context Gatherer completes
+
+### Use Karen When:
+- ✅ **ALWAYS after every phase/playbook completion (MANDATORY)**
+- ✅ Before marking any phase "complete"
+- ✅ After fixing issues (re-run until zero issues)
+
+### Skip All Agents When:
+- ❌ Single-line changes (fix typo, remove unused import)
+- ❌ Trivial updates (change constant value)
+- ❌ Emergency hotfixes (but document after with playbook)
+- ❌ Changes to <3 files with <5 lines each
 
 ## References
 

@@ -41,11 +41,45 @@ cp config/Config.example.toml config/Config.toml
 # Edit config/Config.toml with your settings
 ```
 
+### Fetch Historical Data
+
+Fetch OHLCV candle data from Hyperliquid for backtesting:
+
+```bash
+# Fetch 1 month of hourly BTC data
+cargo run -p algo-trade-cli -- fetch-data \
+  --symbol BTC \
+  --interval 1h \
+  --start 2025-01-01T00:00:00Z \
+  --end 2025-02-01T00:00:00Z \
+  --output data/btc_jan2025.csv
+
+# Fetch 1 week of 5-minute ETH data
+cargo run -p algo-trade-cli -- fetch-data \
+  --symbol ETH \
+  --interval 5m \
+  --start 2025-01-15T00:00:00Z \
+  --end 2025-01-22T00:00:00Z \
+  --output data/eth_week.csv
+
+# Fetch daily SOL data for 3 months
+cargo run -p algo-trade-cli -- fetch-data \
+  --symbol SOL \
+  --interval 1d \
+  --start 2024-10-01T00:00:00Z \
+  --end 2025-01-01T00:00:00Z \
+  --output data/sol_q4.csv
+```
+
+**Supported intervals**: `1m`, `3m`, `5m`, `15m`, `30m`, `1h`, `2h`, `4h`, `8h`, `12h`, `1d`, `3d`, `1w`, `1M`
+
+**Note**: Hyperliquid limits responses to 5000 candles per request. Larger time ranges are automatically paginated.
+
 ### Run Backtest
 
 ```bash
 cargo run -p algo-trade-cli -- backtest \
-  --data tests/data/sample.csv \
+  --data data/btc_jan2025.csv \
   --strategy ma_crossover
 ```
 

@@ -19,3 +19,4 @@ parquet = "54.0"
 polars = { version = "0.43", features = ["lazy", "parquet", "temporal"] }
 rust_decimal = "1.33"
 chrono = "0.4"
+csv = "1.3"
