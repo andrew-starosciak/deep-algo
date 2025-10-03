@@ -100,14 +100,18 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_backtest(data_path: &str, strategy: &str) -> anyhow::Result<()> {
+async fn run_backtest(data_path: &str, strategy_name: &str) -> anyhow::Result<()> {
     use algo_trade_backtest::{HistoricalDataProvider, SimulatedExecutionHandler};
-    use algo_trade_core::TradingSystem;
-    use algo_trade_strategy::{MaCrossoverStrategy, SimpleRiskManager};
+    use algo_trade_core::{MetricsFormatter, TradingSystem};
+    use algo_trade_strategy::{MaCrossoverStrategy, QuadMaStrategy, SimpleRiskManager};
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    tracing::info!("Running backtest with data: {}, strategy: {}", data_path, strategy);
+    tracing::info!("Running backtest with data: {}, strategy: {}", data_path, strategy_name);
+
+    // Extract symbol from CSV first row
+    let symbol = extract_symbol_from_csv(data_path)?;
+    tracing::info!("Detected symbol from CSV: {}", symbol);
 
     // Load historical data
     let data_provider = HistoricalDataProvider::from_csv(data_path)?;
@@ -115,11 +119,20 @@ async fn run_backtest(data_path: &str, strategy: &str) -> anyhow::Result<()> {
     // Create simulated execution handler
     let execution_handler = SimulatedExecutionHandler::new(0.001, 5.0); // 0.1% commission, 5 bps slippage
 
-    // Create strategy
-    let ma_strategy = MaCrossoverStrategy::new("BTC".to_string(), 10, 30);
-    let strategies: Vec<Arc<Mutex<dyn algo_trade_core::Strategy>>> = vec![
-        Arc::new(Mutex::new(ma_strategy))
-    ];
+    // Create strategy based on user selection
+    let strategies: Vec<Arc<Mutex<dyn algo_trade_core::Strategy>>> = match strategy_name {
+        "ma_crossover" => {
+            tracing::info!("Using MA Crossover strategy (10/30 periods)");
+            let ma_strategy = MaCrossoverStrategy::new(symbol, 10, 30);
+            vec![Arc::new(Mutex::new(ma_strategy))]
+        }
+        "quad_ma" => {
+            tracing::info!("Using Quad MA strategy (5/8/13/21 Fibonacci periods)");
+            let quad_strategy = QuadMaStrategy::new(symbol);
+            vec![Arc::new(Mutex::new(quad_strategy))]
+        }
+        _ => anyhow::bail!("Unknown strategy: '{}'. Available: ma_crossover, quad_ma", strategy_name),
+    };
 
     // Create risk manager
     let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
@@ -133,12 +146,30 @@ async fn run_backtest(data_path: &str, strategy: &str) -> anyhow::Result<()> {
         risk_manager,
     );
 
-    // Run backtest
-    system.run().await?;
+    // Run backtest and get metrics
+    let metrics = system.run().await?;
 
-    tracing::info!("Backtest completed");
+    // Display formatted metrics
+    println!("{}", MetricsFormatter::format(&metrics));
 
     Ok(())
+}
+
+fn extract_symbol_from_csv(path: &str) -> anyhow::Result<String> {
+    use anyhow::Context;
+
+    let mut reader = csv::Reader::from_path(path)
+        .with_context(|| format!("Failed to open CSV file: {path}"))?;
+
+    let mut records = reader.records();
+    if let Some(result) = records.next() {
+        let record = result.context("Failed to read first CSV record")?;
+        if record.len() >= 2 {
+            return Ok(record[1].to_string()); // symbol is column index 1
+        }
+    }
+
+    anyhow::bail!("CSV file is empty or missing symbol column")
 }
 
 async fn run_server(addr: &str) -> anyhow::Result<()> {

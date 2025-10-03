@@ -78,6 +78,7 @@ impl Strategy for MaCrossoverStrategy {
                 symbol: self.symbol.clone(),
                 direction: new_signal.clone().unwrap(),
                 strength: 1.0,
+                price: *price,
                 timestamp: Utc::now(),
             };
             self.last_signal = new_signal;

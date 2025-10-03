@@ -41,7 +41,7 @@ impl RiskManager for SimpleRiskManager {
             order_type: OrderType::Market,
             direction,
             quantity: self.fixed_quantity,
-            price: None,
+            price: Some(signal.price),
             timestamp: Utc::now(),
         };
 

@@ -48,6 +48,8 @@ Example:
 | Date | Feature | Status | Report | Complexity | LOC |
 |------|---------|--------|--------|------------|-----|
 | 2025-10-02 | Example: Multi-Account Support | ✅ Template | [example-context-report.md](example-context-report.md) | MEDIUM | ~275 |
+| 2025-10-02 | Hyperliquid OHLCV Data Fetching | ✅ Complete | [2025-10-02_hyperliquid-ohlcv-fetching.md](2025-10-02_hyperliquid-ohlcv-fetching.md) | MEDIUM | ~350 |
+| 2025-10-03 | Backtest Metrics & Quad MA Strategy | ✅ Complete | [2025-10-03_backtest-metrics-quad-ma.md](2025-10-03_backtest-metrics-quad-ma.md) | MEDIUM | ~309 |
 
 ## Workflow Integration
 
@@ -112,5 +114,5 @@ All context reports must meet these criteria:
 
 ---
 
-**Last Updated**: 2025-10-02
-**Total Reports**: 1 (example template)
+**Last Updated**: 2025-10-03
+**Total Reports**: 3 (1 template + 2 active features)

@@ -6,7 +6,7 @@ use csv::Writer;
 pub struct CsvStorage;
 
 impl CsvStorage {
-    /// Writes OHLCV records to CSV file compatible with HistoricalDataProvider
+    /// Writes OHLCV records to CSV file compatible with `HistoricalDataProvider`
     ///
     /// Format: timestamp,symbol,open,high,low,close,volume
     ///
@@ -14,7 +14,7 @@ impl CsvStorage {
     /// Returns error if file cannot be created or writing fails
     pub fn write_ohlcv(path: &str, records: &[OhlcvRecord]) -> Result<()> {
         let file = File::create(path)
-            .with_context(|| format!("Failed to create CSV file: {}", path))?;
+            .with_context(|| format!("Failed to create CSV file: {path}"))?;
         let mut writer = Writer::from_writer(file);
 
         // Write header

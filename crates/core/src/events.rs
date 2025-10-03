@@ -9,11 +9,30 @@ pub enum MarketEvent {
     Bar { symbol: String, open: Decimal, high: Decimal, low: Decimal, close: Decimal, volume: Decimal, timestamp: DateTime<Utc> },
 }
 
+impl MarketEvent {
+    #[must_use]
+    pub const fn timestamp(&self) -> DateTime<Utc> {
+        match self {
+            Self::Quote { timestamp, .. } | Self::Trade { timestamp, .. } | Self::Bar { timestamp, .. } => *timestamp,
+        }
+    }
+
+    #[must_use]
+    pub const fn close_price(&self) -> Option<Decimal> {
+        match self {
+            Self::Bar { close, .. } => Some(*close),
+            Self::Trade { price, .. } => Some(*price),
+            Self::Quote { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SignalEvent {
     pub symbol: String,
     pub direction: SignalDirection,
     pub strength: f64,
+    pub price: Decimal,
     pub timestamp: DateTime<Utc>,
 }
 
