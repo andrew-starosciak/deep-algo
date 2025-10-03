@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+mod tui_backtest;
+
 #[derive(Parser)]
 #[command(name = "algo-trade")]
 #[command(about = "Algorithmic trading system for Hyperliquid", long_about = None)]
@@ -49,19 +51,33 @@ enum Commands {
         #[arg(short, long)]
         output: String,
     },
+    /// Interactive TUI for multi-token parameter sweep backtests
+    TuiBacktest {
+        /// Start date for historical data (defaults to 60 days ago)
+        #[arg(long)]
+        start: Option<String>,
+        /// End date for historical data (defaults to today)
+        #[arg(long)]
+        end: Option<String>,
+        /// Candle interval (defaults to 1h)
+        #[arg(long, default_value = "1h")]
+        interval: String,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // Initialize logging (disabled for TUI to prevent screen corruption)
+    if !matches!(cli.command, Commands::TuiBacktest { .. }) {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+            )
+            .init();
+    }
 
     match cli.command {
         Commands::Run { config } => {
@@ -75,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::FetchData { symbol, interval, start, end, output } => {
             run_fetch_data(&symbol, &interval, &start, &end, &output).await?;
+        }
+        Commands::TuiBacktest { start, end, interval } => {
+            run_tui_backtest(start.as_deref(), end.as_deref(), &interval).await?;
         }
     }
 
@@ -100,6 +119,7 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn run_backtest(data_path: &str, strategy_name: &str) -> anyhow::Result<()> {
     use algo_trade_backtest::{HistoricalDataProvider, SimulatedExecutionHandler};
     use algo_trade_core::{MetricsFormatter, TradingSystem};
@@ -131,7 +151,7 @@ async fn run_backtest(data_path: &str, strategy_name: &str) -> anyhow::Result<()
             let quad_strategy = QuadMaStrategy::new(symbol);
             vec![Arc::new(Mutex::new(quad_strategy))]
         }
-        _ => anyhow::bail!("Unknown strategy: '{}'. Available: ma_crossover, quad_ma", strategy_name),
+        _ => anyhow::bail!("Unknown strategy: '{strategy_name}'. Available: ma_crossover, quad_ma"),
     };
 
     // Create risk manager
@@ -183,6 +203,7 @@ async fn run_server(addr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::cognitive_complexity)]
 async fn run_fetch_data(
     symbol: &str,
     interval: &str,
@@ -218,7 +239,7 @@ async fn run_fetch_data(
 
     if records.is_empty() {
         tracing::warn!("No candle data returned. Symbol may not exist or date range may be invalid.");
-        anyhow::bail!("No data fetched for {} {}", symbol, interval);
+        anyhow::bail!("No data fetched for {symbol} {interval}");
     }
 
     tracing::info!("Fetched {} candles, writing to {}", records.len(), output_path);
@@ -230,4 +251,39 @@ async fn run_fetch_data(
     tracing::info!("You can now run: algo-trade backtest --data {} --strategy <strategy>", output_path);
 
     Ok(())
+}
+
+async fn run_tui_backtest(
+    start_opt: Option<&str>,
+    end_opt: Option<&str>,
+    interval: &str,
+) -> anyhow::Result<()> {
+    use chrono::{DateTime, Duration, Utc};
+    use anyhow::Context;
+
+    // Parse or default dates
+    let end: DateTime<Utc> = if let Some(end_str) = end_opt {
+        end_str.parse()
+            .context("Invalid end time. Use ISO 8601 format (e.g., 2025-01-01T00:00:00Z)")?
+    } else {
+        Utc::now()
+    };
+
+    let start: DateTime<Utc> = if let Some(start_str) = start_opt {
+        start_str.parse()
+            .context("Invalid start time. Use ISO 8601 format (e.g., 2025-01-01T00:00:00Z)")?
+    } else {
+        end - Duration::days(60) // Default: 60 days before end
+    };
+
+    if start >= end {
+        anyhow::bail!("Start time must be before end time");
+    }
+
+    tracing::info!("Starting TUI backtest wizard");
+    tracing::info!("Date range: {} to {}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d"));
+    tracing::info!("Interval: {}", interval);
+
+    // Run TUI application
+    tui_backtest::run(start, end, interval.to_string()).await
 }

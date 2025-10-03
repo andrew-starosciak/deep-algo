@@ -9,6 +9,9 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 use std::sync::Arc;
 
+/// Maximum number of candles per API request (Hyperliquid limit)
+const MAX_CANDLES_PER_REQUEST: usize = 5000;
+
 pub struct HyperliquidClient {
     http_client: Client,
     base_url: String,
@@ -78,62 +81,121 @@ impl HyperliquidClient {
         end: DateTime<Utc>,
     ) -> Result<Vec<OhlcvRecord>> {
         let interval_millis = Self::interval_to_millis(interval)?;
-        let total_candles = ((end.timestamp_millis() - start.timestamp_millis()) / interval_millis) as usize;
+        let total_candles = Self::calculate_total_candles(start, end, interval_millis)?;
 
         tracing::info!(
-            "Fetching {} candles for {} (interval: {}, {} to {})",
-            total_candles, symbol, interval, start, end
+            "Fetching {total_candles} candles for {symbol} (interval: {interval}, {start} to {end})"
         );
 
-        const MAX_CANDLES_PER_REQUEST: usize = 5000;
         let mut all_records = HashMap::new();  // Deduplicate by timestamp
 
         if total_candles <= MAX_CANDLES_PER_REQUEST {
-            // Single request
-            let records = self.fetch_candles_chunk(symbol, interval, start, end).await?;
+            self.fetch_single_request(symbol, interval, start, end, &mut all_records).await?;
+        } else {
+            self.fetch_paginated_requests(symbol, interval, start, end, total_candles, interval_millis, &mut all_records).await?;
+        }
+
+        let records = Self::finalize_records(all_records, total_candles, symbol);
+        Ok(records)
+    }
+
+    /// Calculates total number of candles in time range
+    ///
+    /// # Errors
+    /// Returns error if time range is negative or calculation overflows
+    fn calculate_total_candles(start: DateTime<Utc>, end: DateTime<Utc>, interval_millis: i64) -> Result<usize> {
+        let duration_millis = end.timestamp_millis() - start.timestamp_millis();
+        if duration_millis < 0 {
+            anyhow::bail!("End time must be after start time");
+        }
+
+        let candles = duration_millis / interval_millis;
+        usize::try_from(candles).context("Candle count exceeds platform limits")
+    }
+
+    /// Fetches candles with a single API request
+    async fn fetch_single_request(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        all_records: &mut HashMap<DateTime<Utc>, OhlcvRecord>,
+    ) -> Result<()> {
+        let records = self.fetch_candles_chunk(symbol, interval, start, end).await?;
+        for record in records {
+            all_records.insert(record.timestamp, record);
+        }
+        Ok(())
+    }
+
+    /// Fetches candles with multiple paginated API requests
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_paginated_requests(
+        &self,
+        symbol: &str,
+        interval: &str,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        total_candles: usize,
+        interval_millis: i64,
+        all_records: &mut HashMap<DateTime<Utc>, OhlcvRecord>,
+    ) -> Result<()> {
+        let num_requests = total_candles.div_ceil(MAX_CANDLES_PER_REQUEST);
+        tracing::info!("Requires {num_requests} paginated requests (Hyperliquid limit: 5000 candles/request)");
+
+        let mut current_end = end;
+        for i in 0..num_requests {
+            let chunk_duration = Self::calculate_chunk_duration(interval_millis)?;
+            let chunk_start = (current_end - chunk_duration).max(start);
+
+            tracing::debug!("Request {}/{num_requests}: {chunk_start} to {current_end}", i + 1);
+
+            let records = self.fetch_candles_chunk(symbol, interval, chunk_start, current_end).await?;
             for record in records {
                 all_records.insert(record.timestamp, record);
             }
-        } else {
-            // Multiple requests (pagination backward from end)
-            let num_requests = total_candles.div_ceil(MAX_CANDLES_PER_REQUEST);
-            tracing::info!("Requires {} paginated requests (Hyperliquid limit: 5000 candles/request)", num_requests);
 
-            let mut current_end = end;
-            for i in 0..num_requests {
-                let chunk_duration = Duration::milliseconds(interval_millis * MAX_CANDLES_PER_REQUEST as i64);
-                let chunk_start = current_end - chunk_duration;
-                let chunk_start = chunk_start.max(start);  // Don't go before requested start
-
-                tracing::debug!("Request {}/{}: {} to {}", i + 1, num_requests, chunk_start, current_end);
-
-                let records = self.fetch_candles_chunk(symbol, interval, chunk_start, current_end).await?;
-                for record in records {
-                    all_records.insert(record.timestamp, record);
-                }
-
-                current_end = chunk_start;
-                if current_end <= start {
-                    break;
-                }
+            current_end = chunk_start;
+            if current_end <= start {
+                break;
             }
         }
+        Ok(())
+    }
 
-        // Convert to sorted vector
+    /// Calculates duration for a single chunk request
+    ///
+    /// # Errors
+    /// Returns error if calculation would overflow
+    fn calculate_chunk_duration(interval_millis: i64) -> Result<Duration> {
+        let chunk_millis = interval_millis.checked_mul(
+            i64::try_from(MAX_CANDLES_PER_REQUEST).context("MAX_CANDLES_PER_REQUEST too large")?
+        ).context("Chunk duration calculation overflow")?;
+
+        Ok(Duration::milliseconds(chunk_millis))
+    }
+
+    /// Finalizes records: sorts, checks for gaps, returns vector
+    fn finalize_records(
+        all_records: HashMap<DateTime<Utc>, OhlcvRecord>,
+        total_candles: usize,
+        symbol: &str,
+    ) -> Vec<OhlcvRecord> {
         let mut records: Vec<OhlcvRecord> = all_records.into_values().collect();
         records.sort_by_key(|r| r.timestamp);
 
-        tracing::info!("Fetched {} unique candles for {}", records.len(), symbol);
+        tracing::info!("Fetched {} unique candles for {symbol}", records.len());
 
         // Warn if significantly fewer candles than expected (possible data gaps)
         if records.len() < total_candles * 9 / 10 {
             tracing::warn!(
-                "Expected ~{} candles but got {}. There may be data gaps.",
-                total_candles, records.len()
+                "Expected ~{total_candles} candles but got {}. There may be data gaps.",
+                records.len()
             );
         }
 
-        Ok(records)
+        records
     }
 
     /// Converts interval string to milliseconds
@@ -157,8 +219,7 @@ impl HyperliquidClient {
             "1w" => 7 * 24 * 60 * 60 * 1000,
             "1M" => 30 * 24 * 60 * 60 * 1000,  // Approximate
             _ => anyhow::bail!(
-                "Unsupported interval: '{}'. Valid: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, 1M",
-                interval
+                "Unsupported interval: '{interval}'. Valid: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 8h, 12h, 1d, 3d, 1w, 1M"
             ),
         })
     }
@@ -192,7 +253,7 @@ impl HyperliquidClient {
             let timestamp_millis = candle["t"].as_i64()
                 .ok_or_else(|| anyhow::anyhow!("Missing timestamp in candle data"))?;
             let timestamp = DateTime::from_timestamp_millis(timestamp_millis)
-                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp: {}", timestamp_millis))?;
+                .ok_or_else(|| anyhow::anyhow!("Invalid timestamp: {timestamp_millis}"))?;
 
             let record = OhlcvRecord {
                 timestamp,
@@ -213,5 +274,34 @@ impl HyperliquidClient {
         }
 
         Ok(records)
+    }
+
+    /// Fetches list of all available symbols from Hyperliquid
+    ///
+    /// Calls the `/info` endpoint with `{"type": "meta"}` to get exchange metadata
+    ///
+    /// # Errors
+    /// Returns error if API request fails or response format is unexpected
+    pub async fn fetch_available_symbols(&self) -> Result<Vec<String>> {
+        let request_body = serde_json::json!({"type": "meta"});
+        let response = self.post("/info", request_body).await?;
+
+        let universe = response
+            .get("universe")
+            .and_then(|u| u.as_array())
+            .context("Missing or invalid 'universe' field in meta response")?;
+
+        let mut symbols = Vec::new();
+        for item in universe {
+            if let Some(name) = item.get("name").and_then(|n| n.as_str()) {
+                symbols.push(name.to_string());
+            }
+        }
+
+        if symbols.is_empty() {
+            anyhow::bail!("No symbols found in Hyperliquid meta response");
+        }
+
+        Ok(symbols)
     }
 }

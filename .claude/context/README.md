@@ -50,6 +50,7 @@ Example:
 | 2025-10-02 | Example: Multi-Account Support | ✅ Template | [example-context-report.md](example-context-report.md) | MEDIUM | ~275 |
 | 2025-10-02 | Hyperliquid OHLCV Data Fetching | ✅ Complete | [2025-10-02_hyperliquid-ohlcv-fetching.md](2025-10-02_hyperliquid-ohlcv-fetching.md) | MEDIUM | ~350 |
 | 2025-10-03 | Backtest Metrics & Quad MA Strategy | ✅ Complete | [2025-10-03_backtest-metrics-quad-ma.md](2025-10-03_backtest-metrics-quad-ma.md) | MEDIUM | ~309 |
+| 2025-10-03 | Interactive TUI Multi-Token Parameter Sweep | ✅ Complete | [2025-10-03_multi-token-param-sweep-tui.md](2025-10-03_multi-token-param-sweep-tui.md) | HIGH | ~1564 |
 
 ## Workflow Integration
 
@@ -115,4 +116,4 @@ All context reports must meet these criteria:
 ---
 
 **Last Updated**: 2025-10-03
-**Total Reports**: 3 (1 template + 2 active features)
+**Total Reports**: 4 (1 template + 3 active features)

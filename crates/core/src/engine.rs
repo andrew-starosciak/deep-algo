@@ -1,3 +1,4 @@
+use crate::events::FillEvent;
 use crate::position::PositionTracker;
 use crate::traits::{DataProvider, ExecutionHandler, RiskManager, Strategy};
 use anyhow::Result;
@@ -19,6 +20,7 @@ pub struct PerformanceMetrics {
     pub equity_peak: Decimal,
     pub buy_hold_return: Decimal,
     pub exposure_time: f64,
+    pub fills: Vec<FillEvent>,
 }
 
 pub struct TradingSystem<D, E>
@@ -43,6 +45,7 @@ where
     bars_in_position: usize,
     total_bars: usize,
     equity_peak: Decimal,
+    fills: Vec<FillEvent>,
 }
 
 impl<D, E> TradingSystem<D, E>
@@ -75,6 +78,7 @@ where
             bars_in_position: 0,
             total_bars: 0,
             equity_peak: initial_capital,
+            fills: Vec::new(),
         }
     }
 
@@ -103,6 +107,7 @@ where
             bars_in_position: 0,
             total_bars: 0,
             equity_peak: initial_capital,
+            fills: Vec::new(),
         }
     }
 
@@ -154,6 +159,9 @@ where
                         // Execute order
                         let fill = self.execution_handler.execute_order(order).await?;
                         tracing::info!("Order filled: {:?}", fill);
+
+                        // Store fill for trade history
+                        self.fills.push(fill.clone());
 
                         // Track position and calculate PnL if closing
                         if let Some(pnl) = self.position_tracker.process_fill(&fill) {
@@ -274,6 +282,7 @@ where
             equity_peak: self.equity_peak,
             buy_hold_return,
             exposure_time,
+            fills: self.fills.clone(),
         }
     }
 
