@@ -250,18 +250,113 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
                 Style::default()
             };
 
-            let params_str = match &config.strategy {
-                super::StrategyType::MaCrossover { fast, slow } => {
-                    format!("Fast: {fast}, Slow: {slow}")
+            // Build params string with highlighting for edit mode
+            let params_line = if is_selected && app.editing_param.is_some() {
+                use super::ParamField;
+                let editing_field = app.editing_param.unwrap();
+
+                match &config.strategy {
+                    super::StrategyType::MaCrossover { fast, slow } => {
+                        let mut spans = vec![Span::raw("Fast: ")];
+                        if editing_field == ParamField::FastPeriod {
+                            spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{fast}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            spans.push(Span::raw(fast.to_string()));
+                        }
+                        spans.push(Span::raw(", Slow: "));
+                        if editing_field == ParamField::SlowPeriod {
+                            spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{slow}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            spans.push(Span::raw(slow.to_string()));
+                        }
+                        Line::from(spans)
+                    }
+                    super::StrategyType::QuadMa { ma1, ma2, ma3, ma4 } => {
+                        let mut spans = vec![Span::raw("MA1: ")];
+                        if editing_field == ParamField::Ma1Period {
+                            spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{ma1}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            spans.push(Span::raw(ma1.to_string()));
+                        }
+                        spans.push(Span::raw(", MA2: "));
+                        if editing_field == ParamField::Ma2Period {
+                            spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{ma2}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            spans.push(Span::raw(ma2.to_string()));
+                        }
+                        spans.push(Span::raw(", MA3: "));
+                        if editing_field == ParamField::Ma3Period {
+                            spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{ma3}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            spans.push(Span::raw(ma3.to_string()));
+                        }
+                        spans.push(Span::raw(", MA4: "));
+                        if editing_field == ParamField::Ma4Period {
+                            spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{ma4}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            spans.push(Span::raw(ma4.to_string()));
+                        }
+                        Line::from(spans)
+                    }
                 }
-                super::StrategyType::QuadMa { ma1, ma2, ma3, ma4 } => {
-                    format!("MA1: {ma1}, MA2: {ma2}, MA3: {ma3}, MA4: {ma4}")
-                }
+            } else {
+                // Normal mode - no edit highlighting
+                let params_str = match &config.strategy {
+                    super::StrategyType::MaCrossover { fast, slow } => {
+                        format!("Fast: {fast}, Slow: {slow}")
+                    }
+                    super::StrategyType::QuadMa { ma1, ma2, ma3, ma4 } => {
+                        format!("MA1: {ma1}, MA2: {ma2}, MA3: {ma3}, MA4: {ma4}")
+                    }
+                };
+                Line::from(params_str)
             };
 
             ListItem::new(vec![
                 Line::from(Span::styled(&config.name, Style::default().add_modifier(Modifier::BOLD))),
-                Line::from(params_str),
+                params_line,
             ])
             .style(style)
         })
@@ -272,18 +367,27 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
     f.render_widget(list, chunks[1]);
 
     // Instructions
-    let instructions = Paragraph::new(vec![
-        Line::from("↑↓: Navigate | a: Add Config | d: Delete"),
-        Line::from(format!(
-            "Backtest Matrix: {} tokens × {} configs = {} backtests",
-            app.selected_tokens.len(),
-            app.param_configs.len(),
-            app.selected_tokens.len() * app.param_configs.len()
-        )),
-        Line::from("Enter: Run Backtests | Esc: Back | q: Quit"),
-    ])
-    .alignment(Alignment::Center)
-    .block(Block::default().borders(Borders::ALL));
+    let instructions = if app.editing_param.is_some() {
+        Paragraph::new(vec![
+            Line::from("EDIT MODE: Type digits to change value | Tab: Next Field"),
+            Line::from("Enter: Save | Esc: Cancel"),
+        ])
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL))
+    } else {
+        Paragraph::new(vec![
+            Line::from("↑↓: Navigate | e: Edit | a: Add Config | d: Delete"),
+            Line::from(format!(
+                "Backtest Matrix: {} tokens × {} configs = {} backtests",
+                app.selected_tokens.len(),
+                app.param_configs.len(),
+                app.selected_tokens.len() * app.param_configs.len()
+            )),
+            Line::from("Enter: Run Backtests | Esc: Back | q: Quit"),
+        ])
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL))
+    };
     f.render_widget(instructions, chunks[2]);
 }
 
@@ -473,6 +577,7 @@ fn render_trade_detail(f: &mut Frame, app: &App) {
 
         let rows: Vec<Row> = r.trades
             .iter()
+            .skip(app.trade_scroll_offset)
             .map(|trade| {
                 let action_color = match trade.action.as_str() {
                     "BUY" => Color::Green,

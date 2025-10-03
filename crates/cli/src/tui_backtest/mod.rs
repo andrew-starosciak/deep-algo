@@ -85,6 +85,18 @@ pub enum TimeframeField {
     Interval,
 }
 
+/// Which parameter is being edited in ParameterConfig screen
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub enum ParamField {
+    FastPeriod,
+    SlowPeriod,
+    Ma1Period,
+    Ma2Period,
+    Ma3Period,
+    Ma4Period,
+}
+
 /// Backtest result for a single token/config combination
 #[derive(Debug, Clone)]
 pub struct BacktestResult {
@@ -118,6 +130,8 @@ pub struct App {
     // Parameter configuration
     pub param_configs: Vec<ParamConfig>,
     pub selected_param_index: usize,
+    pub editing_param: Option<ParamField>,
+    pub param_input_buffer: String,
 
     // Timeframe configuration
     pub editing_field: Option<TimeframeField>,
@@ -164,6 +178,8 @@ impl App {
 
             param_configs: Vec::new(),
             selected_param_index: 0,
+            editing_param: None,
+            param_input_buffer: String::new(),
 
             editing_field: None,
             start_date_input: start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -359,6 +375,13 @@ impl App {
     }
 
     fn handle_param_key(&mut self, key: KeyCode) {
+        // If in edit mode, handle editing keys
+        if self.editing_param.is_some() {
+            self.handle_param_edit_key(key);
+            return;
+        }
+
+        // Normal navigation mode
         match key {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.selected_param_index > 0 {
@@ -392,6 +415,16 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('e') => {
+                // Enter edit mode for selected config
+                if let Some(config) = self.param_configs.get(self.selected_param_index) {
+                    self.editing_param = Some(match &config.strategy {
+                        StrategyType::MaCrossover { .. } => ParamField::FastPeriod,
+                        StrategyType::QuadMa { .. } => ParamField::Ma1Period,
+                    });
+                    self.param_input_buffer.clear();
+                }
+            }
             KeyCode::Enter => {
                 // Proceed to running
                 self.total_backtests = self.selected_tokens.len() * self.param_configs.len();
@@ -400,6 +433,60 @@ impl App {
             }
             KeyCode::Esc => {
                 self.current_screen = AppScreen::TimeframeConfig;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_param_edit_key(&mut self, key: KeyCode) {
+        match key {
+            KeyCode::Tab => {
+                // Cycle to next parameter field
+                if let Some(config) = self.param_configs.get(self.selected_param_index) {
+                    self.editing_param = Some(match (&config.strategy, self.editing_param.unwrap()) {
+                        (StrategyType::MaCrossover { .. }, ParamField::FastPeriod) => ParamField::SlowPeriod,
+                        (StrategyType::MaCrossover { .. }, ParamField::SlowPeriod) => ParamField::FastPeriod,
+                        (StrategyType::QuadMa { .. }, ParamField::Ma1Period) => ParamField::Ma2Period,
+                        (StrategyType::QuadMa { .. }, ParamField::Ma2Period) => ParamField::Ma3Period,
+                        (StrategyType::QuadMa { .. }, ParamField::Ma3Period) => ParamField::Ma4Period,
+                        (StrategyType::QuadMa { .. }, ParamField::Ma4Period) => ParamField::Ma1Period,
+                        _ => return, // Invalid combination
+                    });
+                    self.param_input_buffer.clear();
+                }
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                // Append digit to buffer
+                self.param_input_buffer.push(c);
+            }
+            KeyCode::Backspace => {
+                // Remove last character
+                self.param_input_buffer.pop();
+            }
+            KeyCode::Enter => {
+                // Save the edit
+                if let Ok(value) = self.param_input_buffer.parse::<usize>() {
+                    if value > 0 {
+                        if let Some(config) = self.param_configs.get_mut(self.selected_param_index) {
+                            match (&mut config.strategy, self.editing_param.unwrap()) {
+                                (StrategyType::MaCrossover { fast, .. }, ParamField::FastPeriod) => *fast = value,
+                                (StrategyType::MaCrossover { slow, .. }, ParamField::SlowPeriod) => *slow = value,
+                                (StrategyType::QuadMa { ma1, .. }, ParamField::Ma1Period) => *ma1 = value,
+                                (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => *ma2 = value,
+                                (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => *ma3 = value,
+                                (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => *ma4 = value,
+                                _ => {} // Invalid combination
+                            }
+                        }
+                    }
+                }
+                self.editing_param = None;
+                self.param_input_buffer.clear();
+            }
+            KeyCode::Esc => {
+                // Cancel edit
+                self.editing_param = None;
+                self.param_input_buffer.clear();
             }
             _ => {}
         }

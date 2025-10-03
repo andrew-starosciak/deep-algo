@@ -2,7 +2,6 @@ use algo_trade_core::events::{FillEvent, OrderDirection, OrderEvent, OrderType};
 use algo_trade_core::traits::ExecutionHandler;
 use anyhow::Result;
 use async_trait::async_trait;
-use chrono::Utc;
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
@@ -57,7 +56,7 @@ impl ExecutionHandler for SimulatedExecutionHandler {
             quantity: order.quantity,
             price: fill_price,
             commission,
-            timestamp: Utc::now(),
+            timestamp: order.timestamp,
         };
 
         Ok(fill)
