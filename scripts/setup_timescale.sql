@@ -58,3 +58,37 @@ CREATE TABLE IF NOT EXISTS fills (
 CREATE INDEX IF NOT EXISTS idx_fills_timestamp ON fills (timestamp DESC);
 CREATE INDEX IF NOT EXISTS idx_fills_order_id ON fills (order_id);
 CREATE INDEX IF NOT EXISTS idx_fills_symbol ON fills (symbol);
+
+-- Create backtest_results table for storing backtest performance metrics
+CREATE TABLE IF NOT EXISTS backtest_results (
+    timestamp TIMESTAMPTZ NOT NULL,
+    symbol TEXT NOT NULL,
+    exchange TEXT NOT NULL,
+    strategy_name TEXT NOT NULL,
+    sharpe_ratio DECIMAL(10, 4),
+    sortino_ratio DECIMAL(10, 4),
+    total_pnl DECIMAL(20, 8) NOT NULL,
+    total_return DECIMAL(10, 6),
+    win_rate DECIMAL(5, 4),
+    max_drawdown DECIMAL(5, 4),
+    num_trades INTEGER NOT NULL,
+    parameters JSONB,
+    PRIMARY KEY (timestamp, symbol, exchange, strategy_name)
+);
+
+-- Convert to hypertable
+SELECT create_hypertable('backtest_results', 'timestamp', if_not_exists => TRUE);
+
+-- Create indexes for token selection queries
+CREATE INDEX IF NOT EXISTS idx_backtest_results_symbol_time ON backtest_results (symbol, timestamp DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_results_sharpe ON backtest_results (sharpe_ratio DESC);
+CREATE INDEX IF NOT EXISTS idx_backtest_results_strategy ON backtest_results (strategy_name, timestamp DESC);
+
+-- Enable compression for old backtest results
+ALTER TABLE backtest_results SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'symbol, exchange, strategy_name'
+);
+
+-- Compress backtest data older than 30 days
+SELECT add_compression_policy('backtest_results', INTERVAL '30 days');

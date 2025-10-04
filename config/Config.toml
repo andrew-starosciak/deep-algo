@@ -9,3 +9,20 @@ max_connections = 10
 [hyperliquid]
 api_url = "https://api.hyperliquid.xyz"
 ws_url = "wss://api.hyperliquid.xyz/ws"
+
+[backtest_scheduler]
+enabled = true
+cron_schedule = "0 0 3 * * *"  # Daily at 3am UTC
+fetch_universe_from_exchange = true  # Fetch all available tokens from Hyperliquid
+# token_universe = ["BTC", "ETH", "SOL"]  # Optional: only used if fetch_universe_from_exchange = false
+backtest_window_days = 30
+strategy_name = "quad_ma"
+exchange = "hyperliquid"
+hyperliquid_api_url = "https://api.hyperliquid.xyz"
+
+[token_selector]
+min_sharpe_ratio = 1.0
+min_win_rate = 0.50
+max_drawdown = 0.20
+min_num_trades = 10
+lookback_hours = 48

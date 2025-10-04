@@ -18,6 +18,8 @@ algo-trade-core = { path = "../core" }
 algo-trade-data = { path = "../data" }
 algo-trade-hyperliquid = { path = "../exchange-hyperliquid" }
 algo-trade-backtest = { path = "../backtest" }
+algo-trade-backtest-scheduler = { path = "../backtest-scheduler" }
+algo-trade-token-selector = { path = "../token-selector" }
 algo-trade-strategy = { path = "../strategy" }
 algo-trade-bot-orchestrator = { path = "../bot-orchestrator" }
 algo-trade-web-api = { path = "../web-api" }

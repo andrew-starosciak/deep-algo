@@ -63,6 +63,21 @@ enum Commands {
         #[arg(long, default_value = "1m")]
         interval: String,
     },
+    /// Run scheduled backtests (daemon mode)
+    ScheduledBacktest {
+        /// Config file path
+        #[arg(short, long, default_value = "config/Config.toml")]
+        config: String,
+    },
+    /// Run token selection once and display results
+    TokenSelection {
+        /// Config file path
+        #[arg(short, long, default_value = "config/Config.toml")]
+        config: String,
+        /// Strategy name to filter results
+        #[arg(short, long, default_value = "quad_ma")]
+        strategy: String,
+    },
 }
 
 #[tokio::main]
@@ -94,6 +109,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::TuiBacktest { start, end, interval } => {
             run_tui_backtest(start.as_deref(), end.as_deref(), &interval).await?;
+        }
+        Commands::ScheduledBacktest { config } => {
+            run_scheduled_backtest(&config).await?;
+        }
+        Commands::TokenSelection { config, strategy } => {
+            run_token_selection(&config, &strategy).await?;
         }
     }
 
@@ -287,4 +308,84 @@ async fn run_tui_backtest(
 
     // Run TUI application
     tui_backtest::run(start, end, interval.to_string()).await
+}
+
+async fn run_scheduled_backtest(_config_path: &str) -> anyhow::Result<()> {
+    use algo_trade_backtest_scheduler::BacktestScheduler;
+    use algo_trade_data::DatabaseClient;
+    use std::sync::Arc;
+
+    tracing::info!("Starting scheduled backtest daemon");
+
+    // Load config
+    let config = algo_trade_core::ConfigLoader::load()?;
+
+    // Create database client
+    let db_client = Arc::new(DatabaseClient::new(&config.database.url).await?);
+
+    let cron_schedule = config.backtest_scheduler.cron_schedule.clone();
+
+    // Create and start scheduler
+    let scheduler = BacktestScheduler::new(config.backtest_scheduler, db_client);
+
+    tracing::info!("Scheduler started. Running according to cron schedule: {}", cron_schedule);
+    tracing::info!("Press Ctrl+C to stop");
+
+    // This will run forever according to the cron schedule
+    scheduler.start().await?;
+
+    Ok(())
+}
+
+async fn run_token_selection(_config_path: &str, strategy_name: &str) -> anyhow::Result<()> {
+    use algo_trade_token_selector::TokenSelector;
+    use algo_trade_data::DatabaseClient;
+    use std::sync::Arc;
+
+    tracing::info!("Running token selection for strategy: {}", strategy_name);
+
+    // Load config
+    let config = algo_trade_core::ConfigLoader::load()?;
+
+    // Create database client
+    let db_client = Arc::new(DatabaseClient::new(&config.database.url).await?);
+
+    // Create token selector
+    let selector = TokenSelector::new(config.token_selector.clone(), db_client);
+
+    // Get selection details
+    let results = selector.get_selection_details(strategy_name).await?;
+
+    // Display results
+    println!("\n{}", "=".repeat(100));
+    println!("Token Selection Results - Strategy: {}", strategy_name);
+    println!("{}", "=".repeat(100));
+    println!("{:<10} {:>12} {:>10} {:>12} {:>10} {:>15} {:>10}",
+             "Symbol", "Sharpe", "Win Rate", "Max DD", "Trades", "Total PnL", "Approved");
+    println!("{}", "-".repeat(100));
+
+    for result in &results {
+        let approved_mark = if result.approved { "✓" } else { "✗" };
+        println!("{:<10} {:>12.2} {:>9.1}% {:>11.1}% {:>10} {:>15} {:>10}",
+                 result.symbol,
+                 result.sharpe_ratio,
+                 result.win_rate * 100.0,
+                 result.max_drawdown.to_string().parse::<f64>().unwrap_or(0.0) * 100.0,
+                 result.num_trades,
+                 result.total_pnl,
+                 approved_mark);
+    }
+
+    println!("{}", "=".repeat(100));
+
+    let approved_count = results.iter().filter(|r| r.approved).count();
+    println!("\nApproved: {}/{} tokens", approved_count, results.len());
+    println!("\nCriteria:");
+    println!("  - Min Sharpe Ratio: {}", config.token_selector.min_sharpe_ratio);
+    println!("  - Min Win Rate: {}%", config.token_selector.min_win_rate * 100.0);
+    println!("  - Max Drawdown: {}%", config.token_selector.max_drawdown * 100.0);
+    println!("  - Min Trades: {}", config.token_selector.min_num_trades);
+    println!();
+
+    Ok(())
 }

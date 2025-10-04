@@ -6,6 +6,8 @@ members = [
     "crates/strategy",
     "crates/execution",
     "crates/backtest",
+    "crates/backtest-scheduler",
+    "crates/token-selector",
     "crates/bot-orchestrator",
     "crates/web-api",
     "crates/cli",

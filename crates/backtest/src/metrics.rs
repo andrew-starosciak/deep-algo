@@ -1,11 +1,65 @@
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PerformanceMetrics {
     pub total_return: Decimal,
     pub sharpe_ratio: f64,
     pub max_drawdown: Decimal,
     pub num_trades: usize,
     pub win_rate: f64,
+}
+
+impl PerformanceMetrics {
+    /// Converts performance metrics to a database record format.
+    ///
+    /// # Arguments
+    /// * `timestamp` - The timestamp when the backtest was run
+    /// * `symbol` - The trading symbol (e.g., "BTC")
+    /// * `exchange` - The exchange name (e.g., "hyperliquid")
+    /// * `strategy_name` - The name of the strategy (e.g., "quad_ma")
+    /// * `total_pnl` - The total profit/loss from the backtest
+    #[must_use]
+    pub fn to_db_record(
+        &self,
+        timestamp: DateTime<Utc>,
+        symbol: String,
+        exchange: String,
+        strategy_name: String,
+        total_pnl: Decimal,
+    ) -> BacktestResultRecord {
+        BacktestResultRecord {
+            timestamp,
+            symbol,
+            exchange,
+            strategy_name,
+            sharpe_ratio: self.sharpe_ratio,
+            sortino_ratio: None, // Can be added later
+            total_pnl,
+            total_return: self.total_return,
+            win_rate: self.win_rate,
+            max_drawdown: self.max_drawdown,
+            num_trades: self.num_trades,
+            parameters: None, // Can be added later for strategy params
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BacktestResultRecord {
+    pub timestamp: DateTime<Utc>,
+    pub symbol: String,
+    pub exchange: String,
+    pub strategy_name: String,
+    pub sharpe_ratio: f64,
+    pub sortino_ratio: Option<f64>,
+    pub total_pnl: Decimal,
+    pub total_return: Decimal,
+    pub win_rate: f64,
+    pub max_drawdown: Decimal,
+    pub num_trades: usize,
+    pub parameters: Option<serde_json::Value>,
 }
 
 pub struct MetricsCalculator {

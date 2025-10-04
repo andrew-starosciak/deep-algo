@@ -1,0 +1,23 @@
+[package]
+name = "algo-trade-backtest-scheduler"
+version = "0.1.0"
+edition = "2021"
+description = "Automated backtest scheduler for token selection"
+license = "MIT"
+repository = "https://github.com/yourusername/algo-trade"
+keywords = ["trading", "backtest", "scheduler"]
+categories = ["finance"]
+readme = false
+
+[dependencies]
+algo-trade-core = { path = "../core" }
+algo-trade-data = { path = "../data" }
+algo-trade-backtest = { path = "../backtest" }
+algo-trade-hyperliquid = { path = "../exchange-hyperliquid" }
+tokio = { workspace = true }
+tokio-cron-scheduler = "0.13"
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = "0.4"
+rust_decimal = "1.33"
