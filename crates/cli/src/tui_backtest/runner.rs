@@ -156,6 +156,8 @@ async fn run_single_backtest(
             vec![Arc::new(Mutex::new(strategy))]
         }
         StrategyType::QuadMa { ma1, ma2, ma3, ma4, trend_period, volume_factor, take_profit, stop_loss, reversal_confirmation_bars } => {
+            // Precision loss is acceptable for strategy parameters (small integers to ratios)
+            #[allow(clippy::cast_precision_loss)]
             let strategy = QuadMaStrategy::with_full_config(
                 token.to_string(),
                 *ma1,
@@ -190,7 +192,7 @@ async fn run_single_backtest(
     system.run().await
 }
 
-/// Convert FillEvents to TradeRecords with position-aware action labels and PnL tracking
+/// Convert `FillEvent`s to `TradeRecord`s with position-aware action labels and `PnL` tracking
 fn convert_fills_to_trades(fills: &[FillEvent]) -> Vec<TradeRecord> {
     use algo_trade_core::events::OrderDirection;
     use algo_trade_core::position::PositionTracker;

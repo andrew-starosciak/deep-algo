@@ -12,6 +12,7 @@ use ratatui::{
     backend::{Backend, CrosstermBackend},
     Terminal,
 };
+use rust_decimal::prelude::ToPrimitive;
 use std::collections::HashSet;
 use std::io;
 
@@ -100,7 +101,7 @@ impl ParamConfig {
     }
 }
 
-/// Which field is being edited in TimeframeConfig screen
+/// Which field is being edited in `TimeframeConfig` screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeframeField {
     StartDate,
@@ -118,7 +119,7 @@ pub enum DateField {
     Minute,
 }
 
-/// Which parameter is being edited in ParameterConfig screen
+/// Which parameter is being edited in `ParameterConfig` screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum ParamField {
@@ -208,6 +209,33 @@ pub struct App {
     pub start_date: DateTime<Utc>,
     pub end_date: DateTime<Utc>,
     pub interval: String,
+}
+
+/// Calculate profit factor from trade records
+/// Profit Factor = Total Gross Profit / Total Gross Loss
+fn calculate_profit_factor(trades: &[TradeRecord]) -> f64 {
+    use rust_decimal::Decimal;
+
+    let mut gross_profit = Decimal::ZERO;
+    let mut gross_loss = Decimal::ZERO;
+
+    for trade in trades {
+        if let Some(pnl) = trade.pnl {
+            if pnl > Decimal::ZERO {
+                gross_profit += pnl;
+            } else if pnl < Decimal::ZERO {
+                gross_loss += pnl.abs();
+            }
+        }
+    }
+
+    if gross_loss > Decimal::ZERO {
+        (gross_profit / gross_loss).to_f64().unwrap_or(0.0)
+    } else if gross_profit > Decimal::ZERO {
+        999.0  // All wins, no losses - display as "999+"
+    } else {
+        0.0  // No closed trades
+    }
 }
 
 impl App {
@@ -356,142 +384,123 @@ impl App {
         }
     }
 
-    fn handle_timeframe_key(&mut self, key: KeyCode) {
+    /// Get mutable reference to date field based on editing state
+    #[allow(clippy::missing_const_for_fn)] // Can't be const - returns mutable reference
+    fn get_date_field_mut(&mut self) -> Option<&mut String> {
+        match (self.editing_field, self.editing_date_field) {
+            (Some(TimeframeField::StartDate), Some(DateField::Year)) => Some(&mut self.start_year),
+            (Some(TimeframeField::StartDate), Some(DateField::Month)) => Some(&mut self.start_month),
+            (Some(TimeframeField::StartDate), Some(DateField::Day)) => Some(&mut self.start_day),
+            (Some(TimeframeField::StartDate), Some(DateField::Hour)) => Some(&mut self.start_hour),
+            (Some(TimeframeField::StartDate), Some(DateField::Minute)) => Some(&mut self.start_minute),
+            (Some(TimeframeField::EndDate), Some(DateField::Year)) => Some(&mut self.end_year),
+            (Some(TimeframeField::EndDate), Some(DateField::Month)) => Some(&mut self.end_month),
+            (Some(TimeframeField::EndDate), Some(DateField::Day)) => Some(&mut self.end_day),
+            (Some(TimeframeField::EndDate), Some(DateField::Hour)) => Some(&mut self.end_hour),
+            (Some(TimeframeField::EndDate), Some(DateField::Minute)) => Some(&mut self.end_minute),
+            _ => None,
+        }
+    }
+
+    /// Handle Tab key for cycling fields
+    #[allow(clippy::missing_const_for_fn)] // Can't be const - mutates self
+    fn handle_tab_key(&mut self) {
+        if let Some(TimeframeField::StartDate | TimeframeField::EndDate) = self.editing_field {
+            // Cycle through date components
+            self.editing_date_field = Some(match self.editing_date_field {
+                None | Some(DateField::Minute) => DateField::Year,
+                Some(DateField::Year) => DateField::Month,
+                Some(DateField::Month) => DateField::Day,
+                Some(DateField::Day) => DateField::Hour,
+                Some(DateField::Hour) => DateField::Minute,
+            });
+        } else {
+            // Cycle through main fields
+            let new_field = Some(match self.editing_field {
+                None | Some(TimeframeField::Interval) => TimeframeField::StartDate,
+                Some(TimeframeField::StartDate) => TimeframeField::EndDate,
+                Some(TimeframeField::EndDate) => TimeframeField::Interval,
+            });
+
+            // When entering a date field, auto-initialize to Year component
+            if matches!(new_field, Some(TimeframeField::StartDate | TimeframeField::EndDate)) {
+                self.editing_date_field = Some(DateField::Year);
+            } else {
+                self.editing_date_field = None;
+            }
+
+            self.editing_field = new_field;
+        }
+    }
+
+    /// Handle up/down navigation for interval or date increment
+    fn handle_timeframe_navigation(&mut self, up: bool) {
+        match self.editing_field {
+            Some(TimeframeField::Interval) => {
+                if up && self.selected_interval_index > 0 {
+                    self.selected_interval_index -= 1;
+                    self.interval = self.interval_options[self.selected_interval_index].to_string();
+                } else if !up && self.selected_interval_index < self.interval_options.len() - 1 {
+                    self.selected_interval_index += 1;
+                    self.interval = self.interval_options[self.selected_interval_index].to_string();
+                }
+            }
+            Some(TimeframeField::StartDate | TimeframeField::EndDate) => {
+                self.increment_date_field(up);
+            }
+            _ => {}
+        }
+    }
+
+    /// Try to parse and commit datetime from components
+    fn try_commit_datetime(&mut self) {
         use chrono::DateTime;
 
+        let start_str = format!(
+            "{}-{}-{}T{}:{}:00Z",
+            self.start_year, self.start_month, self.start_day,
+            self.start_hour, self.start_minute
+        );
+        let end_str = format!(
+            "{}-{}-{}T{}:{}:00Z",
+            self.end_year, self.end_month, self.end_day,
+            self.end_hour, self.end_minute
+        );
+
+        if let (Ok(start), Ok(end)) = (
+            start_str.parse::<DateTime<chrono::Utc>>(),
+            end_str.parse::<DateTime<chrono::Utc>>(),
+        ) {
+            if start < end {
+                self.start_date = start;
+                self.end_date = end;
+                self.current_screen = AppScreen::ParameterConfig;
+            }
+        }
+    }
+
+    fn handle_timeframe_key(&mut self, key: KeyCode) {
         match key {
-            KeyCode::Tab => {
-                match self.editing_field {
-                    Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate) => {
-                        // Cycle through date components
-                        self.editing_date_field = Some(match self.editing_date_field {
-                            None | Some(DateField::Minute) => DateField::Year,
-                            Some(DateField::Year) => DateField::Month,
-                            Some(DateField::Month) => DateField::Day,
-                            Some(DateField::Day) => DateField::Hour,
-                            Some(DateField::Hour) => DateField::Minute,
-                        });
-                    }
-                    _ => {
-                        // Cycle through main fields
-                        let new_field = Some(match self.editing_field {
-                            None | Some(TimeframeField::Interval) => TimeframeField::StartDate,
-                            Some(TimeframeField::StartDate) => TimeframeField::EndDate,
-                            Some(TimeframeField::EndDate) => TimeframeField::Interval,
-                        });
-
-                        // When entering a date field, auto-initialize to Year component
-                        if matches!(new_field, Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate)) {
-                            self.editing_date_field = Some(DateField::Year);
-                        } else {
-                            self.editing_date_field = None;
-                        }
-
-                        self.editing_field = new_field;
-                    }
-                }
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                match self.editing_field {
-                    Some(TimeframeField::Interval) => {
-                        if self.selected_interval_index > 0 {
-                            self.selected_interval_index -= 1;
-                            self.interval = self.interval_options[self.selected_interval_index].to_string();
-                        }
-                    }
-                    Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate) => {
-                        // Increment date component
-                        self.increment_date_field(true);
-                    }
-                    _ => {}
-                }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                match self.editing_field {
-                    Some(TimeframeField::Interval) => {
-                        if self.selected_interval_index < self.interval_options.len() - 1 {
-                            self.selected_interval_index += 1;
-                            self.interval = self.interval_options[self.selected_interval_index].to_string();
-                        }
-                    }
-                    Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate) => {
-                        // Decrement date component
-                        self.increment_date_field(false);
-                    }
-                    _ => {}
-                }
-            }
+            KeyCode::Tab => self.handle_tab_key(),
+            KeyCode::Up | KeyCode::Char('k') => self.handle_timeframe_navigation(true),
+            KeyCode::Down | KeyCode::Char('j') => self.handle_timeframe_navigation(false),
             KeyCode::Char(c) if c.is_ascii_digit() => {
-                // Type digits into active date component
-                let field_ref = match (self.editing_field, self.editing_date_field) {
-                    (Some(TimeframeField::StartDate), Some(DateField::Year)) => Some(&mut self.start_year),
-                    (Some(TimeframeField::StartDate), Some(DateField::Month)) => Some(&mut self.start_month),
-                    (Some(TimeframeField::StartDate), Some(DateField::Day)) => Some(&mut self.start_day),
-                    (Some(TimeframeField::StartDate), Some(DateField::Hour)) => Some(&mut self.start_hour),
-                    (Some(TimeframeField::StartDate), Some(DateField::Minute)) => Some(&mut self.start_minute),
-                    (Some(TimeframeField::EndDate), Some(DateField::Year)) => Some(&mut self.end_year),
-                    (Some(TimeframeField::EndDate), Some(DateField::Month)) => Some(&mut self.end_month),
-                    (Some(TimeframeField::EndDate), Some(DateField::Day)) => Some(&mut self.end_day),
-                    (Some(TimeframeField::EndDate), Some(DateField::Hour)) => Some(&mut self.end_hour),
-                    (Some(TimeframeField::EndDate), Some(DateField::Minute)) => Some(&mut self.end_minute),
-                    _ => None,
+                let max_len = match self.editing_date_field {
+                    Some(DateField::Year) => 4,
+                    _ => 2,
                 };
-
-                if let Some(field) = field_ref {
-                    // Limit field lengths: Year=4, others=2
-                    let max_len = match self.editing_date_field {
-                        Some(DateField::Year) => 4,
-                        _ => 2,
-                    };
+                if let Some(field) = self.get_date_field_mut() {
                     if field.len() < max_len {
                         field.push(c);
                     }
                 }
             }
             KeyCode::Backspace => {
-                // Delete from active date component
-                let field_ref = match (self.editing_field, self.editing_date_field) {
-                    (Some(TimeframeField::StartDate), Some(DateField::Year)) => Some(&mut self.start_year),
-                    (Some(TimeframeField::StartDate), Some(DateField::Month)) => Some(&mut self.start_month),
-                    (Some(TimeframeField::StartDate), Some(DateField::Day)) => Some(&mut self.start_day),
-                    (Some(TimeframeField::StartDate), Some(DateField::Hour)) => Some(&mut self.start_hour),
-                    (Some(TimeframeField::StartDate), Some(DateField::Minute)) => Some(&mut self.start_minute),
-                    (Some(TimeframeField::EndDate), Some(DateField::Year)) => Some(&mut self.end_year),
-                    (Some(TimeframeField::EndDate), Some(DateField::Month)) => Some(&mut self.end_month),
-                    (Some(TimeframeField::EndDate), Some(DateField::Day)) => Some(&mut self.end_day),
-                    (Some(TimeframeField::EndDate), Some(DateField::Hour)) => Some(&mut self.end_hour),
-                    (Some(TimeframeField::EndDate), Some(DateField::Minute)) => Some(&mut self.end_minute),
-                    _ => None,
-                };
-
-                if let Some(field) = field_ref {
+                if let Some(field) = self.get_date_field_mut() {
                     field.pop();
                 }
             }
-            KeyCode::Enter => {
-                // Reconstruct DateTime from components and proceed to parameter config
-                let start_str = format!(
-                    "{}-{}-{}T{}:{}:00Z",
-                    self.start_year, self.start_month, self.start_day,
-                    self.start_hour, self.start_minute
-                );
-                let end_str = format!(
-                    "{}-{}-{}T{}:{}:00Z",
-                    self.end_year, self.end_month, self.end_day,
-                    self.end_hour, self.end_minute
-                );
-
-                if let (Ok(start), Ok(end)) = (
-                    start_str.parse::<DateTime<chrono::Utc>>(),
-                    end_str.parse::<DateTime<chrono::Utc>>(),
-                ) {
-                    if start < end {
-                        self.start_date = start;
-                        self.end_date = end;
-                        self.current_screen = AppScreen::ParameterConfig;
-                    }
-                }
-            }
+            KeyCode::Enter => self.try_commit_datetime(),
             KeyCode::Esc => {
                 if self.editing_date_field.is_some() {
                     self.editing_date_field = None;
@@ -525,7 +534,8 @@ impl App {
                 if increment {
                     val = (val + 1).min(max_val);
                 } else {
-                    val = val.saturating_sub(1).max(if matches!(self.editing_date_field, Some(DateField::Month | DateField::Day)) { 1 } else { 0 });
+                    let min_val = usize::from(matches!(self.editing_date_field, Some(DateField::Month | DateField::Day)));
+                    val = val.saturating_sub(1).max(min_val);
                 }
                 *field = format!("{:0width$}", val, width = field.len().max(if matches!(self.editing_date_field, Some(DateField::Year)) { 4 } else { 2 }));
             }
@@ -708,7 +718,7 @@ impl App {
             }
             KeyCode::Char('s') => {
                 // Toggle sort column (cycle through)
-                self.sort_column = (self.sort_column + 1) % 6;
+                self.sort_column = (self.sort_column + 1) % 12;
                 self.sort_results();
             }
             KeyCode::Char('r') => {
@@ -750,9 +760,40 @@ impl App {
                 0 => a.token.cmp(&b.token),
                 1 => a.config_name.cmp(&b.config_name),
                 2 => a.total_return.cmp(&b.total_return),
-                3 => a.sharpe_ratio.partial_cmp(&b.sharpe_ratio).unwrap_or(std::cmp::Ordering::Equal),
+                3 => {
+                    // Ret$ = final_capital - initial_capital
+                    let ret_a = a.metrics.as_ref().map(|m| m.final_capital - m.initial_capital);
+                    let ret_b = b.metrics.as_ref().map(|m| m.final_capital - m.initial_capital);
+                    ret_a.cmp(&ret_b)
+                }
                 4 => a.max_drawdown.cmp(&b.max_drawdown),
-                5 => a.num_trades.cmp(&b.num_trades),
+                5 => a.sharpe_ratio.partial_cmp(&b.sharpe_ratio).unwrap_or(std::cmp::Ordering::Equal),
+                6 => a.num_trades.cmp(&b.num_trades),
+                7 => a.win_rate.partial_cmp(&b.win_rate).unwrap_or(std::cmp::Ordering::Equal),
+                8 => {
+                    // Fin$ = final_capital
+                    let fin_a = a.metrics.as_ref().map(|m| m.final_capital);
+                    let fin_b = b.metrics.as_ref().map(|m| m.final_capital);
+                    fin_a.cmp(&fin_b)
+                }
+                9 => {
+                    // Peak$ = equity_peak
+                    let peak_a = a.metrics.as_ref().map(|m| m.equity_peak);
+                    let peak_b = b.metrics.as_ref().map(|m| m.equity_peak);
+                    peak_a.cmp(&peak_b)
+                }
+                10 => {
+                    // B&H% = buy_hold_return
+                    let bh_a = a.metrics.as_ref().map(|m| m.buy_hold_return);
+                    let bh_b = b.metrics.as_ref().map(|m| m.buy_hold_return);
+                    bh_a.cmp(&bh_b)
+                }
+                11 => {
+                    // PF = profit_factor (calculated from trades)
+                    let pf_a = calculate_profit_factor(&a.trades);
+                    let pf_b = calculate_profit_factor(&b.trades);
+                    pf_a.partial_cmp(&pf_b).unwrap_or(std::cmp::Ordering::Equal)
+                }
                 _ => std::cmp::Ordering::Equal,
             };
 
