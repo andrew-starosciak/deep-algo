@@ -19,17 +19,29 @@ use std::io;
 #[derive(Debug, Clone)]
 pub struct TradeRecord {
     pub timestamp: DateTime<Utc>,
-    pub action: String,  // "LONG" | "SHORT" | "CLOSE LONG" | "CLOSE SHORT"
+    pub action: String,  // "OPEN LONG" | "ADD LONG" | "CLOSE LONG" | "OPEN SHORT" | "ADD SHORT" | "CLOSE SHORT"
     pub price: rust_decimal::Decimal,
     pub quantity: rust_decimal::Decimal,
     pub commission: rust_decimal::Decimal,
+    pub pnl: Option<rust_decimal::Decimal>,  // PnL for closing trades, None for opening
+    pub position_value: rust_decimal::Decimal,  // quantity × price in USDC
 }
 
 /// Strategy configuration
 #[derive(Debug, Clone)]
 pub enum StrategyType {
     MaCrossover { fast: usize, slow: usize },
-    QuadMa { ma1: usize, ma2: usize, ma3: usize, ma4: usize },
+    QuadMa {
+        ma1: usize,
+        ma2: usize,
+        ma3: usize,
+        ma4: usize,
+        trend_period: usize,
+        volume_factor: usize,  // hundredths (150 = 1.5x)
+        take_profit: usize,    // basis points (200 = 2.0%)
+        stop_loss: usize,      // basis points (100 = 1.0%)
+        reversal_confirmation_bars: usize,  // bars to confirm reversal (2 = default)
+    },
 }
 
 impl StrategyType {
@@ -52,6 +64,7 @@ pub enum AppScreen {
     Running,
     Results,
     TradeDetail,
+    MetricsDetail,
 }
 
 /// Parameter configuration set
@@ -71,8 +84,18 @@ impl ParamConfig {
 
     pub fn default_quad_ma() -> Self {
         Self {
-            name: "Fibonacci (5/8/13/21)".to_string(),
-            strategy: StrategyType::QuadMa { ma1: 5, ma2: 8, ma3: 13, ma4: 21 },
+            name: "Default (5/10/20/50)".to_string(),
+            strategy: StrategyType::QuadMa {
+                ma1: 5,
+                ma2: 10,
+                ma3: 20,
+                ma4: 50,
+                trend_period: 100,
+                volume_factor: 150,  // 1.5x
+                take_profit: 200,    // 2.0%
+                stop_loss: 100,      // 1.0%
+                reversal_confirmation_bars: 2,  // 2 bars confirmation
+            },
         }
     }
 }
@@ -85,6 +108,16 @@ pub enum TimeframeField {
     Interval,
 }
 
+/// Which date component is being edited
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DateField {
+    Year,
+    Month,
+    Day,
+    Hour,
+    Minute,
+}
+
 /// Which parameter is being edited in ParameterConfig screen
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
@@ -95,6 +128,11 @@ pub enum ParamField {
     Ma2Period,
     Ma3Period,
     Ma4Period,
+    TrendPeriod,
+    VolumeFactor,
+    TakeProfit,
+    StopLoss,
+    ReversalConfirmBars,
 }
 
 /// Backtest result for a single token/config combination
@@ -109,6 +147,7 @@ pub struct BacktestResult {
     #[allow(dead_code)]
     pub win_rate: f64,
     pub trades: Vec<TradeRecord>,
+    pub metrics: Option<algo_trade_core::engine::PerformanceMetrics>,
 }
 
 /// Main application state
@@ -135,8 +174,17 @@ pub struct App {
 
     // Timeframe configuration
     pub editing_field: Option<TimeframeField>,
-    pub start_date_input: String,
-    pub end_date_input: String,
+    pub editing_date_field: Option<DateField>,
+    pub start_year: String,
+    pub start_month: String,
+    pub start_day: String,
+    pub start_hour: String,
+    pub start_minute: String,
+    pub end_year: String,
+    pub end_month: String,
+    pub end_day: String,
+    pub end_hour: String,
+    pub end_minute: String,
     pub interval_options: Vec<&'static str>,
     pub selected_interval_index: usize,
 
@@ -182,8 +230,17 @@ impl App {
             param_input_buffer: String::new(),
 
             editing_field: None,
-            start_date_input: start.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-            end_date_input: end.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            editing_date_field: None,
+            start_year: start.format("%Y").to_string(),
+            start_month: start.format("%m").to_string(),
+            start_day: start.format("%d").to_string(),
+            start_hour: start.format("%H").to_string(),
+            start_minute: start.format("%M").to_string(),
+            end_year: end.format("%Y").to_string(),
+            end_month: end.format("%m").to_string(),
+            end_day: end.format("%d").to_string(),
+            end_hour: end.format("%H").to_string(),
+            end_minute: end.format("%M").to_string(),
             interval_options: vec!["1m", "5m", "15m", "30m", "1h", "4h", "1d"],
             selected_interval_index: interval_options_index(&interval),
 
@@ -216,6 +273,7 @@ impl App {
             AppScreen::Running => self.handle_running_key(key),
             AppScreen::Results => self.handle_results_key(key),
             AppScreen::TradeDetail => self.handle_trade_detail_key(key),
+            AppScreen::MetricsDetail => self.handle_metrics_detail_key(key),
         }
     }
 
@@ -303,58 +361,129 @@ impl App {
 
         match key {
             KeyCode::Tab => {
-                // Cycle through fields
-                self.editing_field = Some(match self.editing_field {
-                    None | Some(TimeframeField::Interval) => TimeframeField::StartDate,
-                    Some(TimeframeField::StartDate) => TimeframeField::EndDate,
-                    Some(TimeframeField::EndDate) => TimeframeField::Interval,
-                });
+                match self.editing_field {
+                    Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate) => {
+                        // Cycle through date components
+                        self.editing_date_field = Some(match self.editing_date_field {
+                            None | Some(DateField::Minute) => DateField::Year,
+                            Some(DateField::Year) => DateField::Month,
+                            Some(DateField::Month) => DateField::Day,
+                            Some(DateField::Day) => DateField::Hour,
+                            Some(DateField::Hour) => DateField::Minute,
+                        });
+                    }
+                    _ => {
+                        // Cycle through main fields
+                        let new_field = Some(match self.editing_field {
+                            None | Some(TimeframeField::Interval) => TimeframeField::StartDate,
+                            Some(TimeframeField::StartDate) => TimeframeField::EndDate,
+                            Some(TimeframeField::EndDate) => TimeframeField::Interval,
+                        });
+
+                        // When entering a date field, auto-initialize to Year component
+                        if matches!(new_field, Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate)) {
+                            self.editing_date_field = Some(DateField::Year);
+                        } else {
+                            self.editing_date_field = None;
+                        }
+
+                        self.editing_field = new_field;
+                    }
+                }
             }
             KeyCode::Up | KeyCode::Char('k') => {
-                if let Some(TimeframeField::Interval) = self.editing_field {
-                    if self.selected_interval_index > 0 {
-                        self.selected_interval_index -= 1;
-                        self.interval = self.interval_options[self.selected_interval_index].to_string();
+                match self.editing_field {
+                    Some(TimeframeField::Interval) => {
+                        if self.selected_interval_index > 0 {
+                            self.selected_interval_index -= 1;
+                            self.interval = self.interval_options[self.selected_interval_index].to_string();
+                        }
                     }
+                    Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate) => {
+                        // Increment date component
+                        self.increment_date_field(true);
+                    }
+                    _ => {}
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if let Some(TimeframeField::Interval) = self.editing_field {
-                    if self.selected_interval_index < self.interval_options.len() - 1 {
-                        self.selected_interval_index += 1;
-                        self.interval = self.interval_options[self.selected_interval_index].to_string();
-                    }
-                }
-            }
-            KeyCode::Char(c) => {
-                // Text input for date fields
                 match self.editing_field {
-                    Some(TimeframeField::StartDate) => {
-                        self.start_date_input.push(c);
+                    Some(TimeframeField::Interval) => {
+                        if self.selected_interval_index < self.interval_options.len() - 1 {
+                            self.selected_interval_index += 1;
+                            self.interval = self.interval_options[self.selected_interval_index].to_string();
+                        }
                     }
-                    Some(TimeframeField::EndDate) => {
-                        self.end_date_input.push(c);
+                    Some(TimeframeField::StartDate) | Some(TimeframeField::EndDate) => {
+                        // Decrement date component
+                        self.increment_date_field(false);
                     }
                     _ => {}
+                }
+            }
+            KeyCode::Char(c) if c.is_ascii_digit() => {
+                // Type digits into active date component
+                let field_ref = match (self.editing_field, self.editing_date_field) {
+                    (Some(TimeframeField::StartDate), Some(DateField::Year)) => Some(&mut self.start_year),
+                    (Some(TimeframeField::StartDate), Some(DateField::Month)) => Some(&mut self.start_month),
+                    (Some(TimeframeField::StartDate), Some(DateField::Day)) => Some(&mut self.start_day),
+                    (Some(TimeframeField::StartDate), Some(DateField::Hour)) => Some(&mut self.start_hour),
+                    (Some(TimeframeField::StartDate), Some(DateField::Minute)) => Some(&mut self.start_minute),
+                    (Some(TimeframeField::EndDate), Some(DateField::Year)) => Some(&mut self.end_year),
+                    (Some(TimeframeField::EndDate), Some(DateField::Month)) => Some(&mut self.end_month),
+                    (Some(TimeframeField::EndDate), Some(DateField::Day)) => Some(&mut self.end_day),
+                    (Some(TimeframeField::EndDate), Some(DateField::Hour)) => Some(&mut self.end_hour),
+                    (Some(TimeframeField::EndDate), Some(DateField::Minute)) => Some(&mut self.end_minute),
+                    _ => None,
+                };
+
+                if let Some(field) = field_ref {
+                    // Limit field lengths: Year=4, others=2
+                    let max_len = match self.editing_date_field {
+                        Some(DateField::Year) => 4,
+                        _ => 2,
+                    };
+                    if field.len() < max_len {
+                        field.push(c);
+                    }
                 }
             }
             KeyCode::Backspace => {
-                // Delete character from date fields
-                match self.editing_field {
-                    Some(TimeframeField::StartDate) => {
-                        self.start_date_input.pop();
-                    }
-                    Some(TimeframeField::EndDate) => {
-                        self.end_date_input.pop();
-                    }
-                    _ => {}
+                // Delete from active date component
+                let field_ref = match (self.editing_field, self.editing_date_field) {
+                    (Some(TimeframeField::StartDate), Some(DateField::Year)) => Some(&mut self.start_year),
+                    (Some(TimeframeField::StartDate), Some(DateField::Month)) => Some(&mut self.start_month),
+                    (Some(TimeframeField::StartDate), Some(DateField::Day)) => Some(&mut self.start_day),
+                    (Some(TimeframeField::StartDate), Some(DateField::Hour)) => Some(&mut self.start_hour),
+                    (Some(TimeframeField::StartDate), Some(DateField::Minute)) => Some(&mut self.start_minute),
+                    (Some(TimeframeField::EndDate), Some(DateField::Year)) => Some(&mut self.end_year),
+                    (Some(TimeframeField::EndDate), Some(DateField::Month)) => Some(&mut self.end_month),
+                    (Some(TimeframeField::EndDate), Some(DateField::Day)) => Some(&mut self.end_day),
+                    (Some(TimeframeField::EndDate), Some(DateField::Hour)) => Some(&mut self.end_hour),
+                    (Some(TimeframeField::EndDate), Some(DateField::Minute)) => Some(&mut self.end_minute),
+                    _ => None,
+                };
+
+                if let Some(field) = field_ref {
+                    field.pop();
                 }
             }
             KeyCode::Enter => {
-                // Parse dates and proceed to parameter config
+                // Reconstruct DateTime from components and proceed to parameter config
+                let start_str = format!(
+                    "{}-{}-{}T{}:{}:00Z",
+                    self.start_year, self.start_month, self.start_day,
+                    self.start_hour, self.start_minute
+                );
+                let end_str = format!(
+                    "{}-{}-{}T{}:{}:00Z",
+                    self.end_year, self.end_month, self.end_day,
+                    self.end_hour, self.end_minute
+                );
+
                 if let (Ok(start), Ok(end)) = (
-                    self.start_date_input.parse::<DateTime<chrono::Utc>>(),
-                    self.end_date_input.parse::<DateTime<chrono::Utc>>(),
+                    start_str.parse::<DateTime<chrono::Utc>>(),
+                    end_str.parse::<DateTime<chrono::Utc>>(),
                 ) {
                     if start < end {
                         self.start_date = start;
@@ -364,13 +493,42 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                if self.editing_field.is_some() {
+                if self.editing_date_field.is_some() {
+                    self.editing_date_field = None;
+                } else if self.editing_field.is_some() {
                     self.editing_field = None;
                 } else {
                     self.current_screen = AppScreen::TokenSelection;
                 }
             }
             _ => {}
+        }
+    }
+
+    fn increment_date_field(&mut self, increment: bool) {
+        let (field_ref, max_val) = match (self.editing_field, self.editing_date_field) {
+            (Some(TimeframeField::StartDate), Some(DateField::Year)) => (Some(&mut self.start_year), 9999),
+            (Some(TimeframeField::StartDate), Some(DateField::Month)) => (Some(&mut self.start_month), 12),
+            (Some(TimeframeField::StartDate), Some(DateField::Day)) => (Some(&mut self.start_day), 31),
+            (Some(TimeframeField::StartDate), Some(DateField::Hour)) => (Some(&mut self.start_hour), 23),
+            (Some(TimeframeField::StartDate), Some(DateField::Minute)) => (Some(&mut self.start_minute), 59),
+            (Some(TimeframeField::EndDate), Some(DateField::Year)) => (Some(&mut self.end_year), 9999),
+            (Some(TimeframeField::EndDate), Some(DateField::Month)) => (Some(&mut self.end_month), 12),
+            (Some(TimeframeField::EndDate), Some(DateField::Day)) => (Some(&mut self.end_day), 31),
+            (Some(TimeframeField::EndDate), Some(DateField::Hour)) => (Some(&mut self.end_hour), 23),
+            (Some(TimeframeField::EndDate), Some(DateField::Minute)) => (Some(&mut self.end_minute), 59),
+            _ => (None, 0),
+        };
+
+        if let Some(field) = field_ref {
+            if let Ok(mut val) = field.parse::<usize>() {
+                if increment {
+                    val = (val + 1).min(max_val);
+                } else {
+                    val = val.saturating_sub(1).max(if matches!(self.editing_date_field, Some(DateField::Month | DateField::Day)) { 1 } else { 0 });
+                }
+                *field = format!("{:0width$}", val, width = field.len().max(if matches!(self.editing_date_field, Some(DateField::Year)) { 4 } else { 2 }));
+            }
         }
     }
 
@@ -441,6 +599,30 @@ impl App {
     fn handle_param_edit_key(&mut self, key: KeyCode) {
         match key {
             KeyCode::Tab => {
+                // Save current field before cycling to next
+                if !self.param_input_buffer.is_empty() {
+                    if let Ok(value) = self.param_input_buffer.parse::<usize>() {
+                        if value > 0 {
+                            if let Some(config) = self.param_configs.get_mut(self.selected_param_index) {
+                                match (&mut config.strategy, self.editing_param.unwrap()) {
+                                    (StrategyType::MaCrossover { fast, .. }, ParamField::FastPeriod) => *fast = value,
+                                    (StrategyType::MaCrossover { slow, .. }, ParamField::SlowPeriod) => *slow = value,
+                                    (StrategyType::QuadMa { ma1, .. }, ParamField::Ma1Period) => *ma1 = value,
+                                    (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => *ma2 = value,
+                                    (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => *ma3 = value,
+                                    (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => *ma4 = value,
+                                    (StrategyType::QuadMa { trend_period, .. }, ParamField::TrendPeriod) => *trend_period = value,
+                                    (StrategyType::QuadMa { volume_factor, .. }, ParamField::VolumeFactor) => *volume_factor = value,
+                                    (StrategyType::QuadMa { take_profit, .. }, ParamField::TakeProfit) => *take_profit = value,
+                                    (StrategyType::QuadMa { stop_loss, .. }, ParamField::StopLoss) => *stop_loss = value,
+                                    (StrategyType::QuadMa { reversal_confirmation_bars, .. }, ParamField::ReversalConfirmBars) => *reversal_confirmation_bars = value,
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Cycle to next parameter field
                 if let Some(config) = self.param_configs.get(self.selected_param_index) {
                     self.editing_param = Some(match (&config.strategy, self.editing_param.unwrap()) {
@@ -449,7 +631,12 @@ impl App {
                         (StrategyType::QuadMa { .. }, ParamField::Ma1Period) => ParamField::Ma2Period,
                         (StrategyType::QuadMa { .. }, ParamField::Ma2Period) => ParamField::Ma3Period,
                         (StrategyType::QuadMa { .. }, ParamField::Ma3Period) => ParamField::Ma4Period,
-                        (StrategyType::QuadMa { .. }, ParamField::Ma4Period) => ParamField::Ma1Period,
+                        (StrategyType::QuadMa { .. }, ParamField::Ma4Period) => ParamField::TrendPeriod,
+                        (StrategyType::QuadMa { .. }, ParamField::TrendPeriod) => ParamField::VolumeFactor,
+                        (StrategyType::QuadMa { .. }, ParamField::VolumeFactor) => ParamField::TakeProfit,
+                        (StrategyType::QuadMa { .. }, ParamField::TakeProfit) => ParamField::StopLoss,
+                        (StrategyType::QuadMa { .. }, ParamField::StopLoss) => ParamField::ReversalConfirmBars,
+                        (StrategyType::QuadMa { .. }, ParamField::ReversalConfirmBars) => ParamField::Ma1Period,
                         _ => return, // Invalid combination
                     });
                     self.param_input_buffer.clear();
@@ -475,6 +662,11 @@ impl App {
                                 (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => *ma2 = value,
                                 (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => *ma3 = value,
                                 (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => *ma4 = value,
+                                (StrategyType::QuadMa { trend_period, .. }, ParamField::TrendPeriod) => *trend_period = value,
+                                (StrategyType::QuadMa { volume_factor, .. }, ParamField::VolumeFactor) => *volume_factor = value,
+                                (StrategyType::QuadMa { take_profit, .. }, ParamField::TakeProfit) => *take_profit = value,
+                                (StrategyType::QuadMa { stop_loss, .. }, ParamField::StopLoss) => *stop_loss = value,
+                                (StrategyType::QuadMa { reversal_confirmation_bars, .. }, ParamField::ReversalConfirmBars) => *reversal_confirmation_bars = value,
                                 _ => {} // Invalid combination
                             }
                         }
@@ -541,6 +733,13 @@ impl App {
                     self.current_screen = AppScreen::TradeDetail;
                 }
             }
+            KeyCode::Char('m') => {
+                // View metrics detail
+                if !self.results.is_empty() {
+                    self.selected_result_index = Some(self.results_scroll_offset);
+                    self.current_screen = AppScreen::MetricsDetail;
+                }
+            }
             _ => {}
         }
     }
@@ -588,12 +787,19 @@ impl App {
             _ => {}
         }
     }
+
+    fn handle_metrics_detail_key(&mut self, key: KeyCode) {
+        if key == KeyCode::Esc {
+            self.current_screen = AppScreen::Results;
+            self.selected_result_index = None;
+        }
+    }
 }
 
-/// Find index of interval in options list, defaults to 4 (1h) if not found
+/// Find index of interval in options list, defaults to 0 (1m) if not found
 fn interval_options_index(interval: &str) -> usize {
     let options = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"];
-    options.iter().position(|&i| i == interval).unwrap_or(4)
+    options.iter().position(|&i| i == interval).unwrap_or(0)
 }
 
 /// Main entry point for TUI application

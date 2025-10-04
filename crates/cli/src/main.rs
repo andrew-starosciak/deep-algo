@@ -59,8 +59,8 @@ enum Commands {
         /// End date for historical data (defaults to today)
         #[arg(long)]
         end: Option<String>,
-        /// Candle interval (defaults to 1h)
-        #[arg(long, default_value = "1h")]
+        /// Candle interval (defaults to 1m)
+        #[arg(long, default_value = "1m")]
         interval: String,
     },
 }
@@ -154,9 +154,10 @@ async fn run_backtest(data_path: &str, strategy_name: &str) -> anyhow::Result<()
         _ => anyhow::bail!("Unknown strategy: '{strategy_name}'. Available: ma_crossover, quad_ma"),
     };
 
-    // Create risk manager
+    // Create risk manager with equity-based position sizing
+    // Risk 5% of equity per trade, max 20% in any single position
     let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
-        Arc::new(SimpleRiskManager::new(1000.0, 0.1));
+        Arc::new(SimpleRiskManager::new(0.05, 0.20));
 
     // Create trading system
     let mut system = TradingSystem::new(
@@ -273,7 +274,7 @@ async fn run_tui_backtest(
         start_str.parse()
             .context("Invalid start time. Use ISO 8601 format (e.g., 2025-01-01T00:00:00Z)")?
     } else {
-        end - Duration::days(60) // Default: 60 days before end
+        end - Duration::days(3) // Default: 3 days before end
     };
 
     if start >= end {

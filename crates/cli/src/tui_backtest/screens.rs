@@ -17,6 +17,7 @@ pub fn render(f: &mut Frame, app: &App) {
         AppScreen::Running => render_running(f, app),
         AppScreen::Results => render_results(f, app),
         AppScreen::TradeDetail => render_trade_detail(f, app),
+        AppScreen::MetricsDetail => render_metrics_detail(f, app),
     }
 }
 
@@ -126,7 +127,7 @@ fn render_token_selection(f: &mut Frame, app: &App) {
 }
 
 fn render_timeframe_config(f: &mut Frame, app: &App) {
-    use super::TimeframeField;
+    use super::{TimeframeField, DateField};
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -156,24 +157,58 @@ fn render_timeframe_config(f: &mut Frame, app: &App) {
         .split(chunks[1]);
 
     // Start date field
-    let start_style = if app.editing_field == Some(TimeframeField::StartDate) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    let start_is_editing = app.editing_field == Some(TimeframeField::StartDate);
+    let start_line = if !start_is_editing {
+        Line::from(format!(
+            "Start: {}-{}-{} {}:{}",
+            app.start_year, app.start_month, app.start_day,
+            app.start_hour, app.start_minute
+        ))
     } else {
-        Style::default()
+        let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let normal = Style::default();
+        Line::from(vec![
+            Span::raw("Start: "),
+            Span::styled(&app.start_year, if app.editing_date_field == Some(DateField::Year) { cyan } else { normal }),
+            Span::raw("-"),
+            Span::styled(&app.start_month, if app.editing_date_field == Some(DateField::Month) { cyan } else { normal }),
+            Span::raw("-"),
+            Span::styled(&app.start_day, if app.editing_date_field == Some(DateField::Day) { cyan } else { normal }),
+            Span::raw(" "),
+            Span::styled(&app.start_hour, if app.editing_date_field == Some(DateField::Hour) { cyan } else { normal }),
+            Span::raw(":"),
+            Span::styled(&app.start_minute, if app.editing_date_field == Some(DateField::Minute) { cyan } else { normal }),
+        ])
     };
-    let start_field = Paragraph::new(format!("Start: {}", app.start_date_input))
-        .style(start_style)
+    let start_field = Paragraph::new(start_line)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(start_field, form_chunks[0]);
 
     // End date field
-    let end_style = if app.editing_field == Some(TimeframeField::EndDate) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    let end_is_editing = app.editing_field == Some(TimeframeField::EndDate);
+    let end_line = if !end_is_editing {
+        Line::from(format!(
+            "End:   {}-{}-{} {}:{}",
+            app.end_year, app.end_month, app.end_day,
+            app.end_hour, app.end_minute
+        ))
     } else {
-        Style::default()
+        let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+        let normal = Style::default();
+        Line::from(vec![
+            Span::raw("End:   "),
+            Span::styled(&app.end_year, if app.editing_date_field == Some(DateField::Year) { cyan } else { normal }),
+            Span::raw("-"),
+            Span::styled(&app.end_month, if app.editing_date_field == Some(DateField::Month) { cyan } else { normal }),
+            Span::raw("-"),
+            Span::styled(&app.end_day, if app.editing_date_field == Some(DateField::Day) { cyan } else { normal }),
+            Span::raw(" "),
+            Span::styled(&app.end_hour, if app.editing_date_field == Some(DateField::Hour) { cyan } else { normal }),
+            Span::raw(":"),
+            Span::styled(&app.end_minute, if app.editing_date_field == Some(DateField::Minute) { cyan } else { normal }),
+        ])
     };
-    let end_field = Paragraph::new(format!("End:   {}", app.end_date_input))
-        .style(end_style)
+    let end_field = Paragraph::new(end_line)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(end_field, form_chunks[1]);
 
@@ -208,9 +243,9 @@ fn render_timeframe_config(f: &mut Frame, app: &App) {
 
     // Instructions
     let instructions = Paragraph::new(vec![
-        Line::from("Tab: Select Field | Type: Edit Date | ↑↓: Change Interval"),
+        Line::from("Tab: Next Field/Component | Type: Edit | ↑↓: Change Interval"),
         Line::from("Backspace: Delete | Enter: Continue | Esc: Back"),
-        Line::from(format!("Date format: YYYY-MM-DDTHH:MM:SSZ (e.g., {})", app.start_date.format("%Y-%m-%dT%H:%M:%SZ"))),
+        Line::from("Date format: [YYYY]-[MM]-[DD] [HH]:[MM] (Tab through components)"),
     ])
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::ALL));
@@ -251,7 +286,7 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
             };
 
             // Build params string with highlighting for edit mode
-            let params_line = if is_selected && app.editing_param.is_some() {
+            let params_lines = if is_selected && app.editing_param.is_some() {
                 use super::ParamField;
                 let editing_field = app.editing_param.unwrap();
 
@@ -283,12 +318,13 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
                         } else {
                             spans.push(Span::raw(slow.to_string()));
                         }
-                        Line::from(spans)
+                        vec![Line::from(spans)]
                     }
-                    super::StrategyType::QuadMa { ma1, ma2, ma3, ma4 } => {
-                        let mut spans = vec![Span::raw("MA1: ")];
+                    super::StrategyType::QuadMa { ma1, ma2, ma3, ma4, trend_period, volume_factor, take_profit, stop_loss, reversal_confirmation_bars } => {
+                        // First line: MA periods
+                        let mut line1_spans = vec![Span::raw("MA1: ")];
                         if editing_field == ParamField::Ma1Period {
-                            spans.push(Span::styled(
+                            line1_spans.push(Span::styled(
                                 if app.param_input_buffer.is_empty() {
                                     format!("[{ma1}_]")
                                 } else {
@@ -297,11 +333,11 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
                                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                             ));
                         } else {
-                            spans.push(Span::raw(ma1.to_string()));
+                            line1_spans.push(Span::raw(ma1.to_string()));
                         }
-                        spans.push(Span::raw(", MA2: "));
+                        line1_spans.push(Span::raw(", MA2: "));
                         if editing_field == ParamField::Ma2Period {
-                            spans.push(Span::styled(
+                            line1_spans.push(Span::styled(
                                 if app.param_input_buffer.is_empty() {
                                     format!("[{ma2}_]")
                                 } else {
@@ -310,11 +346,11 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
                                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                             ));
                         } else {
-                            spans.push(Span::raw(ma2.to_string()));
+                            line1_spans.push(Span::raw(ma2.to_string()));
                         }
-                        spans.push(Span::raw(", MA3: "));
+                        line1_spans.push(Span::raw(", MA3: "));
                         if editing_field == ParamField::Ma3Period {
-                            spans.push(Span::styled(
+                            line1_spans.push(Span::styled(
                                 if app.param_input_buffer.is_empty() {
                                     format!("[{ma3}_]")
                                 } else {
@@ -323,11 +359,11 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
                                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                             ));
                         } else {
-                            spans.push(Span::raw(ma3.to_string()));
+                            line1_spans.push(Span::raw(ma3.to_string()));
                         }
-                        spans.push(Span::raw(", MA4: "));
+                        line1_spans.push(Span::raw(", MA4: "));
                         if editing_field == ParamField::Ma4Period {
-                            spans.push(Span::styled(
+                            line1_spans.push(Span::styled(
                                 if app.param_input_buffer.is_empty() {
                                     format!("[{ma4}_]")
                                 } else {
@@ -336,29 +372,98 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
                                 Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
                             ));
                         } else {
-                            spans.push(Span::raw(ma4.to_string()));
+                            line1_spans.push(Span::raw(ma4.to_string()));
                         }
-                        Line::from(spans)
+
+                        // Second line: Trend, Volume, TP, SL
+                        let mut line2_spans = vec![Span::raw("Trend: ")];
+                        if editing_field == ParamField::TrendPeriod {
+                            line2_spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{trend_period}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            line2_spans.push(Span::raw(trend_period.to_string()));
+                        }
+                        line2_spans.push(Span::raw(", Vol: "));
+                        if editing_field == ParamField::VolumeFactor {
+                            line2_spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{volume_factor}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            line2_spans.push(Span::raw(volume_factor.to_string()));
+                        }
+                        line2_spans.push(Span::raw(", TP: "));
+                        if editing_field == ParamField::TakeProfit {
+                            line2_spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{take_profit}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            line2_spans.push(Span::raw(take_profit.to_string()));
+                        }
+                        line2_spans.push(Span::raw(", SL: "));
+                        if editing_field == ParamField::StopLoss {
+                            line2_spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{stop_loss}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            line2_spans.push(Span::raw(stop_loss.to_string()));
+                        }
+                        line2_spans.push(Span::raw(", RevConf: "));
+                        if editing_field == ParamField::ReversalConfirmBars {
+                            line2_spans.push(Span::styled(
+                                if app.param_input_buffer.is_empty() {
+                                    format!("[{reversal_confirmation_bars}_]")
+                                } else {
+                                    format!("[{}_]", app.param_input_buffer)
+                                },
+                                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                            ));
+                        } else {
+                            line2_spans.push(Span::raw(reversal_confirmation_bars.to_string()));
+                        }
+
+                        vec![Line::from(line1_spans), Line::from(line2_spans)]
                     }
                 }
             } else {
                 // Normal mode - no edit highlighting
-                let params_str = match &config.strategy {
+                match &config.strategy {
                     super::StrategyType::MaCrossover { fast, slow } => {
-                        format!("Fast: {fast}, Slow: {slow}")
+                        vec![Line::from(format!("Fast: {fast}, Slow: {slow}"))]
                     }
-                    super::StrategyType::QuadMa { ma1, ma2, ma3, ma4 } => {
-                        format!("MA1: {ma1}, MA2: {ma2}, MA3: {ma3}, MA4: {ma4}")
+                    super::StrategyType::QuadMa { ma1, ma2, ma3, ma4, trend_period, volume_factor, take_profit, stop_loss, reversal_confirmation_bars } => {
+                        vec![
+                            Line::from(format!("MA1: {ma1}, MA2: {ma2}, MA3: {ma3}, MA4: {ma4}")),
+                            Line::from(format!("Trend: {trend_period}, Vol: {volume_factor}, TP: {take_profit}, SL: {stop_loss}, RevConf: {reversal_confirmation_bars}")),
+                        ]
                     }
-                };
-                Line::from(params_str)
+                }
             };
 
-            ListItem::new(vec![
-                Line::from(Span::styled(&config.name, Style::default().add_modifier(Modifier::BOLD))),
-                params_line,
-            ])
-            .style(style)
+            let mut lines = vec![Line::from(Span::styled(&config.name, Style::default().add_modifier(Modifier::BOLD)))];
+            lines.extend(params_lines);
+
+            ListItem::new(lines).style(style)
         })
         .collect();
 
@@ -534,7 +639,7 @@ fn render_results(f: &mut Frame, app: &App) {
 
     // Instructions
     let instructions = Paragraph::new(vec![
-        Line::from("↑↓: Scroll | Enter: View Trades | s: Change Sort | r: Reverse Sort"),
+        Line::from("↑↓: Scroll | Enter: View Trades | m: View Metrics | s: Change Sort | r: Reverse Sort"),
         Line::from("b: Back to Start | q: Quit"),
     ])
     .alignment(Alignment::Center)
@@ -571,7 +676,7 @@ fn render_trade_detail(f: &mut Frame, app: &App) {
 
     // Trades table
     if let Some(r) = result {
-        let header = Row::new(vec!["Timestamp", "Action", "Price", "Quantity", "Commission"])
+        let header = Row::new(vec!["Timestamp", "Action", "Price", "Quantity", "Value (USDC)", "PnL", "Commission"])
             .style(Style::default().add_modifier(Modifier::BOLD))
             .bottom_margin(1);
 
@@ -579,20 +684,64 @@ fn render_trade_detail(f: &mut Frame, app: &App) {
             .iter()
             .skip(app.trade_scroll_offset)
             .map(|trade| {
-                let action_color = match trade.action.as_str() {
-                    "BUY" => Color::Green,
-                    "SELL" => Color::Red,
-                    _ => Color::White,
+                // Color based on action type
+                let action_color = if trade.action.contains("LONG") {
+                    if trade.action.starts_with("CLOSE") {
+                        Color::Blue  // Closing long
+                    } else {
+                        Color::Green  // Open/Add long
+                    }
+                } else if trade.action.contains("SHORT") {
+                    if trade.action.starts_with("CLOSE") {
+                        Color::Blue  // Closing short
+                    } else {
+                        Color::Red  // Open/Add short
+                    }
+                } else {
+                    Color::White
+                };
+
+                // Format PnL with color
+                let (pnl_text, pnl_color) = if let Some(pnl_value) = trade.pnl {
+                    let pnl_f64 = pnl_value.to_f64().unwrap_or(0.0);
+                    if pnl_f64 > 0.0 {
+                        (format!("+${:.2}", pnl_f64), Color::Green)
+                    } else if pnl_f64 < 0.0 {
+                        (format!("-${:.2}", pnl_f64.abs()), Color::Red)
+                    } else {
+                        ("$0.00".to_string(), Color::White)
+                    }
+                } else {
+                    ("—".to_string(), Color::Gray)
                 };
 
                 Row::new(vec![
-                    trade.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-                    trade.action.clone(),
-                    format!("{:.2}", trade.price.to_f64().unwrap_or(0.0)),
-                    format!("{:.4}", trade.quantity.to_f64().unwrap_or(0.0)),
-                    format!("{:.4}", trade.commission.to_f64().unwrap_or(0.0)),
+                    Span::styled(
+                        trade.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
+                        Style::default().fg(action_color)
+                    ),
+                    Span::styled(
+                        trade.action.clone(),
+                        Style::default().fg(action_color).add_modifier(Modifier::BOLD)
+                    ),
+                    Span::styled(
+                        format!("${:.2}", trade.price.to_f64().unwrap_or(0.0)),
+                        Style::default().fg(action_color)
+                    ),
+                    Span::styled(
+                        format!("{:.8}", trade.quantity.to_f64().unwrap_or(0.0)),
+                        Style::default().fg(action_color)
+                    ),
+                    Span::styled(
+                        format!("${:.2}", trade.position_value.to_f64().unwrap_or(0.0)),
+                        Style::default().fg(action_color)
+                    ),
+                    Span::styled(pnl_text, Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("${:.4}", trade.commission.to_f64().unwrap_or(0.0)),
+                        Style::default().fg(action_color)
+                    ),
                 ])
-                .style(Style::default().fg(action_color))
             })
             .collect();
 
@@ -600,8 +749,10 @@ fn render_trade_detail(f: &mut Frame, app: &App) {
             rows,
             [
                 Constraint::Length(20),
-                Constraint::Length(8),
                 Constraint::Length(12),
+                Constraint::Length(12),
+                Constraint::Length(14),
+                Constraint::Length(14),
                 Constraint::Length(12),
                 Constraint::Length(12),
             ],
@@ -619,6 +770,130 @@ fn render_trade_detail(f: &mut Frame, app: &App) {
 
     // Instructions
     let instructions = Paragraph::new("↑↓: Scroll | Esc: Back to Results")
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(instructions, chunks[2]);
+}
+
+fn render_metrics_detail(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),  // Title
+            Constraint::Min(10),    // Metrics content
+            Constraint::Length(3),  // Instructions
+        ])
+        .split(f.area());
+
+    // Get selected result
+    let result = app.selected_result_index
+        .and_then(|idx| app.results.get(idx));
+
+    let title_text = if let Some(r) = result {
+        format!("Performance Metrics: {} - {}", r.token, r.config_name)
+    } else {
+        "Performance Metrics".to_string()
+    };
+
+    // Title
+    let title = Paragraph::new(title_text)
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    // Metrics content
+    if let Some(r) = result {
+        if let Some(metrics) = &r.metrics {
+            // Format metrics similar to CLI MetricsFormatter
+            let duration_days = metrics.duration.num_days();
+            let duration_hours = metrics.duration.num_hours() % 24;
+
+            let exposure_pct = metrics.exposure_time * 100.0;
+
+            let total_return_pct = metrics.total_return.to_f64().unwrap_or(0.0) * 100.0;
+            let buy_hold_pct = metrics.buy_hold_return.to_f64().unwrap_or(0.0) * 100.0;
+            let max_dd_pct = metrics.max_drawdown.to_f64().unwrap_or(0.0) * 100.0;
+
+            let metrics_text = vec![
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Duration: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("{} days {} hours", duration_days, duration_hours)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Exposure Time: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("{:.1}%", exposure_pct)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Initial Capital: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("${:.2}", metrics.initial_capital.to_f64().unwrap_or(0.0))),
+                ]),
+                Line::from(vec![
+                    Span::styled("Final Capital: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("${:.2}", metrics.final_capital.to_f64().unwrap_or(0.0))),
+                ]),
+                Line::from(vec![
+                    Span::styled("Equity Peak: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("${:.2}", metrics.equity_peak.to_f64().unwrap_or(0.0))),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Total Return: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{:+.2}%", total_return_pct),
+                        if total_return_pct >= 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) }
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled("Buy & Hold: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("{:+.2}%", buy_hold_pct),
+                        if buy_hold_pct >= 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) }
+                    ),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Sharpe Ratio: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("{:.2}", metrics.sharpe_ratio)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Max Drawdown: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(format!("{:.2}%", max_dd_pct), Style::default().fg(Color::Red)),
+                ]),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("Total Trades: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("{}", metrics.num_trades)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Win Rate: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!("{:.1}%", metrics.win_rate * 100.0)),
+                ]),
+            ];
+
+            let metrics_para = Paragraph::new(metrics_text)
+                .block(Block::default().borders(Borders::ALL))
+                .alignment(Alignment::Left);
+            f.render_widget(metrics_para, chunks[1]);
+        } else {
+            let empty = Paragraph::new("No metrics data available")
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(empty, chunks[1]);
+        }
+    } else {
+        let empty = Paragraph::new("No result selected")
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL));
+        f.render_widget(empty, chunks[1]);
+    }
+
+    // Instructions
+    let instructions = Paragraph::new("Esc: Back to Results")
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(instructions, chunks[2]);

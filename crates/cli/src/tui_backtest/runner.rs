@@ -37,25 +37,41 @@ where
 
             // Fetch/load data
             let csv_path = get_cache_path(token, interval, start, end);
-            if Path::new(&csv_path).exists() {
+            let data_ready = if Path::new(&csv_path).exists() {
                 progress_callback(completed, total, token, &config.name,
                     Some(format!("Using cached data for {token}")));
+                true
             } else {
                 progress_callback(completed, total, token, &config.name,
                     Some(format!("Fetching data for {token}...")));
-                fetch_and_cache_data(token, interval, start, end, &csv_path).await?;
-                progress_callback(completed, total, token, &config.name,
-                    Some(format!("Data cached for {token}")));
+                match fetch_and_cache_data(token, interval, start, end, &csv_path).await {
+                    Ok(()) => {
+                        progress_callback(completed, total, token, &config.name,
+                            Some(format!("Data cached for {token}")));
+                        true
+                    }
+                    Err(e) => {
+                        progress_callback(completed, total, token, &config.name,
+                            Some(format!("✗ Failed to fetch data for {token}: {e}")));
+                        false
+                    }
+                }
+            };
+
+            // Run backtest only if data is ready
+            if !data_ready {
+                completed += 1;
+                continue;
             }
 
-            // Run backtest
             progress_callback(completed, total, token, &config.name,
                 Some(format!("Running backtest: {token} - {}", config.name)));
 
             match run_single_backtest(token, config, &csv_path).await {
                 Ok(metrics) => {
-                    // Convert FillEvents to TradeRecords
-                    let trades = metrics.fills.iter().map(convert_fill_to_trade).collect();
+                    // Convert FillEvents to TradeRecords with position tracking
+                    let trades = convert_fills_to_trades(&metrics.fills);
+                    let num_trades = metrics.num_trades;
 
                     results.push(BacktestResult {
                         token: token.clone(),
@@ -66,10 +82,11 @@ where
                         num_trades: metrics.num_trades,
                         win_rate: metrics.win_rate,
                         trades,
+                        metrics: Some(metrics),
                     });
                     progress_callback(completed, total, token, &config.name,
                         Some(format!("✓ Completed: {token} - {} ({} trades)",
-                            config.name, metrics.num_trades)));
+                            config.name, num_trades)));
                 }
                 Err(e) => {
                     progress_callback(completed, total, token, &config.name,
@@ -138,21 +155,28 @@ async fn run_single_backtest(
             let strategy = MaCrossoverStrategy::new(token.to_string(), *fast, *slow);
             vec![Arc::new(Mutex::new(strategy))]
         }
-        StrategyType::QuadMa { ma1, ma2, ma3, ma4 } => {
-            let strategy = QuadMaStrategy::with_periods(
+        StrategyType::QuadMa { ma1, ma2, ma3, ma4, trend_period, volume_factor, take_profit, stop_loss, reversal_confirmation_bars } => {
+            let strategy = QuadMaStrategy::with_full_config(
                 token.to_string(),
                 *ma1,
                 *ma2,
                 *ma3,
                 *ma4,
+                *trend_period,
+                true,                                    // volume_filter_enabled: true (re-enabled)
+                *volume_factor as f64 / 100.0,           // 150 → 1.5
+                *take_profit as f64 / 10000.0,           // 200 → 0.02
+                *stop_loss as f64 / 10000.0,             // 100 → 0.01
+                *reversal_confirmation_bars,             // reversal confirmation bars
             );
             vec![Arc::new(Mutex::new(strategy))]
         }
     };
 
-    // Create risk manager
+    // Create risk manager with equity-based position sizing
+    // Risk 5% of equity per trade, max 20% in any single position
     let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
-        Arc::new(SimpleRiskManager::new(10000.0, 0.1));
+        Arc::new(SimpleRiskManager::new(0.05, 0.20));
 
     // Create trading system
     let mut system = TradingSystem::new(
@@ -166,20 +190,49 @@ async fn run_single_backtest(
     system.run().await
 }
 
-/// Convert FillEvent to TradeRecord for UI display
-fn convert_fill_to_trade(fill: &FillEvent) -> TradeRecord {
+/// Convert FillEvents to TradeRecords with position-aware action labels and PnL tracking
+fn convert_fills_to_trades(fills: &[FillEvent]) -> Vec<TradeRecord> {
     use algo_trade_core::events::OrderDirection;
+    use algo_trade_core::position::PositionTracker;
 
-    let action = match fill.direction {
-        OrderDirection::Buy => "BUY",
-        OrderDirection::Sell => "SELL",
-    };
+    let mut tracker = PositionTracker::new();
+    let mut trades = Vec::with_capacity(fills.len());
 
-    TradeRecord {
-        timestamp: fill.timestamp,
-        action: action.to_string(),
-        price: fill.price,
-        quantity: fill.quantity,
-        commission: fill.commission,
+    for fill in fills {
+        // Get current position before processing this fill
+        let current_position = tracker.get_position(&fill.symbol).map(|p| p.quantity);
+
+        // Process fill to calculate PnL (if closing)
+        let pnl = tracker.process_fill(fill);
+
+        // Determine action based on direction and position state
+        let action = match (&fill.direction, current_position) {
+            // Buy orders
+            (OrderDirection::Buy, None) => "OPEN LONG",
+            (OrderDirection::Buy, Some(qty)) if qty > rust_decimal::Decimal::ZERO => "ADD LONG",
+            (OrderDirection::Buy, Some(qty)) if qty < rust_decimal::Decimal::ZERO => "CLOSE SHORT",
+
+            // Sell orders
+            (OrderDirection::Sell, None) => "OPEN SHORT",
+            (OrderDirection::Sell, Some(qty)) if qty < rust_decimal::Decimal::ZERO => "ADD SHORT",
+            (OrderDirection::Sell, Some(qty)) if qty > rust_decimal::Decimal::ZERO => "CLOSE LONG",
+
+            // Default (shouldn't happen)
+            _ => "UNKNOWN",
+        };
+
+        let position_value = fill.price * fill.quantity;
+
+        trades.push(TradeRecord {
+            timestamp: fill.timestamp,
+            action: action.to_string(),
+            price: fill.price,
+            quantity: fill.quantity,
+            commission: fill.commission,
+            pnl,
+            position_value,
+        });
     }
+
+    trades
 }

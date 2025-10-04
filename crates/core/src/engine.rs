@@ -6,6 +6,7 @@ use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+#[derive(Debug, Clone)]
 pub struct PerformanceMetrics {
     pub total_return: Decimal,
     pub sharpe_ratio: f64,
@@ -123,6 +124,10 @@ where
     /// - Strategy signal generation fails
     /// - Risk manager evaluation fails
     /// - Order execution fails
+    ///
+    /// # Panics
+    ///
+    /// Panics if the equity curve is empty (should never happen as it's initialized with initial capital).
     pub async fn run(&mut self) -> Result<PerformanceMetrics> {
         while let Some(market_event) = self.data_provider.next_event().await? {
             // Track timestamps
@@ -154,9 +159,18 @@ where
             for strategy in &self.strategies {
                 let mut strategy = strategy.lock().await;
                 if let Some(signal) = strategy.on_market_event(&market_event).await? {
-                    // Risk management evaluation
-                    if let Some(order) = self.risk_manager.evaluate_signal(&signal).await? {
-                        // Execute order
+                    // Get current account equity for position sizing
+                    let current_equity = *self.equity_curve.last().unwrap();
+
+                    // Get current position for the signal's symbol (for position flipping)
+                    let current_position = self.position_tracker.get_position(&signal.symbol)
+                        .map(|p| p.quantity);
+
+                    // Risk management evaluation (returns Vec of orders)
+                    let orders = self.risk_manager.evaluate_signal(&signal, current_equity, current_position).await?;
+
+                    // Execute all orders sequentially
+                    for order in orders {
                         let fill = self.execution_handler.execute_order(order).await?;
                         tracing::info!("Order filled: {:?}", fill);
 
