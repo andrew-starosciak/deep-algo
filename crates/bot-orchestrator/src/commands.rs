@@ -18,6 +18,11 @@ pub struct BotConfig {
     pub symbol: String,
     pub strategy: String,
     pub enabled: bool,
+    pub interval: String,
+    pub ws_url: String,
+    pub api_url: String,
+    pub warmup_periods: usize,
+    pub strategy_config: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

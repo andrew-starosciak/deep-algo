@@ -300,6 +300,95 @@ where
         }
     }
 
+    /// Processes a single market event (for live trading loop)
+    ///
+    /// # Errors
+    /// Returns error if data provider, strategy, risk manager, or execution fails
+    pub async fn process_next_event(&mut self) -> Result<bool> {
+        if let Some(market_event) = self.data_provider.next_event().await? {
+            // Track timestamps
+            if self.start_time.is_none() {
+                self.start_time = Some(market_event.timestamp());
+            }
+            self.end_time = Some(market_event.timestamp());
+
+            // Track prices for buy & hold
+            if let Some(close) = market_event.close_price() {
+                if self.first_price.is_none() {
+                    self.first_price = Some(close);
+                }
+                self.last_price = Some(close);
+            }
+
+            // Track total bars
+            self.total_bars += 1;
+
+            // Track exposure time
+            if !self.position_tracker.all_positions().is_empty() {
+                self.bars_in_position += 1;
+            }
+
+            // Collect PnLs from trades
+            let mut pnls_to_record = Vec::new();
+
+            // Generate signals from all strategies
+            for strategy in &self.strategies {
+                let mut strategy = strategy.lock().await;
+                if let Some(signal) = strategy.on_market_event(&market_event).await? {
+                    let current_equity = *self.equity_curve.last().unwrap();
+                    let current_position = self.position_tracker.get_position(&signal.symbol)
+                        .map(|p| p.quantity);
+
+                    let orders = self.risk_manager.evaluate_signal(
+                        signal,
+                        current_equity,
+                        current_position,
+                    ).await?;
+
+                    for order in orders {
+                        let fill = self.execution_handler.execute_order(order).await?;
+
+                        if let Some(closed_position) = self.position_tracker.update(&fill) {
+                            let pnl = closed_position.unrealized_pnl;
+                            pnls_to_record.push(pnl);
+                        }
+
+                        self.fills.push(fill);
+                    }
+                }
+            }
+
+            // Record PnLs to returns after all strategies processed
+            for pnl in pnls_to_record {
+                let return_pct = pnl / self.initial_capital;
+                self.returns.push(return_pct);
+
+                if pnl > Decimal::ZERO {
+                    self.wins += 1;
+                } else if pnl < Decimal::ZERO {
+                    self.losses += 1;
+                }
+            }
+
+            // Update equity curve
+            let current_equity = *self.equity_curve.last().unwrap();
+            let unrealized_pnl: Decimal = self.position_tracker.all_positions()
+                .iter()
+                .map(|p| p.unrealized_pnl)
+                .sum();
+            let new_equity = current_equity + unrealized_pnl;
+            self.equity_curve.push(new_equity);
+
+            if new_equity > self.equity_peak {
+                self.equity_peak = new_equity;
+            }
+
+            Ok(true) // Event processed
+        } else {
+            Ok(false) // No more events
+        }
+    }
+
     fn calculate_max_drawdown(&self) -> Decimal {
         let mut max_drawdown = Decimal::ZERO;
         let mut peak = self.equity_curve[0];

@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod tui_backtest;
+mod tui_live_bot;
 
 #[derive(Parser)]
 #[command(name = "algo-trade")]
@@ -78,6 +79,8 @@ enum Commands {
         #[arg(short, long, default_value = "quad_ma")]
         strategy: String,
     },
+    /// Interactive TUI for managing live trading bots
+    LiveBotTui,
 }
 
 #[tokio::main]
@@ -85,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging (disabled for TUI to prevent screen corruption)
-    if !matches!(cli.command, Commands::TuiBacktest { .. }) {
+    if !matches!(cli.command, Commands::TuiBacktest { .. } | Commands::LiveBotTui) {
         tracing_subscriber::fmt()
             .with_env_filter(
                 tracing_subscriber::EnvFilter::try_from_default_env()
@@ -115,6 +118,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::TokenSelection { config, strategy } => {
             run_token_selection(&config, &strategy).await?;
+        }
+        Commands::LiveBotTui => {
+            tui_live_bot::run().await?;
         }
     }
 
