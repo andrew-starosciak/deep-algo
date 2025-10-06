@@ -23,7 +23,7 @@ async fn test_backtest_ma_crossover() {
     ];
 
     let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
-        Arc::new(SimpleRiskManager::new(10000.0, 0.1));
+        Arc::new(SimpleRiskManager::new(0.05, 0.20, 1));
 
     let mut system = TradingSystem::new(
         data_provider,

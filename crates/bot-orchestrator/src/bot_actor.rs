@@ -104,9 +104,13 @@ impl BotActor {
 
         tracing::info!("Bot {} strategy initialized", self.config.bot_id);
 
-        // Create risk manager
+        // Create risk manager with bot config parameters
         let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
-            Arc::new(SimpleRiskManager::new(0.05, 0.20));
+            Arc::new(SimpleRiskManager::new(
+                self.config.risk_per_trade_pct,
+                self.config.max_position_pct,
+                self.config.leverage,
+            ));
 
         // Create trading system
         let system = TradingSystem::new(

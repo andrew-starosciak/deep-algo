@@ -175,10 +175,10 @@ async fn run_single_backtest(
         }
     };
 
-    // Create risk manager with equity-based position sizing
-    // Risk 5% of equity per trade, max 20% in any single position
+    // Create risk manager with leverage-aware position sizing
+    // Risk 5% of equity per trade, max 20% in any single position, 1x leverage (backtest conservative)
     let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
-        Arc::new(SimpleRiskManager::new(0.05, 0.20));
+        Arc::new(SimpleRiskManager::new(0.05, 0.20, 1));
 
     // Create trading system
     let mut system = TradingSystem::new(
