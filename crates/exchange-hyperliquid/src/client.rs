@@ -1,39 +1,84 @@
+use crate::signing::{sign_order_request, signature_to_hex};
+use crate::wallet::create_wallet_from_private_key;
 use algo_trade_data::database::OhlcvRecord;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Duration, Utc};
+use ethers::signers::LocalWallet;
 use governor::{Quota, RateLimiter, state::InMemoryState, clock::DefaultClock};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Maximum number of candles per API request (Hyperliquid limit)
 const MAX_CANDLES_PER_REQUEST: usize = 5000;
 
+/// Rate limit: 1200 requests per minute = 20 per second
+const RATE_LIMIT_QPS: NonZeroU32 = match NonZeroU32::new(20) {
+    Some(n) => n,
+    None => unreachable!(),
+};
+
 pub struct HyperliquidClient {
     http_client: Client,
     base_url: String,
     rate_limiter: Arc<RateLimiter<governor::state::direct::NotKeyed, InMemoryState, DefaultClock>>,
+
+    // Wallet for signing (optional, for authenticated requests)
+    wallet: Option<LocalWallet>,
+    account_address: Option<String>,
+    nonce_counter: Arc<AtomicU64>,
 }
 
 impl HyperliquidClient {
     /// Creates a new Hyperliquid HTTP client
     ///
     /// # Panics
-    /// Panics if rate limiter quota cannot be created
+    /// Panics if current timestamp is negative (never happens in practice)
     #[must_use]
     pub fn new(base_url: String) -> Self {
-        // 1200 requests per minute = 20 per second
-        let quota = Quota::per_second(NonZeroU32::new(20).unwrap());
+        let quota = Quota::per_second(RATE_LIMIT_QPS);
         let rate_limiter = Arc::new(RateLimiter::direct(quota));
+
+        let timestamp = Utc::now().timestamp_millis();
+        let nonce = u64::try_from(timestamp).expect("Timestamp must be positive");
 
         Self {
             http_client: Client::new(),
             base_url,
             rate_limiter,
+            wallet: None,
+            account_address: None,
+            nonce_counter: Arc::new(AtomicU64::new(nonce)),
         }
+    }
+
+    /// Creates authenticated client with wallet
+    ///
+    /// # Errors
+    /// Returns error if private key format is invalid
+    pub fn with_wallet(
+        base_url: String,
+        api_wallet_private_key: &str,
+        account_address: String,
+        nonce_counter: Arc<AtomicU64>,
+    ) -> Result<Self> {
+        let wallet = create_wallet_from_private_key(api_wallet_private_key)?;
+
+        let quota = Quota::per_second(RATE_LIMIT_QPS);
+        let rate_limiter = Arc::new(RateLimiter::direct(quota));
+
+        Ok(Self {
+            http_client: Client::new(),
+            base_url,
+            rate_limiter,
+            wallet: Some(wallet),
+            account_address: Some(account_address),
+            nonce_counter,
+        })
     }
 
     /// Sends a GET request to the specified endpoint
@@ -58,6 +103,32 @@ impl HyperliquidClient {
         let response = self.http_client.post(&url).json(&body).send().await?;
         let json = response.json().await?;
         Ok(json)
+    }
+
+    /// Sends authenticated POST request with EIP-712 signed payload
+    ///
+    /// # Errors
+    /// Returns error if wallet not configured, signing fails, or HTTP request fails
+    pub async fn post_signed(
+        &self,
+        endpoint: &str,
+        order_payload: serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let wallet = self.wallet.as_ref()
+            .context("Client not authenticated - use with_wallet()")?;
+
+        let nonce = self.nonce_counter.fetch_add(1, Ordering::SeqCst);
+        let signature = sign_order_request(wallet, &order_payload, nonce).await?;
+        let sig_hex = signature_to_hex(&signature);
+
+        let signed_request = serde_json::json!({
+            "action": order_payload,
+            "nonce": nonce,
+            "signature": sig_hex,
+            "vaultAddress": self.account_address.as_ref(),
+        });
+
+        self.post(endpoint, signed_request).await
     }
 
     /// Fetches OHLCV candles from Hyperliquid API with automatic pagination

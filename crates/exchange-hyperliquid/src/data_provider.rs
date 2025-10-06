@@ -1,6 +1,6 @@
 use algo_trade_core::events::MarketEvent;
 use algo_trade_core::traits::DataProvider;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use rust_decimal::Decimal;
@@ -50,7 +50,10 @@ impl LiveDataProvider {
         let client = HyperliquidClient::new(api_url);
         let end = Utc::now();
         let interval_minutes = self.parse_interval_minutes()?;
-        let start = end - Duration::minutes((lookback_periods * interval_minutes) as i64);
+        let total_minutes = lookback_periods * interval_minutes;
+        let minutes_i64 = i64::try_from(total_minutes)
+            .context("Lookback period too large")?;
+        let start = end - Duration::minutes(minutes_i64);
 
         let records = client.fetch_candles(&self.symbol, &self.interval, start, end).await?;
 

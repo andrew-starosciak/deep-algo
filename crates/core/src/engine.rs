@@ -304,6 +304,9 @@ where
     ///
     /// # Errors
     /// Returns error if data provider, strategy, risk manager, or execution fails
+    ///
+    /// # Panics
+    /// Panics if `equity_curve` is empty (should never happen as it's initialized with `initial_capital`)
     pub async fn process_next_event(&mut self) -> Result<bool> {
         if let Some(market_event) = self.data_provider.next_event().await? {
             // Track timestamps
@@ -340,7 +343,7 @@ where
                         .map(|p| p.quantity);
 
                     let orders = self.risk_manager.evaluate_signal(
-                        signal,
+                        &signal,
                         current_equity,
                         current_position,
                     ).await?;
@@ -348,8 +351,7 @@ where
                     for order in orders {
                         let fill = self.execution_handler.execute_order(order).await?;
 
-                        if let Some(closed_position) = self.position_tracker.update(&fill) {
-                            let pnl = closed_position.unrealized_pnl;
+                        if let Some(pnl) = self.position_tracker.process_fill(&fill) {
                             pnls_to_record.push(pnl);
                         }
 
@@ -372,11 +374,10 @@ where
 
             // Update equity curve
             let current_equity = *self.equity_curve.last().unwrap();
-            let unrealized_pnl: Decimal = self.position_tracker.all_positions()
-                .iter()
-                .map(|p| p.unrealized_pnl)
-                .sum();
-            let new_equity = current_equity + unrealized_pnl;
+            // TODO: Calculate unrealized PnL from open positions
+            // Need current market price for each symbol to calculate unrealized PnL
+            // For now, just track realized PnL
+            let new_equity = current_equity;
             self.equity_curve.push(new_equity);
 
             if new_equity > self.equity_peak {
@@ -404,5 +405,102 @@ where
         }
 
         max_drawdown
+    }
+
+    // Public accessor methods for live monitoring
+    /// Get current equity
+    #[must_use]
+    pub fn current_equity(&self) -> Decimal {
+        self.equity_curve.last().copied().unwrap_or(self.initial_capital)
+    }
+
+    /// Get initial capital
+    #[must_use]
+    pub const fn initial_capital(&self) -> Decimal {
+        self.initial_capital
+    }
+
+    /// Get total return percentage
+    #[must_use]
+    pub fn total_return_pct(&self) -> f64 {
+        let current = self.current_equity();
+        ((current - self.initial_capital) / self.initial_capital)
+            .to_string()
+            .parse()
+            .unwrap_or(0.0)
+    }
+
+    /// Get Sharpe ratio
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // Acceptable for statistics over small sample sizes
+    pub fn sharpe_ratio(&self) -> f64 {
+        if self.returns.is_empty() {
+            return 0.0;
+        }
+
+        let mean_return: f64 = self
+            .returns
+            .iter()
+            .map(|r| r.to_string().parse::<f64>().unwrap_or(0.0))
+            .sum::<f64>()
+            / self.returns.len() as f64;
+
+        let variance: f64 = self
+            .returns
+            .iter()
+            .map(|r| {
+                let val = r.to_string().parse::<f64>().unwrap_or(0.0);
+                (val - mean_return).powi(2)
+            })
+            .sum::<f64>()
+            / self.returns.len() as f64;
+
+        let std_dev = variance.sqrt();
+        if std_dev > 0.0 {
+            mean_return / std_dev * f64::sqrt(252.0)
+        } else {
+            0.0
+        }
+    }
+
+    /// Get maximum drawdown
+    #[must_use]
+    pub fn max_drawdown(&self) -> f64 {
+        self.calculate_max_drawdown()
+            .to_string()
+            .parse()
+            .unwrap_or(0.0)
+    }
+
+    /// Get win rate
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // Acceptable for statistics over small sample sizes
+    pub fn win_rate(&self) -> f64 {
+        let total = self.wins + self.losses;
+        if total > 0 {
+            self.wins as f64 / total as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Get number of trades
+    #[must_use]
+    pub const fn num_trades(&self) -> usize {
+        self.wins + self.losses
+    }
+
+    /// Get open positions
+    #[must_use]
+    pub const fn open_positions(&self) -> &std::collections::HashMap<String, crate::position::Position> {
+        self.position_tracker.all_positions()
+    }
+
+    /// Calculate unrealized `PnL` for a position
+    #[must_use]
+    pub fn unrealized_pnl(&self, symbol: &str, current_price: Decimal) -> Option<Decimal> {
+        self.position_tracker.get_position(symbol).map(|pos| {
+            (current_price - pos.avg_price) * pos.quantity
+        })
     }
 }

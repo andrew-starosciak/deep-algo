@@ -117,7 +117,7 @@ impl DatabaseClient {
         .bind(record.total_return)
         .bind(record.win_rate)
         .bind(record.max_drawdown)
-        .bind(i32::try_from(record.num_trades)?)
+        .bind(record.num_trades)
         .bind(record.parameters)
         .execute(&self.pool)
         .await?;
@@ -163,7 +163,7 @@ impl DatabaseClient {
             .bind(record.total_return)
             .bind(record.win_rate)
             .bind(record.max_drawdown)
-            .bind(i32::try_from(record.num_trades)?)
+            .bind(record.num_trades)
             .bind(&record.parameters)
             .execute(&mut *tx)
             .await?;

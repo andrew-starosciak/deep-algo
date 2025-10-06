@@ -1,19 +1,27 @@
 use crate::commands::{BotCommand, BotConfig, BotState, BotStatus};
+use crate::events::{BotEvent, EnhancedBotStatus};
 use algo_trade_core::TradingSystem;
-use algo_trade_core::events::MarketEvent;
-use algo_trade_hyperliquid::LiveDataProvider;
-use algo_trade_execution::LiveExecutionHandler;
+use algo_trade_hyperliquid::{LiveDataProvider, LiveExecutionHandler, HyperliquidClient};
 use algo_trade_strategy::{SimpleRiskManager, create_strategy};
 use anyhow::{Result, Context};
 use chrono::Utc;
-use tokio::sync::mpsc;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, watch};
 
 pub struct BotActor {
     config: BotConfig,
     state: BotState,
     rx: mpsc::Receiver<BotCommand>,
-    system: Option<TradingSystem>,
+    system: Option<TradingSystem<LiveDataProvider, LiveExecutionHandler>>,
+
+    // Event streaming (used in Phase 2 for event emission)
+    #[allow(dead_code)]
+    event_tx: broadcast::Sender<BotEvent>,
+    #[allow(dead_code)]
+    status_tx: watch::Sender<EnhancedBotStatus>,
+    #[allow(dead_code)]
+    recent_events: VecDeque<BotEvent>,
 }
 
 impl BotActor {
@@ -22,21 +30,30 @@ impl BotActor {
     /// # Returns
     /// A new `BotActor` instance in the stopped state.
     #[must_use]
-    pub fn new(config: BotConfig, rx: mpsc::Receiver<BotCommand>) -> Self {
+    pub fn new(
+        config: BotConfig,
+        rx: mpsc::Receiver<BotCommand>,
+        event_tx: broadcast::Sender<BotEvent>,
+        status_tx: watch::Sender<EnhancedBotStatus>,
+    ) -> Self {
         Self {
             config,
             state: BotState::Stopped,
             rx,
             system: None,
+            event_tx,
+            status_tx,
+            recent_events: VecDeque::with_capacity(10),
         }
     }
 
     /// Initializes the trading system with all components
+    #[allow(clippy::cognitive_complexity)]
     async fn initialize_system(&mut self) -> Result<()> {
         tracing::info!("Initializing trading system for bot {}", self.config.bot_id);
 
         // Create live data provider with WebSocket
-        let mut data_provider = LiveDataProvider::new(
+        let data_provider = LiveDataProvider::new(
             self.config.ws_url.clone(),
             self.config.symbol.clone(),
             self.config.interval.clone(),
@@ -54,10 +71,24 @@ impl BotActor {
             warmup_events.len()
         );
 
+        // Create HTTP client (authenticated if wallet provided)
+        let client = if let Some(ref wallet_config) = self.config.wallet {
+            tracing::info!("Creating authenticated Hyperliquid client with wallet {}", wallet_config.account_address);
+            let private_key = wallet_config.api_wallet_private_key.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Wallet private key not provided"))?;
+            HyperliquidClient::with_wallet(
+                self.config.api_url.clone(),
+                private_key,
+                wallet_config.account_address.clone(),
+                wallet_config.nonce_counter.clone(),
+            ).context("Failed to create authenticated client")?
+        } else {
+            tracing::warn!("Creating unauthenticated client - order execution will fail");
+            HyperliquidClient::new(self.config.api_url.clone())
+        };
+
         // Create execution handler
-        let execution_handler = LiveExecutionHandler::new(
-            self.config.api_url.clone(),
-        ).context("Failed to create execution handler")?;
+        let execution_handler = LiveExecutionHandler::new(client);
 
         // Create strategy
         let strategy = create_strategy(
@@ -67,11 +98,8 @@ impl BotActor {
         ).context("Failed to create strategy")?;
 
         // Feed warmup events to strategy to initialize state
-        {
-            let mut strat = strategy.lock().await;
-            for event in warmup_events {
-                let _ = strat.on_market_event(&event).await?;
-            }
+        for event in warmup_events {
+            let _ = strategy.lock().await.on_market_event(&event).await?;
         }
 
         tracing::info!("Bot {} strategy initialized", self.config.bot_id);
@@ -100,7 +128,7 @@ impl BotActor {
                     // Check for stop command
                     cmd = self.rx.recv() => {
                         match cmd {
-                            Some(BotCommand::Stop) | Some(BotCommand::Pause) | Some(BotCommand::Shutdown) => {
+                            Some(BotCommand::Stop | BotCommand::Pause | BotCommand::Shutdown) => {
                                 break;
                             }
                             Some(cmd) => {
@@ -165,7 +193,7 @@ impl BotActor {
                 }
                 BotCommand::UpdateConfig(new_config) => {
                     tracing::info!("Bot {} config updated", self.config.bot_id);
-                    self.config = new_config;
+                    self.config = *new_config;
                 }
                 BotCommand::GetStatus(tx) => {
                     let status = BotStatus {

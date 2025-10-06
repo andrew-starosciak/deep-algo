@@ -1,6 +1,8 @@
 pub mod client;
 pub mod data_provider;
 pub mod execution;
+pub mod signing;
+pub mod wallet;
 pub mod websocket;
 
 pub use client::HyperliquidClient;

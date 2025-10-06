@@ -43,6 +43,19 @@ pub async fn create_bot(
         symbol: req.symbol,
         strategy: req.strategy,
         enabled: true,
+        interval: "1m".to_string(),
+        ws_url: std::env::var("HYPERLIQUID_WS_URL")
+            .unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".to_string()),
+        api_url: std::env::var("HYPERLIQUID_API_URL")
+            .unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string()),
+        warmup_periods: 100,
+        strategy_config: None,
+        initial_capital: rust_decimal::Decimal::from(10000),
+        risk_per_trade_pct: 0.05,
+        max_position_pct: 0.20,
+        leverage: 1,
+        margin_mode: algo_trade_bot_orchestrator::MarginMode::Cross,
+        wallet: None,
     };
 
     registry

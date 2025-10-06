@@ -1,10 +1,15 @@
 use crate::bot_actor::BotActor;
 use crate::bot_handle::BotHandle;
-use crate::commands::BotConfig;
+use crate::commands::{BotConfig, BotState};
+// BotEvent will be used in Phase 2 for event emission logic
+#[allow(unused_imports)]
+use crate::events::{BotEvent, EnhancedBotStatus};
 use anyhow::Result;
+use chrono::Utc;
+use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
 pub struct BotRegistry {
     bots: Arc<RwLock<HashMap<String, BotHandle>>>,
@@ -34,10 +39,33 @@ impl BotRegistry {
     /// Returns an error if the bot cannot be spawned.
     pub async fn spawn_bot(&self, config: BotConfig) -> Result<BotHandle> {
         let (tx, rx) = mpsc::channel(32);
-        let handle = BotHandle::new(tx);
+
+        // Create event streaming channels
+        // event_rx stored in BotHandle, will be used by subscribers in Phase 2
+        let (event_tx, _event_rx) = broadcast::channel(1000);
+
+        // Create initial status
+        let initial_status = EnhancedBotStatus {
+            bot_id: config.bot_id.clone(),
+            state: BotState::Stopped,
+            last_heartbeat: Utc::now(),
+            current_equity: Decimal::ZERO,
+            initial_capital: Decimal::ZERO,
+            total_return_pct: 0.0,
+            sharpe_ratio: 0.0,
+            max_drawdown: 0.0,
+            win_rate: 0.0,
+            num_trades: 0,
+            open_positions: Vec::new(),
+            recent_events: Vec::new(),
+            error: None,
+        };
+        let (status_tx, status_rx) = watch::channel(initial_status);
+
+        let handle = BotHandle::new(tx, event_tx.clone(), status_rx);
 
         let bot_id = config.bot_id.clone();
-        let actor = BotActor::new(config, rx);
+        let actor = BotActor::new(config, rx, event_tx, status_tx);
         let bot_id_for_task = bot_id.clone();
         tokio::spawn(async move {
             if let Err(e) = actor.run().await {
