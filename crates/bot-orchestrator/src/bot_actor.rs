@@ -364,6 +364,12 @@ impl BotActor {
                 BotCommand::Start => {
                     tracing::info!("Bot {} received start command", self.config.bot_id);
 
+                    // Defensive: Only start if stopped or error (allow restart from error)
+                    if matches!(self.state, BotState::Running | BotState::Paused) {
+                        tracing::warn!("Bot {} in invalid state for start (state: {:?}), ignoring command", self.config.bot_id, self.state);
+                        continue;
+                    }
+
                     // Initialize trading system
                     if let Err(e) = self.initialize_system().await {
                         tracing::error!("Failed to initialize bot {}: {}", self.config.bot_id, e);
@@ -390,16 +396,34 @@ impl BotActor {
                     self.update_status_without_market_data();
                 }
                 BotCommand::Stop => {
+                    // Defensive: Only stop if running or paused
+                    if matches!(self.state, BotState::Stopped | BotState::Error) {
+                        tracing::warn!("Bot {} already stopped, ignoring stop command", self.config.bot_id);
+                        continue;
+                    }
+
                     tracing::info!("Bot {} stopped", self.config.bot_id);
                     self.state = BotState::Stopped;
                     self.update_status_without_market_data();
                 }
                 BotCommand::Pause => {
+                    // Defensive: Only pause if running
+                    if !matches!(self.state, BotState::Running) {
+                        tracing::warn!("Bot {} not running (state: {:?}), cannot pause", self.config.bot_id, self.state);
+                        continue;
+                    }
+
                     tracing::info!("Bot {} paused", self.config.bot_id);
                     self.state = BotState::Paused;
                     self.update_status_without_market_data();
                 }
                 BotCommand::Resume => {
+                    // Defensive: Only resume if paused
+                    if !matches!(self.state, BotState::Paused) {
+                        tracing::warn!("Bot {} not paused (state: {:?}), cannot resume", self.config.bot_id, self.state);
+                        continue;
+                    }
+
                     tracing::info!("Bot {} resumed", self.config.bot_id);
                     self.state = BotState::Running;
                     if self.started_at.is_none() {
