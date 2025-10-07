@@ -15,8 +15,10 @@ algo-trade-strategy = { path = "../strategy" }
 algo-trade-hyperliquid = { path = "../exchange-hyperliquid" }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = "1.0"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = "1.33"
 async-trait = "0.1.89"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
