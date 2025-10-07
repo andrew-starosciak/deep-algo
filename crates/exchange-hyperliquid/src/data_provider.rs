@@ -21,21 +21,39 @@ impl LiveDataProvider {
     /// # Errors
     /// Returns error if WebSocket connection fails or subscription fails
     pub async fn new(ws_url: String, symbol: String, interval: String) -> Result<Self> {
-        let mut ws = HyperliquidWebSocket::new(ws_url);
-        ws.connect().await?;
+        let mut ws = HyperliquidWebSocket::new(ws_url.clone());
+
+        // Connect to WebSocket
+        ws.connect().await
+            .map_err(|e| {
+                tracing::error!("WebSocket connection failed: {:?}", e);
+                e
+            })?;
 
         // Subscribe to candles for the symbol
-        let subscription = serde_json::json!({
+        let subscription = Self::create_subscription(&symbol, &interval);
+
+        tracing::debug!("Subscribing to candles: {}", subscription);
+        ws.subscribe(subscription).await
+            .map_err(|e| {
+                tracing::error!("WebSocket subscription failed: {:?}", e);
+                e
+            })?;
+
+        tracing::info!("Successfully subscribed to {} candles (interval: {})", symbol, interval);
+        Ok(Self { ws, symbol, interval })
+    }
+
+    /// Create subscription JSON for candle data
+    fn create_subscription(symbol: &str, interval: &str) -> serde_json::Value {
+        serde_json::json!({
             "method": "subscribe",
             "subscription": {
                 "type": "candle",
                 "coin": symbol,
                 "interval": interval
             }
-        });
-        ws.subscribe(subscription).await?;
-
-        Ok(Self { ws, symbol, interval })
+        })
     }
 
     /// Fetches historical candles to warm up strategy state before live trading
@@ -89,34 +107,93 @@ impl LiveDataProvider {
             anyhow::bail!("Invalid interval format: {interval}. Expected format: 1m, 5m, 1h, 1d")
         }
     }
+
+    /// Extract candle object from data field (handles both object and array formats)
+    fn extract_candle_from_data(data: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        if let Some(obj) = data.as_object() {
+            Some(obj)
+        } else if let Some(arr) = data.as_array() {
+            arr.first()?.as_object()
+        } else {
+            None
+        }
+    }
+
+    /// Parse candle fields into `MarketEvent`
+    fn parse_candle_to_event(&self, candle: &serde_json::Map<String, serde_json::Value>) -> Result<MarketEvent> {
+        let symbol = candle.get("s")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&self.symbol)
+            .to_string();
+
+        let open = candle.get("o")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'o' (open) field in candle"))?;
+        let high = candle.get("h")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'h' (high) field in candle"))?;
+        let low = candle.get("l")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'l' (low) field in candle"))?;
+        let close = candle.get("c")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'c' (close) field in candle"))?;
+        let volume = candle.get("v")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'v' (volume) field in candle"))?;
+        let timestamp = candle.get("t")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or_else(|| anyhow::anyhow!("Missing 't' (timestamp) field in candle"))?;
+
+        let open = Decimal::from_str(open)?;
+        let high = Decimal::from_str(high)?;
+        let low = Decimal::from_str(low)?;
+        let close = Decimal::from_str(close)?;
+        let volume = Decimal::from_str(volume)?;
+        let timestamp = chrono::DateTime::from_timestamp_millis(timestamp)
+            .ok_or_else(|| anyhow::anyhow!("Invalid timestamp: {timestamp}"))?;
+
+        tracing::debug!("Parsed candle: {} @ {} (OHLCV: {}/{}/{}/{}/{})",
+            symbol, timestamp, open, high, low, close, volume);
+
+        Ok(MarketEvent::Bar {
+            symbol,
+            open,
+            high,
+            low,
+            close,
+            volume,
+            timestamp,
+        })
+    }
 }
 
 #[async_trait]
 impl DataProvider for LiveDataProvider {
     async fn next_event(&mut self) -> Result<Option<MarketEvent>> {
         while let Some(msg) = self.ws.next_message().await? {
-            if let Some(data) = msg.get("data") {
-                if let Some(candle) = data.as_object() {
-                    let symbol = self.symbol.clone();
-                    let open = Decimal::from_str(candle["o"].as_str().unwrap_or("0"))?;
-                    let high = Decimal::from_str(candle["h"].as_str().unwrap_or("0"))?;
-                    let low = Decimal::from_str(candle["l"].as_str().unwrap_or("0"))?;
-                    let close = Decimal::from_str(candle["c"].as_str().unwrap_or("0"))?;
-                    let volume = Decimal::from_str(candle["v"].as_str().unwrap_or("0"))?;
-                    let timestamp = candle["t"].as_i64().unwrap_or(0);
-                    let timestamp = chrono::DateTime::from_timestamp(timestamp / 1000, 0)
-                        .unwrap_or_else(Utc::now);
+            tracing::trace!("Received WebSocket message: {}", msg);
 
-                    return Ok(Some(MarketEvent::Bar {
-                        symbol,
-                        open,
-                        high,
-                        low,
-                        close,
-                        volume,
-                        timestamp,
-                    }));
+            // Filter out subscription confirmation messages
+            if let Some(channel) = msg.get("channel").and_then(serde_json::Value::as_str) {
+                if channel == "subscriptionResponse" {
+                    tracing::debug!("Subscription confirmation received");
+                    continue;
                 }
+            }
+
+            // Check if this is a candle data message
+            if msg.get("channel").is_some() && msg.get("data").is_some() {
+                if let Some(data) = msg.get("data") {
+                    if let Some(candle) = Self::extract_candle_from_data(data) {
+                        return Ok(Some(self.parse_candle_to_event(candle)?));
+                    }
+                    tracing::warn!("Could not extract candle from data: {data}");
+                }
+            } else if msg.get("method") == Some(&serde_json::json!("subscribe")) {
+                tracing::debug!("Subscription confirmation received: {}", msg);
+            } else {
+                tracing::debug!("Received non-data message: {}", msg);
             }
         }
         Ok(None)

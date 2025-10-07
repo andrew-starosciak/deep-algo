@@ -1,5 +1,5 @@
-use algo_trade_core::events::{FillEvent, OrderEvent, SignalEvent};
-use crate::commands::BotState;
+use algo_trade_core::events::{ClosedTrade, FillEvent, OrderEvent, SignalEvent};
+use crate::commands::{BotState, ExecutionMode};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -49,7 +49,9 @@ pub enum BotEvent {
 pub struct EnhancedBotStatus {
     pub bot_id: String,
     pub state: BotState,
+    pub execution_mode: ExecutionMode,
     pub last_heartbeat: DateTime<Utc>,
+    pub started_at: Option<DateTime<Utc>>, // When bot started running (None if never started)
 
     // Performance metrics
     pub current_equity: Decimal,
@@ -62,6 +64,9 @@ pub struct EnhancedBotStatus {
 
     // Open positions
     pub open_positions: Vec<PositionInfo>,
+
+    // Closed trades (trade history)
+    pub closed_trades: Vec<ClosedTrade>,
 
     // Recent events (last 10)
     pub recent_events: Vec<BotEvent>,

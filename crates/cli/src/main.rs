@@ -80,21 +80,45 @@ enum Commands {
         strategy: String,
     },
     /// Interactive TUI for managing live trading bots
-    LiveBotTui,
+    LiveBotTui {
+        /// Optional log file path (logs to file instead of stderr)
+        #[arg(long)]
+        log_file: Option<String>,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging (disabled for TUI to prevent screen corruption)
-    if !matches!(cli.command, Commands::TuiBacktest { .. } | Commands::LiveBotTui) {
-        tracing_subscriber::fmt()
-            .with_env_filter(
-                tracing_subscriber::EnvFilter::try_from_default_env()
-                    .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-            )
-            .init();
+    // Initialize logging (disabled for TUI to prevent screen corruption, unless log_file is provided)
+    match &cli.command {
+        Commands::LiveBotTui { log_file: Some(path) } => {
+            // Log to file for TUI
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        Commands::TuiBacktest { .. } | Commands::LiveBotTui { .. } => {
+            // No logging for TUI (prevents screen corruption)
+        }
+        _ => {
+            // Normal stderr logging for non-TUI commands
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .init();
+        }
     }
 
     match cli.command {
@@ -119,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::TokenSelection { config, strategy } => {
             run_token_selection(&config, &strategy).await?;
         }
-        Commands::LiveBotTui => {
+        Commands::LiveBotTui { log_file: _ } => {
             tui_live_bot::run().await?;
         }
     }

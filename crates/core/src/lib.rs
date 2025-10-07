@@ -11,7 +11,7 @@ pub mod traits;
 pub use config::{AppConfig, DatabaseConfig, HyperliquidConfig, ServerConfig};
 pub use config_loader::ConfigLoader;
 pub use config_watcher::ConfigWatcher;
-pub use engine::{PerformanceMetrics, TradingSystem};
+pub use engine::{PerformanceMetrics, ProcessingCycleEvents, TradingSystem};
 pub use events::{FillEvent, MarketEvent, OrderEvent, SignalEvent, SignalDirection};
 pub use metrics_formatter::MetricsFormatter;
 pub use position::{Position, PositionTracker};

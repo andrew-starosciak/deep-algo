@@ -55,6 +55,9 @@ pub async fn create_bot(
         max_position_pct: 0.20,
         leverage: 1,
         margin_mode: algo_trade_bot_orchestrator::MarginMode::Cross,
+        execution_mode: algo_trade_bot_orchestrator::ExecutionMode::Paper, // Safe default for web API
+        paper_slippage_bps: 10.0,
+        paper_commission_rate: 0.00025,
         wallet: None,
     };
 

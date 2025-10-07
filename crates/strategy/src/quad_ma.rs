@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use std::collections::VecDeque;
+use std::io::Write;
 
 /// Quad Moving Average strategy with crossover detection and fixed TP/SL.
 ///
@@ -168,7 +169,6 @@ impl QuadMaStrategy {
         stop_loss_pct: f64,
         reversal_confirmation_bars: usize,
     ) -> Self {
-        use std::io::Write;
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -176,8 +176,7 @@ impl QuadMaStrategy {
         {
             let _ = writeln!(
                 file,
-                "[QuadMA CONFIG] {} - MA: {}/{}/{}/{}, trend={}, vol_filter={}, vol_factor={:.2}, tp={:.4}, sl={:.4}",
-                symbol, short_1, short_2, long_1, long_2, trend, volume_filter_enabled, volume_factor, take_profit_pct, stop_loss_pct
+                "[QuadMA CONFIG] {symbol} - MA: {short_1}/{short_2}/{long_1}/{long_2}, trend={trend}, vol_filter={volume_filter_enabled}, vol_factor={volume_factor:.2}, tp={take_profit_pct:.4}, sl={stop_loss_pct:.4}"
             );
         }
         Self {
@@ -399,6 +398,7 @@ impl QuadMaStrategy {
 
 #[async_trait]
 impl Strategy for QuadMaStrategy {
+    #[allow(clippy::too_many_lines)]
     async fn on_market_event(&mut self, event: &MarketEvent) -> Result<Option<SignalEvent>> {
         // Only process Bar events (need volume data)
         let MarketEvent::Bar { symbol, close: price, volume, .. } = event else {
@@ -454,7 +454,6 @@ impl Strategy for QuadMaStrategy {
             let sl_pct = Decimal::from_f64(self.stop_loss_pct).unwrap_or_else(|| Decimal::from(1) / Decimal::from(100));
 
             // Debug: Log TP/SL check
-            use std::io::Write;
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -490,7 +489,6 @@ impl Strategy for QuadMaStrategy {
                     SignalDirection::Short => (entry - *price) / entry,
                     SignalDirection::Exit => Decimal::ZERO,
                 };
-                use std::io::Write;
                 if let Ok(mut file) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -583,7 +581,7 @@ impl Strategy for QuadMaStrategy {
                 }
             } else {
                 // New reversal signal - start confirmation counter
-                self.pending_reversal = desired_signal.clone();
+                self.pending_reversal.clone_from(&desired_signal);
                 self.pending_reversal_count = 1;
                 self.last_signal.clone()
             }
@@ -595,7 +593,10 @@ impl Strategy for QuadMaStrategy {
         };
 
         // Only generate signal event if direction actually changed
-        if final_signal != self.last_signal {
+        if final_signal == self.last_signal {
+            // No change, no signal
+            Ok(None)
+        } else {
             self.last_signal.clone_from(&final_signal);
             self.bars_since_entry = 0;  // Reset counter on new position
 
@@ -612,9 +613,6 @@ impl Strategy for QuadMaStrategy {
                 // Should never happen with the logic above
                 Ok(None)
             }
-        } else {
-            // No change, no signal
-            Ok(None)
         }
     }
 

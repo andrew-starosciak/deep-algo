@@ -9,3 +9,31 @@ max_connections = 10
 [hyperliquid]
 api_url = "https://api.hyperliquid.xyz"
 ws_url = "wss://api.hyperliquid.xyz/ws"
+
+# Bot Configuration Example
+# [[bots]]
+# bot_id = "test_bot_1"
+# symbol = "BTC-USD"
+# strategy = "ma_crossover"
+# enabled = true
+# interval = "1m"
+# warmup_periods = 100
+# initial_capital = 10000
+# risk_per_trade_pct = 0.05
+# max_position_pct = 0.20
+# leverage = 1
+# margin_mode = "Cross"
+#
+# # Execution Mode: "Live" or "Paper"
+# # Paper mode: Live market data, simulated fills (no real money)
+# # Live mode: Real trading (requires wallet configuration)
+# execution_mode = "Paper"
+#
+# # Paper Trading Settings (used when execution_mode = "Paper")
+# paper_slippage_bps = 10.0          # 10 basis points (0.1%)
+# paper_commission_rate = 0.00025    # 0.025% (Hyperliquid taker fee)
+#
+# # Wallet Configuration (required for Live mode)
+# # [bots.wallet]
+# # account_address = "0x..."
+# # api_wallet_private_key = "0x..."  # Keep secure! Use env vars in production

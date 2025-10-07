@@ -12,11 +12,12 @@ readme = false
 [dependencies]
 algo-trade-core = { path = "../core" }
 algo-trade-data = { path = "../data" }
+algo-trade-backtest = { path = "../backtest" }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["json"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 governor = "0.6"
 ethers = "2.0"

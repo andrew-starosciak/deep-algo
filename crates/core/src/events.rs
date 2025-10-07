@@ -25,6 +25,22 @@ impl MarketEvent {
             Self::Quote { .. } => None,
         }
     }
+
+    #[must_use]
+    pub fn symbol(&self) -> &str {
+        match self {
+            Self::Quote { symbol, .. } | Self::Trade { symbol, .. } | Self::Bar { symbol, .. } => symbol,
+        }
+    }
+
+    #[must_use]
+    pub const fn volume(&self) -> Option<Decimal> {
+        match self {
+            Self::Bar { volume, .. } => Some(*volume),
+            Self::Trade { size, .. } => Some(*size),
+            Self::Quote { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,4 +90,24 @@ pub struct FillEvent {
     pub price: Decimal,
     pub commission: Decimal,
     pub timestamp: DateTime<Utc>,
+}
+
+/// Represents a closed trade (complete round trip: entry + exit)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosedTrade {
+    pub symbol: String,
+    pub entry_time: DateTime<Utc>,
+    pub exit_time: DateTime<Utc>,
+    pub entry_price: Decimal,
+    pub exit_price: Decimal,
+    pub quantity: Decimal,
+    pub direction: TradeDirection, // Long or Short
+    pub pnl: Decimal,
+    pub pnl_pct: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TradeDirection {
+    Long,  // Buy then Sell
+    Short, // Sell then Buy
 }

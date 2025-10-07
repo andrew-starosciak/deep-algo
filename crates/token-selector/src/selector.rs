@@ -32,7 +32,7 @@ pub struct TokenSelector {
 impl TokenSelector {
     /// Creates a new token selector.
     #[must_use]
-    pub fn new(config: TokenSelectorConfig, db_client: Arc<DatabaseClient>) -> Self {
+    pub const fn new(config: TokenSelectorConfig, db_client: Arc<DatabaseClient>) -> Self {
         Self { config, db_client }
     }
 

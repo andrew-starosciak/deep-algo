@@ -15,7 +15,7 @@ use tokio::sync::Mutex;
 /// Creates a strategy from name and configuration
 ///
 /// # Arguments
-/// * `strategy_name` - Name of strategy ("ma_crossover", "quad_ma")
+/// * `strategy_name` - Name of strategy (`ma_crossover`, `quad_ma`)
 /// * `symbol` - Trading symbol
 /// * `config` - Optional JSON configuration string
 ///
@@ -34,13 +34,11 @@ pub fn create_strategy(
 
                 let fast = json.get("fast")
                     .and_then(Value::as_u64)
-                    .map(|v| v as usize)
-                    .unwrap_or(10);
+                    .map_or(10, |v| usize::try_from(v).unwrap_or(10));
 
                 let slow = json.get("slow")
                     .and_then(Value::as_u64)
-                    .map(|v| v as usize)
-                    .unwrap_or(30);
+                    .map_or(30, |v| usize::try_from(v).unwrap_or(30));
 
                 (fast, slow)
             } else {
@@ -55,15 +53,15 @@ pub fn create_strategy(
                 let json: Value = serde_json::from_str(&cfg)
                     .context("Failed to parse quad_ma config JSON")?;
 
-                let ma1 = json.get("ma1").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(5);
-                let ma2 = json.get("ma2").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(10);
-                let ma3 = json.get("ma3").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(20);
-                let ma4 = json.get("ma4").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(50);
-                let trend_period = json.get("trend_period").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(100);
-                let volume_factor = json.get("volume_factor").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(150);
-                let take_profit = json.get("take_profit").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(200);
-                let stop_loss = json.get("stop_loss").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(100);
-                let reversal_confirmation_bars = json.get("reversal_confirmation_bars").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(3);
+                let ma1 = json.get("ma1").and_then(Value::as_u64).map_or(5, |v| usize::try_from(v).unwrap_or(5));
+                let ma2 = json.get("ma2").and_then(Value::as_u64).map_or(10, |v| usize::try_from(v).unwrap_or(10));
+                let ma3 = json.get("ma3").and_then(Value::as_u64).map_or(20, |v| usize::try_from(v).unwrap_or(20));
+                let ma4 = json.get("ma4").and_then(Value::as_u64).map_or(50, |v| usize::try_from(v).unwrap_or(50));
+                let trend_period = json.get("trend_period").and_then(Value::as_u64).map_or(100, |v| usize::try_from(v).unwrap_or(100));
+                let volume_factor = json.get("volume_factor").and_then(Value::as_u64).map_or(150, |v| usize::try_from(v).unwrap_or(150));
+                let take_profit = json.get("take_profit").and_then(Value::as_u64).map_or(200, |v| usize::try_from(v).unwrap_or(200));
+                let stop_loss = json.get("stop_loss").and_then(Value::as_u64).map_or(100, |v| usize::try_from(v).unwrap_or(100));
+                let reversal_confirmation_bars = json.get("reversal_confirmation_bars").and_then(Value::as_u64).map_or(3, |v| usize::try_from(v).unwrap_or(3));
 
                 // Convert percentage values to f64
                 #[allow(clippy::cast_precision_loss)]

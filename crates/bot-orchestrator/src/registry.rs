@@ -48,7 +48,9 @@ impl BotRegistry {
         let initial_status = EnhancedBotStatus {
             bot_id: config.bot_id.clone(),
             state: BotState::Stopped,
+            execution_mode: config.execution_mode,
             last_heartbeat: Utc::now(),
+            started_at: None,
             current_equity: Decimal::ZERO,
             initial_capital: Decimal::ZERO,
             total_return_pct: 0.0,
@@ -57,6 +59,7 @@ impl BotRegistry {
             win_rate: 0.0,
             num_trades: 0,
             open_positions: Vec::new(),
+            closed_trades: Vec::new(),
             recent_events: Vec::new(),
             error: None,
         };

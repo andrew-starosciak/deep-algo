@@ -1,4 +1,4 @@
-use algo_trade_bot_orchestrator::{BotConfig, BotRegistry};
+use algo_trade_bot_orchestrator::{BotConfig, BotEvent, BotRegistry, BotState, EnhancedBotStatus, ExecutionMode};
 use algo_trade_hyperliquid::HyperliquidClient;
 use anyhow::Result;
 use chrono::Utc;
@@ -15,6 +15,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph},
     Frame, Terminal,
 };
+use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 
@@ -98,6 +99,7 @@ enum ParamField {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BotScreen {
     BotList,
+    BotMonitor,
     StrategySelection,
     ParameterConfig,
     TokenSelection,
@@ -110,8 +112,15 @@ struct App {
 
     // Bot list
     cached_bots: Vec<String>,
+    cached_bot_statuses: HashMap<String, EnhancedBotStatus>,
     selected_bot: usize,
     messages: Vec<String>,
+
+    // Bot monitor
+    monitored_bot_id: Option<String>,
+    bot_events: Vec<BotEvent>,
+    bot_status: Option<EnhancedBotStatus>,
+    event_rx: Option<tokio::sync::broadcast::Receiver<BotEvent>>,
 
     // Strategy selection
     selected_strategy_index: usize,
@@ -134,8 +143,13 @@ impl App {
             registry,
             current_screen: BotScreen::BotList,
             cached_bots: Vec::new(),
+            cached_bot_statuses: HashMap::new(),
             selected_bot: 0,
-            messages: vec!["Live Bot Manager - Press 'a' to add bot, 'q' to quit".to_string()],
+            messages: vec!["Live Bot Manager - Press 'a' to add bot, 'v' to view bot, 'q' to quit".to_string()],
+            monitored_bot_id: None,
+            bot_events: Vec::new(),
+            bot_status: None,
+            event_rx: None,
             selected_strategy_index: 0,
             available_strategies: vec!["Quad MA", "MA Crossover"],
             param_config: ParamConfig::default_quad_ma(),
@@ -191,9 +205,15 @@ async fn run_app<B: ratatui::backend::Backend>(
     app: &mut App,
 ) -> Result<()> {
     loop {
-        // Refresh cached bot list before drawing
+        // Refresh cached bot list and statuses before drawing
         if app.current_screen == BotScreen::BotList {
             app.cached_bots = app.registry.list_bots().await;
+            app.cached_bot_statuses.clear();
+            for bot_id in &app.cached_bots {
+                if let Some(handle) = app.registry.get_bot(bot_id).await {
+                    app.cached_bot_statuses.insert(bot_id.clone(), handle.latest_status());
+                }
+            }
         }
 
         // Proactively load tokens when entering token selection screen
@@ -216,6 +236,27 @@ async fn run_app<B: ratatui::backend::Backend>(
             }
         }
 
+        // Poll for bot events when on monitor screen
+        if app.current_screen == BotScreen::BotMonitor {
+            if let Some(ref mut event_rx) = app.event_rx {
+                // Try to receive events (non-blocking)
+                while let Ok(event) = event_rx.try_recv() {
+                    app.bot_events.push(event);
+                    // Keep only last 100 events
+                    if app.bot_events.len() > 100 {
+                        app.bot_events.remove(0);
+                    }
+                }
+            }
+
+            // Update status from handle
+            if let Some(bot_id) = &app.monitored_bot_id {
+                if let Some(handle) = app.registry.get_bot(bot_id).await {
+                    app.bot_status = Some(handle.latest_status());
+                }
+            }
+        }
+
         terminal.draw(|f| ui(f, app))?;
 
         if event::poll(std::time::Duration::from_millis(100))? {
@@ -233,6 +274,7 @@ async fn run_app<B: ratatui::backend::Backend>(
 async fn handle_key_event(key: crossterm::event::KeyEvent, app: &mut App) -> Result<bool> {
     match app.current_screen {
         BotScreen::BotList => handle_bot_list_keys(key, app).await,
+        BotScreen::BotMonitor => handle_bot_monitor_keys(key, app).await,
         BotScreen::StrategySelection => handle_strategy_selection_keys(key, app),
         BotScreen::ParameterConfig => handle_parameter_config_keys(key, app),
         BotScreen::TokenSelection => handle_token_selection_keys(key, app).await,
@@ -247,6 +289,19 @@ async fn handle_bot_list_keys(key: crossterm::event::KeyEvent, app: &mut App) ->
             app.current_screen = BotScreen::StrategySelection;
             app.selected_strategy_index = 0;
             app.add_message("Select strategy for new bot".to_string());
+        }
+        KeyCode::Char('v') => {
+            // View selected bot
+            if let Some(bot_id) = app.cached_bots.get(app.selected_bot) {
+                if let Some(handle) = app.registry.get_bot(bot_id).await {
+                    app.monitored_bot_id = Some(bot_id.clone());
+                    app.bot_events.clear();
+                    app.bot_status = Some(handle.latest_status());
+                    app.event_rx = Some(handle.subscribe_events());
+                    app.current_screen = BotScreen::BotMonitor;
+                    app.add_message(format!("Monitoring bot: {bot_id}"));
+                }
+            }
         }
         KeyCode::Char('s') => {
             // Start selected bot
@@ -402,6 +457,21 @@ async fn handle_token_selection_keys(key: crossterm::event::KeyEvent, app: &mut 
     Ok(false)
 }
 
+async fn handle_bot_monitor_keys(key: crossterm::event::KeyEvent, app: &mut App) -> Result<bool> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            // Return to bot list
+            app.current_screen = BotScreen::BotList;
+            app.monitored_bot_id = None;
+            app.bot_events.clear();
+            app.bot_status = None;
+            app.event_rx = None;
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
 fn next_param_field(strategy: &StrategyType, current: Option<ParamField>) -> ParamField {
     match strategy {
         StrategyType::MaCrossover { .. } => match current {
@@ -505,6 +575,9 @@ async fn create_bot(app: &App, token: &str) -> Result<String> {
         max_position_pct: 0.20,
         leverage: 1,
         margin_mode: algo_trade_bot_orchestrator::MarginMode::Cross,
+        execution_mode: algo_trade_bot_orchestrator::ExecutionMode::Paper,
+        paper_slippage_bps: 10.0,
+        paper_commission_rate: 0.00025,
         wallet: None, // Loaded from env at runtime
     };
 
@@ -516,9 +589,63 @@ async fn create_bot(app: &App, token: &str) -> Result<String> {
 fn ui(f: &mut Frame, app: &App) {
     match app.current_screen {
         BotScreen::BotList => render_bot_list(f, app),
+        BotScreen::BotMonitor => render_bot_monitor(f, app),
         BotScreen::StrategySelection => render_strategy_selection(f, app),
         BotScreen::ParameterConfig => render_parameter_config(f, app),
         BotScreen::TokenSelection => render_token_selection(f, app),
+    }
+}
+
+/// Returns color for bot state
+fn state_color(state: &BotState) -> Color {
+    match state {
+        BotState::Running => Color::Green,
+        BotState::Stopped => Color::Gray,
+        BotState::Paused => Color::Yellow,
+        BotState::Error => Color::Red,
+    }
+}
+
+/// Returns icon for bot state
+fn state_icon(state: &BotState) -> &'static str {
+    match state {
+        BotState::Running => "▶",
+        BotState::Stopped => "■",
+        BotState::Paused => "⏸",
+        BotState::Error => "✖",
+    }
+}
+
+/// Returns icon for execution mode
+fn execution_icon(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Live => "💰",
+        ExecutionMode::Paper => "📄",
+    }
+}
+
+/// Formats PnL with color (green for profit, red for loss)
+fn format_pnl(pnl_pct: f64) -> (String, Color) {
+    let color = if pnl_pct >= 0.0 { Color::Green } else { Color::Red };
+    let sign = if pnl_pct >= 0.0 { "+" } else { "" };
+    (format!("{sign}{pnl_pct:.2}%"), color)
+}
+
+/// Formats duration in human-readable format (e.g., "2h 15m", "45m", "3d 5h")
+fn format_duration(started_at: chrono::DateTime<chrono::Utc>) -> String {
+    let now = chrono::Utc::now();
+    let duration = now.signed_duration_since(started_at);
+
+    let days = duration.num_days();
+    let hours = duration.num_hours() % 24;
+    let minutes = duration.num_minutes() % 60;
+
+    if days > 0 {
+        format!("{}d {}h", days, hours)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else {
+        format!("{}m", minutes)
     }
 }
 
@@ -527,6 +654,7 @@ fn render_bot_list(f: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),  // Title
+            Constraint::Length(3),  // Summary
             Constraint::Min(10),    // Bot list
             Constraint::Length(10), // Messages
             Constraint::Length(3),  // Help
@@ -540,18 +668,73 @@ fn render_bot_list(f: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
-    // Bot list
+    // Summary header - count bots by state
+    let mut running = 0;
+    let mut stopped = 0;
+    let mut paused = 0;
+    let mut error = 0;
+
+    for status in app.cached_bot_statuses.values() {
+        match status.state {
+            BotState::Running => running += 1,
+            BotState::Stopped => stopped += 1,
+            BotState::Paused => paused += 1,
+            BotState::Error => error += 1,
+        }
+    }
+
+    let summary_text = vec![
+        Span::styled(format!("{running} Running"), Style::default().fg(Color::Green)),
+        Span::raw(" | "),
+        Span::styled(format!("{stopped} Stopped"), Style::default().fg(Color::Gray)),
+        Span::raw(" | "),
+        Span::styled(format!("{paused} Paused"), Style::default().fg(Color::Yellow)),
+        Span::raw(" | "),
+        Span::styled(format!("{error} Error"), Style::default().fg(Color::Red)),
+    ];
+
+    let summary = Paragraph::new(Line::from(summary_text))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL).title("Summary"));
+    f.render_widget(summary, chunks[1]);
+
+    // Bot list with color coding, icons, and compact metrics
     let items: Vec<ListItem> = app
         .cached_bots
         .iter()
         .enumerate()
         .map(|(i, bot_id)| {
+            // Get bot status for color, icons, and metrics from cache
+            let (state_col, display_text) = if let Some(status) = app.cached_bot_statuses.get(bot_id) {
+                let state_col = state_color(&status.state);
+                let state_ico = state_icon(&status.state);
+                let exec_ico = execution_icon(status.execution_mode);
+
+                // Runtime display (only for running bots)
+                let runtime_str = if matches!(status.state, BotState::Running) && status.started_at.is_some() {
+                    format!(" | {}", format_duration(status.started_at.unwrap()))
+                } else {
+                    String::new()
+                };
+
+                // Metrics display (trades and return)
+                let (pnl_str, _pnl_color) = format_pnl(status.total_return_pct);
+                let metrics_str = format!(" | {} trades | {}", status.num_trades, pnl_str);
+
+                let display_text = format!("{state_ico} {exec_ico} {bot_id}{runtime_str}{metrics_str}");
+                (state_col, display_text)
+            } else {
+                (Color::Gray, format!("? ? {bot_id}"))
+            };
+
+            // Highlight selected bot
             let style = if i == app.selected_bot {
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(state_col)
             };
-            ListItem::new(bot_id.as_str()).style(style)
+
+            ListItem::new(display_text).style(style)
         })
         .collect();
 
@@ -559,19 +742,162 @@ fn render_bot_list(f: &mut Frame, app: &App) {
         .block(Block::default().borders(Borders::ALL).title("Bots"))
         .highlight_style(Style::default().bg(Color::DarkGray));
 
-    f.render_widget(list, chunks[1]);
+    f.render_widget(list, chunks[2]);
 
     // Messages
     let messages: Vec<Line> = app.messages.iter().map(|m| Line::from(m.as_str())).collect();
     let messages_widget = Paragraph::new(messages)
         .block(Block::default().borders(Borders::ALL).title("Messages"))
         .wrap(ratatui::widgets::Wrap { trim: true });
-    f.render_widget(messages_widget, chunks[2]);
+    f.render_widget(messages_widget, chunks[3]);
 
     // Help
-    let help = Paragraph::new("a: Add Bot | s: Start | x: Stop | r: Remove | ↑↓: Navigate | q: Quit")
+    let help = Paragraph::new("a: Add Bot | v: View Bot | s: Start | x: Stop | r: Remove | ↑↓: Navigate | q: Quit")
         .block(Block::default().borders(Borders::ALL).title("Help"));
-    f.render_widget(help, chunks[3]);
+    f.render_widget(help, chunks[4]);
+}
+
+fn render_bot_monitor(f: &mut Frame, app: &App) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),   // Title
+            Constraint::Length(8),   // Metrics panel
+            Constraint::Min(8),      // Trade history
+            Constraint::Min(8),      // Events log
+            Constraint::Length(3),   // Help
+        ])
+        .split(f.area());
+
+    // Title
+    let bot_id = app.monitored_bot_id.as_ref().map_or("Unknown", String::as_str);
+    let title = Paragraph::new(format!("Bot Monitor - {bot_id}"))
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .alignment(Alignment::Center)
+        .block(Block::default().borders(Borders::ALL));
+    f.render_widget(title, chunks[0]);
+
+    // Metrics panel
+    let metrics_text = if let Some(status) = &app.bot_status {
+        vec![
+            Line::from(vec![
+                Span::raw("Equity: "),
+                Span::styled(format!("${}", status.current_equity), Style::default().fg(Color::Green)),
+                Span::raw("  Return: "),
+                Span::styled(format!("{:.2}%", status.total_return_pct * 100.0),
+                    if status.total_return_pct >= 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) }),
+            ]),
+            Line::from(vec![
+                Span::raw("Sharpe: "),
+                Span::styled(format!("{:.2}", status.sharpe_ratio), Style::default().fg(Color::Yellow)),
+                Span::raw("  Max DD: "),
+                Span::styled(format!("{:.2}%", status.max_drawdown * 100.0), Style::default().fg(Color::Red)),
+                Span::raw("  Win Rate: "),
+                Span::styled(format!("{:.1}%", status.win_rate * 100.0), Style::default().fg(Color::Cyan)),
+            ]),
+            Line::from(vec![
+                Span::raw("Trades: "),
+                Span::styled(status.num_trades.to_string(), Style::default().fg(Color::White)),
+                Span::raw("  Open Positions: "),
+                Span::styled(status.open_positions.len().to_string(), Style::default().fg(Color::Magenta)),
+            ]),
+            Line::from(vec![
+                Span::raw("State: "),
+                Span::styled(format!("{:?}", status.state), Style::default().fg(Color::Green)),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from("Waiting for bot data..."),
+        ]
+    };
+
+    let metrics_panel = Paragraph::new(metrics_text)
+        .block(Block::default().borders(Borders::ALL).title("Performance Metrics"));
+    f.render_widget(metrics_panel, chunks[1]);
+
+    // Trade history
+    let trade_lines: Vec<ListItem> = if let Some(status) = &app.bot_status {
+        status.closed_trades
+            .iter()
+            .rev()
+            .take(10)
+            .map(|trade| {
+                let direction_icon = match trade.direction {
+                    algo_trade_core::events::TradeDirection::Long => "📈",
+                    algo_trade_core::events::TradeDirection::Short => "📉",
+                };
+                let pnl_color = if trade.pnl > rust_decimal::Decimal::ZERO {
+                    Color::Green
+                } else {
+                    Color::Red
+                };
+                let pnl_sign = if trade.pnl > rust_decimal::Decimal::ZERO { "+" } else { "" };
+
+                ListItem::new(Line::from(vec![
+                    Span::raw(format!("{} {} ", direction_icon, trade.symbol)),
+                    Span::styled(
+                        format!("{}{:.2}% ", pnl_sign, trade.pnl_pct),
+                        Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)
+                    ),
+                    Span::raw(format!("(${} → ${})", trade.entry_price, trade.exit_price)),
+                ]))
+            })
+            .collect()
+    } else {
+        vec![ListItem::new("No trades yet")]
+    };
+
+    let trades_list = List::new(trade_lines)
+        .block(Block::default().borders(Borders::ALL).title("Trade History (Last 10)"));
+    f.render_widget(trades_list, chunks[2]);
+
+    // Events log
+    let event_lines: Vec<ListItem> = app.bot_events
+        .iter()
+        .rev()
+        .take(20)
+        .map(|event| {
+            let text = format_bot_event(event);
+            ListItem::new(text)
+        })
+        .collect();
+
+    let events_list = List::new(event_lines)
+        .block(Block::default().borders(Borders::ALL).title("Recent Events"));
+    f.render_widget(events_list, chunks[3]);
+
+    // Help
+    let help = Paragraph::new("q/Esc: Back to Bot List")
+        .block(Block::default().borders(Borders::ALL).title("Help"));
+    f.render_widget(help, chunks[4]);
+}
+
+fn format_bot_event(event: &BotEvent) -> String {
+    match event {
+        BotEvent::MarketUpdate { symbol, price, timestamp, .. } => {
+            format!("[{:}] Market: {} @ ${}", timestamp.format("%H:%M:%S"), symbol, price)
+        }
+        BotEvent::SignalGenerated(signal) => {
+            format!("[{:}] Signal: {:?} {} @ ${}", signal.timestamp.format("%H:%M:%S"), signal.direction, signal.symbol, signal.price)
+        }
+        BotEvent::OrderPlaced(order) => {
+            format!("[{:}] Order: {:?} {} qty={}", order.timestamp.format("%H:%M:%S"), order.direction, order.symbol, order.quantity)
+        }
+        BotEvent::OrderFilled(fill) => {
+            format!("[{:}] Fill: {:?} {} qty={} @ ${}", fill.timestamp.format("%H:%M:%S"), fill.direction, fill.symbol, fill.quantity, fill.price)
+        }
+        BotEvent::PositionUpdate { symbol, quantity, avg_price, unrealized_pnl } => {
+            format!("Position: {} qty={} avg=${} PnL=${}", symbol, quantity, avg_price, unrealized_pnl)
+        }
+        BotEvent::TradeClosed { symbol, pnl, win } => {
+            let status = if *win { "WIN" } else { "LOSS" };
+            format!("Trade Closed: {} {} PnL=${}", symbol, status, pnl)
+        }
+        BotEvent::Error { message, timestamp } => {
+            format!("[{:}] ERROR: {}", timestamp.format("%H:%M:%S"), message)
+        }
+    }
 }
 
 fn render_strategy_selection(f: &mut Frame, app: &App) {

@@ -1,10 +1,19 @@
-use crate::events::FillEvent;
+use crate::events::{FillEvent, MarketEvent, OrderDirection, OrderEvent, SignalEvent};
 use crate::position::PositionTracker;
 use crate::traits::{DataProvider, ExecutionHandler, RiskManager, Strategy};
 use anyhow::Result;
 use rust_decimal::Decimal;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
+/// Events emitted during a single processing cycle
+#[derive(Debug, Clone)]
+pub struct ProcessingCycleEvents {
+    pub market_event: MarketEvent,
+    pub signals: Vec<SignalEvent>,
+    pub orders: Vec<OrderEvent>,
+    pub fills: Vec<FillEvent>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PerformanceMetrics {
@@ -47,6 +56,7 @@ where
     total_bars: usize,
     equity_peak: Decimal,
     fills: Vec<FillEvent>,
+    closed_trades: Vec<crate::events::ClosedTrade>,
 }
 
 impl<D, E> TradingSystem<D, E>
@@ -80,6 +90,7 @@ where
             total_bars: 0,
             equity_peak: initial_capital,
             fills: Vec::new(),
+            closed_trades: Vec::new(),
         }
     }
 
@@ -109,6 +120,7 @@ where
             total_bars: 0,
             equity_peak: initial_capital,
             fills: Vec::new(),
+            closed_trades: Vec::new(),
         }
     }
 
@@ -179,22 +191,22 @@ where
 
                         // Track position and calculate PnL if closing
                         if let Some(pnl) = self.position_tracker.process_fill(&fill) {
-                            pnls_to_record.push(pnl);
+                            pnls_to_record.push((pnl, fill.clone()));
                         }
                     }
                 }
             }
 
             // Process PnLs after iteration completes
-            for pnl in pnls_to_record {
-                self.add_trade(pnl);
+            for (pnl, exit_fill) in pnls_to_record {
+                self.add_trade(pnl, &exit_fill);
             }
         }
 
         Ok(self.calculate_metrics())
     }
 
-    fn add_trade(&mut self, pnl: Decimal) {
+    fn add_trade(&mut self, pnl: Decimal, exit_fill: &FillEvent) {
         let current_equity = *self.equity_curve.last().unwrap();
         let new_equity = current_equity + pnl;
 
@@ -213,6 +225,37 @@ where
 
         let return_pct = pnl / current_equity;
         self.returns.push(return_pct);
+
+        // Find matching entry fill for this symbol (most recent opposite direction)
+        let entry_fill = self.fills.iter().rev()
+            .find(|f| f.symbol == exit_fill.symbol &&
+                     matches!((&f.direction, &exit_fill.direction),
+                              (OrderDirection::Buy, OrderDirection::Sell) |
+                              (OrderDirection::Sell, OrderDirection::Buy)))
+            .cloned();
+
+        if let Some(entry) = entry_fill {
+            let direction = match entry.direction {
+                OrderDirection::Buy => crate::events::TradeDirection::Long,
+                OrderDirection::Sell => crate::events::TradeDirection::Short,
+            };
+
+            let pnl_pct = (pnl / (entry.price * entry.quantity)).try_into().unwrap_or(0.0);
+
+            let closed_trade = crate::events::ClosedTrade {
+                symbol: exit_fill.symbol.clone(),
+                entry_time: entry.timestamp,
+                exit_time: exit_fill.timestamp,
+                entry_price: entry.price,
+                exit_price: exit_fill.price,
+                quantity: exit_fill.quantity,
+                direction,
+                pnl,
+                pnl_pct: pnl_pct * 100.0, // Convert to percentage
+            };
+
+            self.closed_trades.push(closed_trade);
+        }
     }
 
     fn calculate_metrics(&self) -> PerformanceMetrics {
@@ -307,7 +350,7 @@ where
     ///
     /// # Panics
     /// Panics if `equity_curve` is empty (should never happen as it's initialized with `initial_capital`)
-    pub async fn process_next_event(&mut self) -> Result<bool> {
+    pub async fn process_next_event(&mut self) -> Result<Option<ProcessingCycleEvents>> {
         if let Some(market_event) = self.data_provider.next_event().await? {
             // Track timestamps
             if self.start_time.is_none() {
@@ -331,6 +374,11 @@ where
                 self.bars_in_position += 1;
             }
 
+            // Collect events for return
+            let mut cycle_signals = Vec::new();
+            let mut cycle_orders = Vec::new();
+            let mut cycle_fills = Vec::new();
+
             // Collect PnLs from trades
             let mut pnls_to_record = Vec::new();
 
@@ -338,6 +386,8 @@ where
             for strategy in &self.strategies {
                 let mut strategy = strategy.lock().await;
                 if let Some(signal) = strategy.on_market_event(&market_event).await? {
+                    cycle_signals.push(signal.clone());
+
                     let current_equity = *self.equity_curve.last().unwrap();
                     let current_position = self.position_tracker.get_position(&signal.symbol)
                         .map(|p| p.quantity);
@@ -348,8 +398,10 @@ where
                         current_position,
                     ).await?;
 
-                    for order in orders {
-                        let fill = self.execution_handler.execute_order(order).await?;
+                    for order in &orders {
+                        cycle_orders.push(order.clone());
+                        let fill = self.execution_handler.execute_order(order.clone()).await?;
+                        cycle_fills.push(fill.clone());
 
                         if let Some(pnl) = self.position_tracker.process_fill(&fill) {
                             pnls_to_record.push(pnl);
@@ -384,9 +436,14 @@ where
                 self.equity_peak = new_equity;
             }
 
-            Ok(true) // Event processed
+            Ok(Some(ProcessingCycleEvents {
+                market_event,
+                signals: cycle_signals,
+                orders: cycle_orders,
+                fills: cycle_fills,
+            }))
         } else {
-            Ok(false) // No more events
+            Ok(None) // No more events
         }
     }
 
@@ -484,16 +541,22 @@ where
         }
     }
 
-    /// Get number of trades
+    /// Get number of trades (closed trades count)
     #[must_use]
     pub const fn num_trades(&self) -> usize {
-        self.wins + self.losses
+        self.closed_trades.len()
     }
 
     /// Get open positions
     #[must_use]
     pub const fn open_positions(&self) -> &std::collections::HashMap<String, crate::position::Position> {
         self.position_tracker.all_positions()
+    }
+
+    /// Get closed trades history
+    #[must_use]
+    pub fn closed_trades(&self) -> &[crate::events::ClosedTrade] {
+        &self.closed_trades
     }
 
     /// Calculate unrealized `PnL` for a position

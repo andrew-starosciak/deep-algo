@@ -16,6 +16,21 @@ pub enum BotCommand {
     Shutdown,
 }
 
+/// Execution mode for bot trading
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ExecutionMode {
+    /// Live trading with real money (requires wallet configuration)
+    Live,
+    /// Paper trading with simulated fills (no real money, safe for testing)
+    Paper,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        Self::Live
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BotConfig {
     pub bot_id: String,
@@ -42,6 +57,14 @@ pub struct BotConfig {
     #[serde(default)]
     pub margin_mode: MarginMode,
 
+    // Execution mode
+    #[serde(default)]
+    pub execution_mode: ExecutionMode,
+    #[serde(default = "default_paper_slippage")]
+    pub paper_slippage_bps: f64,
+    #[serde(default = "default_paper_commission")]
+    pub paper_commission_rate: f64,
+
     // Wallet configuration (loaded from env vars at runtime, not serialized)
     #[serde(skip)]
     pub wallet: Option<WalletConfig>,
@@ -61,6 +84,14 @@ const fn default_max_position() -> f64 {
 
 const fn default_leverage() -> u8 {
     1 // Conservative default
+}
+
+const fn default_paper_slippage() -> f64 {
+    10.0 // 10 basis points (0.1%) - conservative estimate
+}
+
+const fn default_paper_commission() -> f64 {
+    0.00025 // 0.025% - Hyperliquid taker fee
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

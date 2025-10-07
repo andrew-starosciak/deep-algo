@@ -18,10 +18,10 @@ impl PerformanceMetrics {
     /// * `timestamp` - The timestamp when the backtest was run
     /// * `symbol` - The trading symbol (e.g., "BTC")
     /// * `exchange` - The exchange name (e.g., "hyperliquid")
-    /// * `strategy_name` - The name of the strategy (e.g., "quad_ma")
+    /// * `strategy_name` - The name of the strategy (e.g., `quad_ma`)
     /// * `total_pnl` - The total profit/loss from the backtest
     #[must_use]
-    pub fn to_db_record(
+    pub const fn to_db_record(
         &self,
         timestamp: DateTime<Utc>,
         symbol: String,
