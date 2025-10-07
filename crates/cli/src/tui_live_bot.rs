@@ -763,7 +763,8 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
         .constraints([
             Constraint::Length(3),   // Title
             Constraint::Length(8),   // Metrics panel
-            Constraint::Min(8),      // Trade history
+            Constraint::Min(6),      // Open positions
+            Constraint::Min(6),      // Trade history
             Constraint::Min(8),      // Events log
             Constraint::Length(3),   // Help
         ])
@@ -779,6 +780,12 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
 
     // Metrics panel
     let metrics_text = if let Some(status) = &app.bot_status {
+        // Calculate total unrealized P&L across all positions
+        let total_unrealized_pnl: rust_decimal::Decimal = status.open_positions
+            .iter()
+            .map(|pos| pos.unrealized_pnl)
+            .sum();
+
         vec![
             Line::from(vec![
                 Span::raw("Equity: "),
@@ -802,7 +809,18 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
                 Span::styled(status.open_positions.len().to_string(), Style::default().fg(Color::Magenta)),
             ]),
             Line::from(vec![
-                Span::raw("State: "),
+                Span::raw("Unrealized P&L: "),
+                Span::styled(
+                    format!("${:.2}", total_unrealized_pnl),
+                    if total_unrealized_pnl > rust_decimal::Decimal::ZERO {
+                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                    } else if total_unrealized_pnl < rust_decimal::Decimal::ZERO {
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Yellow)
+                    }
+                ),
+                Span::raw("  State: "),
                 Span::styled(format!("{:?}", status.state), Style::default().fg(Color::Green)),
             ]),
         ]
@@ -815,6 +833,60 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
     let metrics_panel = Paragraph::new(metrics_text)
         .block(Block::default().borders(Borders::ALL).title("Performance Metrics"));
     f.render_widget(metrics_panel, chunks[1]);
+
+    // Open positions
+    let position_lines: Vec<ListItem> = if let Some(status) = &app.bot_status {
+        if status.open_positions.is_empty() {
+            vec![ListItem::new(Span::styled(
+                "No open positions",
+                Style::default().fg(Color::DarkGray)
+            ))]
+        } else {
+            status.open_positions
+                .iter()
+                .map(|pos| {
+                    let pnl_color = if pos.unrealized_pnl > rust_decimal::Decimal::ZERO {
+                        Color::Green
+                    } else if pos.unrealized_pnl < rust_decimal::Decimal::ZERO {
+                        Color::Red
+                    } else {
+                        Color::Yellow
+                    };
+                    let pnl_sign = if pos.unrealized_pnl > rust_decimal::Decimal::ZERO { "+" } else { "" };
+
+                    let side_icon = if pos.quantity > rust_decimal::Decimal::ZERO {
+                        "🟢" // Long
+                    } else {
+                        "🔴" // Short
+                    };
+
+                    ListItem::new(Line::from(vec![
+                        Span::raw(format!("{} {} ", side_icon, pos.symbol)),
+                        Span::raw(format!("qty: {} ", pos.quantity.abs())),
+                        Span::styled(
+                            format!("${:.2} → ${:.2} ", pos.avg_price, pos.current_price),
+                            Style::default().fg(Color::Cyan)
+                        ),
+                        Span::styled(
+                            format!("{}${:.2} ({}{:.2}%)",
+                                pnl_sign,
+                                pos.unrealized_pnl.abs(),
+                                pnl_sign,
+                                pos.unrealized_pnl_pct
+                            ),
+                            Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)
+                        ),
+                    ]))
+                })
+                .collect()
+        }
+    } else {
+        vec![ListItem::new("Waiting for bot data...")]
+    };
+
+    let positions_list = List::new(position_lines)
+        .block(Block::default().borders(Borders::ALL).title("Open Positions"));
+    f.render_widget(positions_list, chunks[2]);
 
     // Trade history
     let trade_lines: Vec<ListItem> = if let Some(status) = &app.bot_status {
@@ -850,7 +922,7 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
 
     let trades_list = List::new(trade_lines)
         .block(Block::default().borders(Borders::ALL).title("Trade History (Last 10)"));
-    f.render_widget(trades_list, chunks[2]);
+    f.render_widget(trades_list, chunks[3]);
 
     // Events log
     let event_lines: Vec<ListItem> = app.bot_events
@@ -865,12 +937,12 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
 
     let events_list = List::new(event_lines)
         .block(Block::default().borders(Borders::ALL).title("Recent Events"));
-    f.render_widget(events_list, chunks[3]);
+    f.render_widget(events_list, chunks[4]);
 
     // Help
     let help = Paragraph::new("q/Esc: Back to Bot List")
         .block(Block::default().borders(Borders::ALL).title("Help"));
-    f.render_widget(help, chunks[4]);
+    f.render_widget(help, chunks[5]);
 }
 
 fn format_bot_event(event: &BotEvent) -> String {
