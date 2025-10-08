@@ -1,0 +1,80 @@
+version: '3.8'
+
+services:
+  timescaledb:
+    image: timescale/timescaledb:latest-pg17
+    container_name: algo-trade-db
+    environment:
+      POSTGRES_DB: algo_trade
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      TIMESCALEDB_TELEMETRY: 'off'
+      TS_TUNE_MEMORY: 4GB
+      TS_TUNE_NUM_CPUS: 4
+    volumes:
+      - timescale-data:/var/lib/postgresql/data
+      - ./scripts/setup_timescale.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d algo_trade"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    restart: unless-stopped
+    networks:
+      - algo-trade-network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trade-app
+    environment:
+      # Database connection (uses service name 'timescaledb')
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@timescaledb:5432/algo_trade
+
+      # Bot persistence (SQLite)
+      BOT_DATABASE_URL: sqlite:///data/bots.db
+
+      # Hyperliquid API
+      HYPERLIQUID_API_URL: ${HYPERLIQUID_API_URL:-https://api.hyperliquid.xyz}
+      HYPERLIQUID_WS_URL: ${HYPERLIQUID_WS_URL:-wss://api.hyperliquid.xyz/ws}
+
+      # Logging
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Config path
+      CONFIG_PATH: /config/Config.toml
+    volumes:
+      - sqlite-data:/data
+      - ./config/Config.toml:/config/Config.toml:ro
+    secrets:
+      - db_password
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8080}:8080"
+      - "${TUI_PORT:-7681}:7681"
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - algo-trade-network
+
+volumes:
+  timescale-data:
+    driver: local
+  sqlite-data:
+    driver: local
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+
+networks:
+  algo-trade-network:
+    driver: bridge

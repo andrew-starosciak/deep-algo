@@ -157,6 +157,211 @@ Then access:
 - REST API: `http://localhost:8080/api/bots`
 - WebSocket: `ws://localhost:8080/ws`
 
+## Docker Deployment
+
+### Quick Start
+
+The entire trading system can be deployed using Docker Compose for a self-contained, production-ready setup.
+
+#### Prerequisites
+
+- Docker Engine 20.10+ with BuildKit enabled
+- Docker Compose 2.0+
+- 4GB RAM minimum (8GB recommended for TimescaleDB)
+- 10GB disk space for Docker images and volumes
+
+#### Initial Setup
+
+1. **Create secrets directory and set database password**:
+   ```bash
+   mkdir -p secrets
+   echo "your_secure_password_here" > secrets/db_password.txt
+   chmod 600 secrets/db_password.txt
+   ```
+
+2. **Create environment file**:
+   ```bash
+   cp .env.example .env
+   # Edit .env and set DB_PASSWORD to match secrets/db_password.txt
+   nano .env
+   ```
+
+3. **Build Docker images**:
+   ```bash
+   DOCKER_BUILDKIT=1 docker compose build
+   ```
+   First build: ~5-10 minutes. Subsequent builds: <1 minute (with cache).
+
+4. **Start services**:
+   ```bash
+   docker compose up -d
+   ```
+
+5. **Verify services are running**:
+   ```bash
+   docker compose ps
+   docker compose logs -f app
+   ```
+
+#### Access Points
+
+- **Web API**: http://localhost:8080
+- **TUI (Web Terminal)**: http://localhost:7681
+- **TimescaleDB**: postgresql://localhost:5432/algo_trade (development only)
+
+### Managing Services
+
+#### Daily Operations
+
+```bash
+# Start all services
+docker compose up -d
+
+# Stop all services (graceful shutdown)
+docker compose stop
+
+# Restart services
+docker compose restart app
+
+# View logs (all services)
+docker compose logs -f
+
+# View logs (app only)
+docker compose logs -f app
+
+# Check service status
+docker compose ps
+
+# Shell access to app container
+docker exec -it algo-trade-app /bin/bash
+
+# Access TUI via terminal (alternative to web)
+docker exec -it algo-trade-app algo-trade live-bot-tui
+```
+
+#### Updating the Application
+
+```bash
+# Pull latest code
+git pull
+
+# Rebuild and restart
+docker compose down
+DOCKER_BUILDKIT=1 docker compose build
+docker compose up -d
+```
+
+#### Complete Teardown
+
+```bash
+# Stop and remove containers (keeps volumes/data)
+docker compose down
+
+# Stop and remove everything including volumes (DELETES ALL DATA)
+docker compose down -v
+```
+
+### Data Backup and Restore
+
+#### Backup TimescaleDB
+
+```bash
+# Create backups directory
+mkdir -p backups
+
+# Backup TimescaleDB volume
+docker run --rm \
+  -v algo-trade_timescale-data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar czf /backup/timescale-$(date +%Y%m%d-%H%M%S).tar.gz /data
+```
+
+#### Backup SQLite (Bot Configurations)
+
+```bash
+# Backup SQLite volume (bots.db)
+docker run --rm \
+  -v algo-trade_sqlite-data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine tar czf /backup/sqlite-$(date +%Y%m%d-%H%M%S).tar.gz /data
+```
+
+#### Restore TimescaleDB
+
+```bash
+# Stop services first
+docker compose down
+
+# Restore TimescaleDB volume
+docker run --rm \
+  -v algo-trade_timescale-data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine sh -c "rm -rf /data/* && tar xzf /backup/timescale-YYYYMMDD-HHMMSS.tar.gz -C /"
+
+# Restart services
+docker compose up -d
+```
+
+#### Restore SQLite
+
+```bash
+# Stop services first
+docker compose down
+
+# Restore SQLite volume
+docker run --rm \
+  -v algo-trade_sqlite-data:/data \
+  -v $(pwd)/backups:/backup \
+  alpine sh -c "rm -rf /data/* && tar xzf /backup/sqlite-YYYYMMDD-HHMMSS.tar.gz -C /"
+
+# Restart services
+docker compose up -d
+```
+
+### Troubleshooting
+
+#### Services won't start
+
+**Check logs**:
+```bash
+docker compose logs timescaledb
+docker compose logs app
+```
+
+**Common issues**:
+- Port conflicts (8080, 7681, 5432 already in use) - Change ports in .env
+- Memory limits - TimescaleDB needs 2GB minimum
+- Database password mismatch - Verify secrets/db_password.txt matches .env
+
+#### TUI not accessible at port 7681
+
+**Verify ttyd is running**:
+```bash
+docker exec -it algo-trade-app ps aux | grep ttyd
+```
+
+**Check entrypoint logs**:
+```bash
+docker compose logs app | grep ttyd
+```
+
+#### Database initialization fails
+
+**Remove TimescaleDB volume and recreate**:
+```bash
+docker compose down
+docker volume rm algo-trade_timescale-data
+docker compose up -d
+```
+
+#### Build fails with cache issues
+
+**Clear BuildKit cache**:
+```bash
+docker builder prune -af
+DOCKER_BUILDKIT=1 docker compose build --no-cache
+```
+
 ## Architecture
 
 ### Workspace Crates
