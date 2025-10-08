@@ -1,0 +1,44 @@
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Logs
+*.log
+quad_ma_debug.log
+
+# Cache
+cache/
+
+# Test data
+tests/data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation (not needed at runtime)
+*.md
+.claude/
+
+# CI/CD
+.github/
+
+# Environment
+.env
+.env.*
+
+# Database files (should be in volumes, not image)
+*.db
+*.db-shm
+*.db-wal
+
+# Temporary
+tmp/
+temp/

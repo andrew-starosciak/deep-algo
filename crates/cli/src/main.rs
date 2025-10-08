@@ -152,21 +152,85 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
-    tracing::info!("Starting trading system with config: {}", config_path);
+    tracing::info!("Starting trading system daemon with config: {}", config_path);
 
     // Load config
     let config = algo_trade_core::ConfigLoader::load()?;
 
-    // Create bot registry
-    let registry = std::sync::Arc::new(algo_trade_bot_orchestrator::BotRegistry::new());
+    // Initialize database for persistence
+    let db_path = std::env::var("BOT_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://bots.db".to_string());
 
-    // Start web API
+    tracing::info!("Initializing bot database at: {}", db_path);
+    let database = std::sync::Arc::new(
+        algo_trade_bot_orchestrator::BotDatabase::new(&db_path).await?
+    );
+
+    // Create bot registry with persistence
+    let registry = std::sync::Arc::new(
+        algo_trade_bot_orchestrator::BotRegistry::with_database(database)
+    );
+
+    // Restore bots from database
+    match registry.restore_from_db().await {
+        Ok(restored) => {
+            if restored.is_empty() {
+                tracing::info!("No bots to restore from database");
+            } else {
+                tracing::info!("Restored {} bot(s) from database: {:?}", restored.len(), restored);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to restore bots from database: {}", e);
+        }
+    }
+
+    // Start web API server
     let server = algo_trade_web_api::ApiServer::new(registry.clone());
     let addr = format!("{}:{}", config.server.host, config.server.port);
 
     tracing::info!("Web API listening on {}", addr);
-    server.serve(&addr).await?;
 
+    // Spawn server in background task
+    let server_handle = tokio::spawn(async move {
+        if let Err(e) = server.serve(&addr).await {
+            tracing::error!("Server error: {}", e);
+        }
+    });
+
+    // Wait for shutdown signal (SIGINT or SIGTERM)
+    let shutdown_signal = async {
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate()
+        ).expect("Failed to create SIGTERM handler");
+
+        let mut sigint = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::interrupt()
+        ).expect("Failed to create SIGINT handler");
+
+        tokio::select! {
+            _ = sigterm.recv() => {
+                tracing::info!("Received SIGTERM, initiating graceful shutdown");
+            }
+            _ = sigint.recv() => {
+                tracing::info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+            }
+        }
+    };
+
+    // Wait for shutdown signal
+    shutdown_signal.await;
+
+    // Graceful shutdown
+    tracing::info!("Shutting down all bots...");
+    if let Err(e) = registry.shutdown_all().await {
+        tracing::error!("Error during bot shutdown: {}", e);
+    }
+
+    // Abort server task
+    server_handle.abort();
+
+    tracing::info!("Trading system daemon stopped");
     Ok(())
 }
 

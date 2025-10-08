@@ -1,4 +1,5 @@
 use crate::bot_actor::BotActor;
+use crate::bot_database::BotDatabase;
 use crate::bot_handle::BotHandle;
 use crate::commands::{BotConfig, BotState};
 // BotEvent will be used in Phase 2 for event emission logic
@@ -13,6 +14,7 @@ use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
 pub struct BotRegistry {
     bots: Arc<RwLock<HashMap<String, BotHandle>>>,
+    db: Option<Arc<BotDatabase>>,
 }
 
 impl Default for BotRegistry {
@@ -22,7 +24,7 @@ impl Default for BotRegistry {
 }
 
 impl BotRegistry {
-    /// Creates a new bot registry.
+    /// Creates a new bot registry without persistence.
     ///
     /// # Returns
     /// A new `BotRegistry` instance with an empty bot collection.
@@ -30,14 +32,39 @@ impl BotRegistry {
     pub fn new() -> Self {
         Self {
             bots: Arc::new(RwLock::new(HashMap::new())),
+            db: None,
+        }
+    }
+
+    /// Creates a new bot registry with database persistence.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - Database instance for persistence
+    ///
+    /// # Returns
+    /// A new `BotRegistry` instance with persistence enabled.
+    #[must_use]
+    pub fn with_database(database: Arc<BotDatabase>) -> Self {
+        Self {
+            bots: Arc::new(RwLock::new(HashMap::new())),
+            db: Some(database),
         }
     }
 
     /// Spawns a new bot with the given configuration.
     ///
+    /// If persistence is enabled, the bot configuration is saved to the database.
+    ///
     /// # Errors
-    /// Returns an error if the bot cannot be spawned.
+    /// Returns an error if the bot cannot be spawned or database persistence fails.
     pub async fn spawn_bot(&self, config: BotConfig) -> Result<BotHandle> {
+        // Persist to database if enabled
+        if let Some(ref db) = self.db {
+            db.insert_bot(&config).await?;
+            tracing::info!("Persisted bot {} configuration to database", config.bot_id);
+        }
+
         let (tx, rx) = mpsc::channel(32);
 
         // Create event streaming channels
@@ -92,13 +119,22 @@ impl BotRegistry {
 
     /// Removes and shuts down the bot with the given ID.
     ///
+    /// If persistence is enabled, the bot is also deleted from the database.
+    ///
     /// # Errors
-    /// Returns an error if the bot shutdown fails.
+    /// Returns an error if the bot shutdown or database deletion fails.
     pub async fn remove_bot(&self, bot_id: &str) -> Result<()> {
         let value = self.bots.write().await.remove(bot_id);
         if let Some(handle) = value {
             handle.shutdown().await?;
         }
+
+        // Delete from database if enabled
+        if let Some(ref db) = self.db {
+            db.delete_bot(bot_id).await?;
+            tracing::info!("Deleted bot {} from database", bot_id);
+        }
+
         Ok(())
     }
 
@@ -121,5 +157,38 @@ impl BotRegistry {
             handle.shutdown().await?;
         }
         Ok(())
+    }
+
+    /// Restores bots from database and spawns them.
+    ///
+    /// Only restores bots marked as `enabled = true` in the database.
+    /// Does NOT auto-start bots - they remain in Stopped state.
+    ///
+    /// # Errors
+    ///
+    /// Returns error if database query or bot spawning fails.
+    pub async fn restore_from_db(&self) -> Result<Vec<String>> {
+        let Some(ref db) = self.db else {
+            tracing::warn!("No database configured, skipping restore");
+            return Ok(Vec::new());
+        };
+
+        let configs = db.get_enabled_bots().await?;
+        let mut restored = Vec::new();
+
+        for config in configs {
+            let bot_id = config.bot_id.clone();
+            match self.spawn_bot(config).await {
+                Ok(_) => {
+                    tracing::info!("Restored bot {}", bot_id);
+                    restored.push(bot_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to restore bot {}: {}", bot_id, e);
+                }
+            }
+        }
+
+        Ok(restored)
     }
 }
