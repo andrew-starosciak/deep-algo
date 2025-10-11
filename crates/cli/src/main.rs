@@ -162,6 +162,17 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
         .unwrap_or_else(|_| "sqlite://bots.db".to_string());
 
     tracing::info!("Initializing bot database at: {}", db_path);
+
+    // Ensure parent directory exists for SQLite database
+    if let Some(file_path) = db_path.strip_prefix("sqlite://") {
+        let path = std::path::Path::new(file_path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+    }
+
     let database = std::sync::Arc::new(
         algo_trade_bot_orchestrator::BotDatabase::new(&db_path).await?
     );
