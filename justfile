@@ -6,10 +6,11 @@ default:
     @just --list
 
 # Start the trading daemon (persistent bot orchestrator)
-# Environment: BOT_DATABASE_URL (default: sqlite://bots.db)
+# Environment: BOT_DATABASE_URL (default: sqlite://data/bots.db)
 daemon:
     @echo "Starting trading daemon with config/Config.toml..."
-    @echo "Database: ${BOT_DATABASE_URL:-sqlite://bots.db}"
+    @echo "Database: ${BOT_DATABASE_URL:-sqlite://data/bots.db}"
+    @mkdir -p data
     cargo run -p algo-trade-cli -- run --config config/Config.toml
 
 # Start the TUI for live bot management

@@ -159,7 +159,7 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
 
     // Initialize database for persistence
     let db_path = std::env::var("BOT_DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://bots.db".to_string());
+        .unwrap_or_else(|_| "sqlite://data/bots.db".to_string());
 
     tracing::info!("Initializing bot database at: {}", db_path);
 
@@ -168,7 +168,22 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
         let path = std::path::Path::new(file_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
+                tracing::info!("Creating directory for SQLite database: {}", parent.display());
                 std::fs::create_dir_all(parent)?;
+                tracing::info!("Directory created successfully, checking permissions...");
+
+                // Verify we can write to the directory
+                let test_file = parent.join(".write_test");
+                match std::fs::write(&test_file, "test") {
+                    Ok(_) => {
+                        std::fs::remove_file(&test_file)?;
+                        tracing::info!("Directory is writable");
+                    }
+                    Err(e) => {
+                        tracing::error!("Cannot write to directory {}: {}", parent.display(), e);
+                        return Err(e.into());
+                    }
+                }
             }
         }
     }

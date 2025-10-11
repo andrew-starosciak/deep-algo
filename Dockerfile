@@ -32,10 +32,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # Stage 4: Runtime - Minimal Debian image with ttyd
 FROM debian:bookworm-slim AS runtime
 
-# Install runtime dependencies and ttyd
+# Install runtime dependencies, gosu, and ttyd
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     curl \
+    gosu \
     && curl -L https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd \
     && chmod +x /usr/local/bin/ttyd \
     && apt-get remove -y curl \
@@ -57,11 +58,10 @@ COPY --chown=algotrader:algotrader \
 RUN mkdir -p /data && chown algotrader:algotrader /data
 
 # Copy entrypoint script
-COPY --chown=algotrader:algotrader docker/entrypoint.sh /entrypoint.sh
+COPY docker/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Switch to non-root user
-USER algotrader
+# Don't switch user here - entrypoint will handle it
 WORKDIR /home/algotrader
 
 # Expose ports (Web API, ttyd)

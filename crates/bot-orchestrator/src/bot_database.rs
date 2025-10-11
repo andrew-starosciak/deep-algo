@@ -22,10 +22,19 @@ impl BotDatabase {
     ///
     /// Returns error if connection fails or migrations fail.
     pub async fn new(database_url: &str) -> Result<Self> {
+        // Ensure the database file can be created
+        // SQLite by default needs explicit create mode in the connection string
+        // If no mode is specified, add ?mode=rwc (read+write+create)
+        let url_with_mode = if database_url.contains('?') {
+            database_url.to_string()
+        } else {
+            format!("{}?mode=rwc", database_url)
+        };
+
         // Create connection pool
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(database_url)
+            .connect(&url_with_mode)
             .await?;
 
         // Run migrations

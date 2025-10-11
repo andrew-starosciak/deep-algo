@@ -1,6 +1,17 @@
 #!/bin/bash
 set -e
 
+# Fix permissions for /data volume (must run as root)
+if [ "$(id -u)" = "0" ]; then
+    echo "Fixing /data volume permissions..."
+    chown -R algotrader:algotrader /data
+    chmod -R 755 /data
+
+    # Switch to algotrader user and re-exec this script
+    echo "Switching to algotrader user..."
+    exec gosu algotrader "$0" "$@"
+fi
+
 # Function to handle graceful shutdown
 shutdown() {
     echo "Shutting down gracefully..."
@@ -15,7 +26,7 @@ shutdown() {
 trap shutdown TERM INT
 
 # Start trading daemon in background
-echo "Starting trading daemon..."
+echo "Starting trading daemon as $(whoami)..."
 algo-trade run --config "${CONFIG_PATH:-/config/Config.toml}" &
 daemon_pid=$!
 
