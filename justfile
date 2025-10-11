@@ -146,3 +146,64 @@ watch:
 debug command:
     @echo "Running with debug logging: {{command}}..."
     RUST_LOG=debug just {{command}}
+
+# Docker Commands
+
+# Build Docker images
+docker-build:
+    @echo "Building Docker images..."
+    docker compose build
+
+# Start Docker containers (daemon mode)
+docker-up:
+    @echo "Starting Docker containers..."
+    docker compose up -d
+    @echo "Services started:"
+    @echo "  - Web API: http://localhost:8080"
+    @echo "  - TUI: http://localhost:7681"
+    @echo "  - TimescaleDB: localhost:5432"
+
+# Stop Docker containers
+docker-down:
+    @echo "Stopping Docker containers..."
+    docker compose down
+
+# View Docker logs
+docker-logs service="app":
+    @echo "Viewing logs for {{service}}..."
+    docker compose logs -f {{service}}
+
+# Restart Docker containers
+docker-restart:
+    @echo "Restarting Docker containers..."
+    docker compose restart
+
+# Full Docker rebuild and restart
+docker-rebuild:
+    @echo "Rebuilding and restarting Docker containers..."
+    docker compose down
+    docker compose build
+    docker compose up -d
+    @echo "✅ Docker deployment restarted"
+
+# Check Docker container status
+docker-ps:
+    @echo "Docker container status:"
+    docker compose ps
+
+# Execute command in app container
+# Example: just docker-exec "ls -la /data"
+docker-exec cmd:
+    docker exec algo-trade-app {{cmd}}
+
+# Open shell in app container
+docker-shell:
+    docker exec -it algo-trade-app bash
+
+# Clean Docker volumes (WARNING: deletes all data)
+docker-clean:
+    @echo "⚠️  This will delete all Docker volumes and data!"
+    @echo "Press Ctrl+C to cancel, or Enter to continue..."
+    @read
+    docker compose down -v
+    @echo "✅ Docker volumes cleaned"
