@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 mod tui_backtest;
+mod tui_backtest_manager;
 mod tui_live_bot;
 
 #[derive(Parser)]
@@ -94,6 +95,12 @@ enum Commands {
         #[arg(short, long, default_value = "quad_ma")]
         strategy: String,
     },
+    /// Interactive TUI for viewing backtest results and token selection
+    BacktestManagerTui {
+        /// Optional log file path (logs to file instead of stderr)
+        #[arg(long)]
+        log_file: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -102,7 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize logging (disabled for TUI to prevent screen corruption, unless log_file is provided)
     match &cli.command {
-        Commands::LiveBotTui { log_file: Some(path) } => {
+        Commands::LiveBotTui { log_file: Some(path) } | Commands::BacktestManagerTui { log_file: Some(path) } => {
             // Log to file for TUI
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -116,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
                 .with_writer(std::sync::Mutex::new(file))
                 .init();
         }
-        Commands::TuiBacktest { .. } | Commands::LiveBotTui { .. } => {
+        Commands::TuiBacktest { .. } | Commands::LiveBotTui { .. } | Commands::BacktestManagerTui { .. } => {
             // No logging for TUI (prevents screen corruption)
         }
         _ => {
@@ -157,6 +164,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::BacktestDaemon { config, strategy } => {
             run_backtest_daemon(&config, &strategy).await?;
+        }
+        Commands::BacktestManagerTui { log_file: _ } => {
+            tui_backtest_manager::run().await?;
         }
     }
 

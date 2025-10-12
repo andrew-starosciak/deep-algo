@@ -89,6 +89,15 @@ cargo run -p algo-trade-cli -- run --config config/Config.toml
 # Web API only
 cargo run -p algo-trade-cli -- server --addr 0.0.0.0:8080
 
+# Interactive TUI for managing live trading bots
+cargo run -p algo-trade-cli -- live-bot-tui
+
+# Interactive TUI for viewing backtest results and token selection
+cargo run -p algo-trade-cli -- backtest-manager-tui
+
+# Backtest-driven bot deployment daemon (auto-deploy paper bots)
+cargo run -p algo-trade-cli -- backtest-daemon --config config/Config.toml --strategy quad_ma
+
 # With debug logging
 RUST_LOG=debug cargo run -p algo-trade-cli -- run
 ```
@@ -174,6 +183,80 @@ tokio::select! {
     }
 }
 ```
+
+## TUI Applications
+
+The CLI includes three interactive terminal user interfaces built with ratatui:
+
+### 1. Multi-Token Backtest TUI (`tui-backtest`)
+
+Run parameter sweep backtests across multiple tokens:
+- Fetch OHLCV data for selected tokens
+- Run backtests with configurable parameter ranges
+- View results table with sortable metrics
+- Filter by performance criteria
+
+**Usage:**
+```bash
+cargo run -p algo-trade-cli -- tui-backtest --start 2025-01-01T00:00:00Z --end 2025-02-01T00:00:00Z
+```
+
+### 2. Live Bot Management TUI (`live-bot-tui`)
+
+Monitor and control live trading bots:
+- Dashboard with real-time bot metrics (PnL, Sharpe, drawdown)
+- Start/stop/configure individual bots
+- View open positions and recent trades
+- Monitor bot health and heartbeats
+
+**Usage:**
+```bash
+cargo run -p algo-trade-cli -- live-bot-tui
+
+# With file logging (prevents terminal corruption)
+cargo run -p algo-trade-cli -- live-bot-tui --log-file /tmp/live-bot.log
+```
+
+**Access via Docker:**
+```bash
+docker compose up -d app
+# Access at http://localhost:7681
+```
+
+### 3. Backtest Manager TUI (`backtest-manager-tui`)
+
+View historical backtest results and token selection status:
+- **Dashboard**: Scheduler status, backtest counts, token approval summary
+- **Reports**: Table of all backtest results with sortable metrics (Sharpe, win rate, etc.)
+- **Token Selection**: View approved/rejected tokens with filtering criteria
+- **Config**: View scheduler and selector configuration
+- **Report Detail**: Detailed view of individual backtest metrics
+
+**Usage:**
+```bash
+cargo run -p algo-trade-cli -- backtest-manager-tui
+
+# With file logging
+cargo run -p algo-trade-cli -- backtest-manager-tui --log-file /tmp/backtest-manager.log
+```
+
+**Access via Docker:**
+```bash
+docker compose up -d backtest-manager
+# Access at http://localhost:7682
+```
+
+**Keyboard Navigation:**
+- `d` - Dashboard screen
+- `r` - Reports list
+- `t` - Token selection
+- `c` - Configuration view
+- `↑/↓` - Navigate lists
+- `Enter` - View report detail
+- `Esc` - Return to reports list
+- `q` - Quit
+
+**Data Source:** Reads from TimescaleDB `backtest_results` table populated by `backtest-daemon` or `scheduled-backtest`.
 
 ## Adding New Features
 
@@ -266,6 +349,77 @@ Check auto-reconnect logic in `HyperliquidWebSocket::reconnect()`. Should have e
 ### Backtest vs Live divergence
 
 Strategy implementation likely has look-ahead bias. Ensure all logic works event-by-event, not on future data.
+
+## Docker Deployment
+
+### Services
+
+The docker-compose.yml includes five services:
+
+1. **timescaledb** - TimescaleDB for backtest results and OHLCV data
+2. **app** - Main trading system with web API and live bot TUI (port 7681)
+3. **backtest-manager** - Backtest results viewer TUI (port 7682)
+4. **scheduled-backtest** - Scheduled backtest daemon (no TUI, cron-based)
+5. **backtest-daemon** - Backtest-driven bot deployment daemon (auto-deploys paper bots)
+
+### Running with Docker Compose
+
+```bash
+# Start all services
+docker compose up -d
+
+# Start specific service
+docker compose up -d backtest-manager
+
+# View logs
+docker compose logs -f backtest-manager
+
+# Access TUIs via browser
+# Live Bot TUI: http://localhost:7681
+# Backtest Manager TUI: http://localhost:7682
+
+# Stop all services
+docker compose down
+```
+
+### Environment Variables
+
+Key environment variables (set in .env or docker-compose.yml):
+
+- `DB_PASSWORD` - PostgreSQL/TimescaleDB password (required)
+- `BACKTEST_TUI_PORT` - Host port for backtest manager (default: 7682)
+- `TUI_PORT` - Host port for live bot TUI (default: 7681)
+- `API_PORT` - Web API port (default: 8080)
+- `RUST_LOG` - Log level (default: info)
+- `HYPERLIQUID_API_URL` - Hyperliquid API endpoint
+- `HYPERLIQUID_WS_URL` - Hyperliquid WebSocket endpoint
+
+### Service Differences
+
+**app service:**
+- Runs trading daemon + live bot TUI
+- Needs bot database (SQLite) for persistence
+- Requires Hyperliquid credentials for live trading
+
+**backtest-manager service:**
+- Runs backtest manager TUI only (no daemon)
+- Read-only access to TimescaleDB
+- No credentials required (view-only mode)
+
+**scheduled-backtest service:**
+- Runs scheduled backtests on cron schedule (configured in Config.toml)
+- Fetches OHLCV data from Hyperliquid automatically
+- Stores backtest results in TimescaleDB
+- No TUI (daemon only)
+- No bot persistence needed (doesn't manage bots)
+
+**backtest-daemon service:**
+- Runs scheduled-backtest in background (inherits cron schedule)
+- Monitors token selection results every 5 minutes
+- Auto-deploys paper trading bots for approved tokens
+- Needs bot database (SQLite) for bot persistence
+- No TUI (daemon only)
+- Default strategy: quad_ma (can be changed via command in docker-compose.yml)
 
 ## Playbook Reference
 

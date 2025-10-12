@@ -65,6 +65,105 @@ services:
     networks:
       - algo-trade-network
 
+  backtest-manager:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trade-backtest-manager
+    environment:
+      # Database connection (uses service name 'timescaledb')
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@timescaledb:5432/algo_trade
+
+      # Hyperliquid API
+      HYPERLIQUID_API_URL: ${HYPERLIQUID_API_URL:-https://api.hyperliquid.xyz}
+
+      # Logging
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Config path
+      CONFIG_PATH: /config/Config.toml
+
+      # Enable backtest manager TUI
+      BACKTEST_MANAGER_TUI: "true"
+    volumes:
+      - ./config/Config.toml:/config/Config.toml:ro
+    secrets:
+      - db_password
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    ports:
+      - "${BACKTEST_TUI_PORT:-7682}:7681"
+    restart: unless-stopped
+    stop_grace_period: 10s
+    networks:
+      - algo-trade-network
+
+  scheduled-backtest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trade-scheduled-backtest
+    environment:
+      # Database connection (uses service name 'timescaledb')
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@timescaledb:5432/algo_trade
+
+      # Hyperliquid API
+      HYPERLIQUID_API_URL: ${HYPERLIQUID_API_URL:-https://api.hyperliquid.xyz}
+
+      # Logging
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Config path
+      CONFIG_PATH: /config/Config.toml
+    volumes:
+      - ./config/Config.toml:/config/Config.toml:ro
+    secrets:
+      - db_password
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    command: ["scheduled-backtest", "--config", "/config/Config.toml"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - algo-trade-network
+
+  backtest-daemon:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trade-backtest-daemon
+    environment:
+      # Database connection (uses service name 'timescaledb')
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@timescaledb:5432/algo_trade
+
+      # Bot persistence (SQLite)
+      BOT_DATABASE_URL: sqlite:///data/bots.db
+
+      # Hyperliquid API
+      HYPERLIQUID_API_URL: ${HYPERLIQUID_API_URL:-https://api.hyperliquid.xyz}
+      HYPERLIQUID_WS_URL: ${HYPERLIQUID_WS_URL:-wss://api.hyperliquid.xyz/ws}
+
+      # Logging
+      RUST_LOG: ${RUST_LOG:-info}
+
+      # Config path
+      CONFIG_PATH: /config/Config.toml
+    volumes:
+      - sqlite-data:/data
+      - ./config/Config.toml:/config/Config.toml:ro
+    secrets:
+      - db_password
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    command: ["backtest-daemon", "--config", "/config/Config.toml", "--strategy", "quad_ma"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - algo-trade-network
+
 volumes:
   timescale-data:
     driver: local
