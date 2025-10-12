@@ -191,4 +191,225 @@ impl BotRegistry {
 
         Ok(restored)
     }
+
+    /// Synchronizes running bots with approved tokens from backtest analysis.
+    ///
+    /// This method:
+    /// 1. Compares the list of approved tokens with currently running bots
+    /// 2. Spawns new paper trading bots for newly approved tokens
+    /// 3. Stops bots for tokens that are no longer approved
+    ///
+    /// All spawned bots are in paper trading mode with the specified strategy configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `approved_tokens` - List of token symbols that passed backtest criteria
+    /// * `strategy_name` - Name of the strategy to use (e.g., "quad_ma")
+    /// * `base_config` - Template configuration for spawning new bots
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple of `(started, stopped)` where:
+    /// - `started`: Vector of bot IDs that were newly spawned
+    /// - `stopped`: Vector of bot IDs that were stopped
+    ///
+    /// # Errors
+    ///
+    /// Returns error if bot spawning or stopping fails.
+    pub async fn sync_bots_with_approved_tokens(
+        &self,
+        approved_tokens: &[String],
+        strategy_name: &str,
+        base_config: &BotConfig,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        let current_bots = self.bots.read().await;
+        let current_bot_symbols: std::collections::HashSet<String> = current_bots
+            .values()
+            .map(|handle| {
+                // Extract symbol from bot_id (format: "strategy_symbol")
+                let bot_id = handle.latest_status().bot_id;
+                bot_id.split('_').nth(1).unwrap_or("").to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        drop(current_bots);
+
+        let approved_set: std::collections::HashSet<String> =
+            approved_tokens.iter().cloned().collect();
+
+        // Find tokens to add (approved but not running)
+        let to_start: Vec<String> = approved_set
+            .difference(&current_bot_symbols)
+            .cloned()
+            .collect();
+
+        // Find tokens to remove (running but not approved)
+        let to_stop: Vec<String> = current_bot_symbols
+            .difference(&approved_set)
+            .cloned()
+            .collect();
+
+        tracing::info!(
+            "Bot sync: {} to start, {} to stop",
+            to_start.len(),
+            to_stop.len()
+        );
+
+        // Start new bots
+        let mut started = Vec::new();
+        for symbol in &to_start {
+            let bot_id = format!("{}_{}", strategy_name, symbol);
+            let mut config = base_config.clone();
+            config.bot_id = bot_id.clone();
+            config.symbol = symbol.clone();
+            config.strategy = strategy_name.to_string();
+            config.execution_mode = crate::ExecutionMode::Paper;
+
+            match self.spawn_bot(config).await {
+                Ok(_) => {
+                    tracing::info!("Started paper bot {} for token {}", bot_id, symbol);
+                    started.push(bot_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start bot for token {}: {}", symbol, e);
+                }
+            }
+        }
+
+        // Stop removed bots
+        let mut stopped = Vec::new();
+        for symbol in &to_stop {
+            let bot_id = format!("{}_{}", strategy_name, symbol);
+            match self.remove_bot(&bot_id).await {
+                Ok(()) => {
+                    tracing::info!("Stopped bot {} for token {}", bot_id, symbol);
+                    stopped.push(bot_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to stop bot {}: {}", bot_id, e);
+                }
+            }
+        }
+
+        Ok((started, stopped))
+    }
+
+    /// Synchronizes running bots with approved tokens including optimal backtest parameters.
+    ///
+    /// This enhanced version:
+    /// 1. Extracts optimal strategy parameters from backtest results
+    /// 2. Applies those parameters to newly spawned bots via `strategy_config`
+    /// 3. Compares with currently running bots and starts/stops as needed
+    ///
+    /// # Arguments
+    ///
+    /// * `backtest_results` - Backtest results with parameters for approved tokens
+    /// * `strategy_name` - Name of the strategy to use
+    /// * `base_config` - Template configuration for spawning new bots
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple of `(started, stopped)` where:
+    /// - `started`: Vector of bot IDs that were newly spawned with optimal parameters
+    /// - `stopped`: Vector of bot IDs that were stopped
+    ///
+    /// # Errors
+    ///
+    /// Returns error if bot spawning or stopping fails.
+    pub async fn sync_bots_with_backtest_results(
+        &self,
+        backtest_results: &[algo_trade_data::BacktestResultRecord],
+        strategy_name: &str,
+        base_config: &BotConfig,
+    ) -> Result<(Vec<String>, Vec<String>)> {
+        use std::collections::HashMap;
+
+        let current_bots = self.bots.read().await;
+        let current_bot_symbols: std::collections::HashSet<String> = current_bots
+            .values()
+            .map(|handle| {
+                let bot_id = handle.latest_status().bot_id;
+                bot_id.split('_').nth(1).unwrap_or("").to_string()
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        drop(current_bots);
+
+        // Build map of symbol -> parameters from backtest results
+        let approved_tokens: HashMap<String, Option<String>> = backtest_results
+            .iter()
+            .map(|r| {
+                let params_json = r.parameters.as_ref().map(|v| v.to_string());
+                (r.symbol.clone(), params_json)
+            })
+            .collect();
+
+        let approved_set: std::collections::HashSet<String> =
+            approved_tokens.keys().cloned().collect();
+
+        // Find tokens to add/remove
+        let to_start: Vec<String> = approved_set
+            .difference(&current_bot_symbols)
+            .cloned()
+            .collect();
+
+        let to_stop: Vec<String> = current_bot_symbols
+            .difference(&approved_set)
+            .cloned()
+            .collect();
+
+        tracing::info!(
+            "Bot sync with parameters: {} to start, {} to stop",
+            to_start.len(),
+            to_stop.len()
+        );
+
+        // Start new bots with optimal parameters
+        let mut started = Vec::new();
+        for symbol in &to_start {
+            let bot_id = format!("{}_{}", strategy_name, symbol);
+            let mut config = base_config.clone();
+            config.bot_id = bot_id.clone();
+            config.symbol = symbol.clone();
+            config.strategy = strategy_name.to_string();
+            config.execution_mode = crate::ExecutionMode::Paper;
+
+            // Apply optimal parameters from backtest if available
+            if let Some(Some(params_json)) = approved_tokens.get(symbol) {
+                config.strategy_config = Some(params_json.clone());
+                tracing::info!(
+                    "Applying optimal parameters to bot {}: {}",
+                    bot_id,
+                    params_json
+                );
+            }
+
+            match self.spawn_bot(config).await {
+                Ok(_) => {
+                    tracing::info!("Started paper bot {} for token {} with optimal params", bot_id, symbol);
+                    started.push(bot_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to start bot for token {}: {}", symbol, e);
+                }
+            }
+        }
+
+        // Stop removed bots
+        let mut stopped = Vec::new();
+        for symbol in &to_stop {
+            let bot_id = format!("{}_{}", strategy_name, symbol);
+            match self.remove_bot(&bot_id).await {
+                Ok(()) => {
+                    tracing::info!("Stopped bot {} for token {}", bot_id, symbol);
+                    stopped.push(bot_id);
+                }
+                Err(e) => {
+                    tracing::error!("Failed to stop bot {}: {}", bot_id, e);
+                }
+            }
+        }
+
+        Ok((started, stopped))
+    }
 }

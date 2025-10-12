@@ -11,6 +11,7 @@ categories = ["asynchronous", "concurrency"]
 
 [dependencies]
 algo-trade-core = { path = "../core" }
+algo-trade-data = { path = "../data" }
 algo-trade-strategy = { path = "../strategy" }
 algo-trade-hyperliquid = { path = "../exchange-hyperliquid" }
 tokio = { workspace = true }

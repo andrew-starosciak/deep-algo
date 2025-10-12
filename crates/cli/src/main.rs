@@ -85,6 +85,15 @@ enum Commands {
         #[arg(long)]
         log_file: Option<String>,
     },
+    /// Run backtest-driven bot deployment daemon (schedule + auto-deploy)
+    BacktestDaemon {
+        /// Config file path
+        #[arg(short, long, default_value = "config/Config.toml")]
+        config: String,
+        /// Strategy name for bot deployment
+        #[arg(short, long, default_value = "quad_ma")]
+        strategy: String,
+    },
 }
 
 #[tokio::main]
@@ -145,6 +154,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::LiveBotTui { log_file: _ } => {
             tui_live_bot::run().await?;
+        }
+        Commands::BacktestDaemon { config, strategy } => {
+            run_backtest_daemon(&config, &strategy).await?;
         }
     }
 
@@ -507,5 +519,177 @@ async fn run_token_selection(_config_path: &str, strategy_name: &str) -> anyhow:
     println!("  - Min Trades: {}", config.token_selector.min_num_trades);
     println!();
 
+    Ok(())
+}
+
+async fn run_backtest_daemon(_config_path: &str, strategy_name: &str) -> anyhow::Result<()> {
+    use algo_trade_backtest_scheduler::BacktestScheduler;
+    use algo_trade_token_selector::TokenSelector;
+    use algo_trade_data::DatabaseClient;
+    use algo_trade_bot_orchestrator::{BotRegistry, BotDatabase, BotConfig, ExecutionMode};
+    use std::sync::Arc;
+    use tokio::time::{interval, Duration};
+
+    tracing::info!("Starting backtest-driven bot deployment daemon");
+    tracing::info!("Strategy: {}", strategy_name);
+
+    // Load config
+    let config = algo_trade_core::ConfigLoader::load()?;
+
+    // Create TimescaleDB client (for backtest results)
+    let timescale_client = Arc::new(DatabaseClient::new(&config.database.url).await?);
+
+    // Create SQLite database for bot persistence
+    let db_path = std::env::var("BOT_DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://data/bots.db".to_string());
+
+    if let Some(file_path) = db_path.strip_prefix("sqlite://") {
+        let path = std::path::Path::new(file_path);
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+    }
+
+    let bot_database = Arc::new(BotDatabase::new(&db_path).await?);
+
+    // Create bot registry with persistence
+    let registry = Arc::new(BotRegistry::with_database(bot_database));
+
+    // Restore existing bots
+    match registry.restore_from_db().await {
+        Ok(restored) => {
+            if !restored.is_empty() {
+                tracing::info!("Restored {} bot(s) from database: {:?}", restored.len(), restored);
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to restore bots: {}", e);
+        }
+    }
+
+    // Create token selector
+    let selector = TokenSelector::new(
+        config.token_selector.clone(),
+        timescale_client.clone()
+    );
+
+    // Create base bot config template
+    let base_config = BotConfig {
+        bot_id: String::new(), // Will be overridden per bot
+        symbol: String::new(),  // Will be overridden per bot
+        strategy: strategy_name.to_string(),
+        enabled: true,
+        interval: config.backtest_scheduler.backtest_window_days.to_string(),
+        ws_url: std::env::var("HYPERLIQUID_WS_URL")
+            .unwrap_or_else(|_| "wss://api.hyperliquid.xyz/ws".to_string()),
+        api_url: config.backtest_scheduler.hyperliquid_api_url.clone(),
+        warmup_periods: 50,
+        strategy_config: None, // Will be set per bot from backtest params
+        initial_capital: rust_decimal::Decimal::from(10000),
+        risk_per_trade_pct: 0.02,
+        max_position_pct: 0.1,
+        leverage: 1,
+        margin_mode: algo_trade_bot_orchestrator::MarginMode::Isolated,
+        execution_mode: ExecutionMode::Paper,
+        paper_slippage_bps: 10.0,
+        paper_commission_rate: 0.00025,
+        wallet: None, // Paper trading, no wallet needed
+    };
+
+    tracing::info!("Initial setup complete");
+    tracing::info!("Cron schedule: {}", config.backtest_scheduler.cron_schedule);
+    tracing::info!("Bot sync interval: every 5 minutes");
+    tracing::info!("Press Ctrl+C to stop");
+
+    // Spawn backtest scheduler in background
+    let scheduler_config = config.backtest_scheduler.clone();
+    let scheduler_db = timescale_client.clone();
+    tokio::spawn(async move {
+        let scheduler = BacktestScheduler::new(scheduler_config, scheduler_db);
+        if let Err(e) = scheduler.start().await {
+            tracing::error!("Backtest scheduler error: {}", e);
+        }
+    });
+
+    // Main loop: periodically sync bots with approved tokens
+    let mut sync_interval = interval(Duration::from_secs(300)); // 5 minutes
+
+    loop {
+        tokio::select! {
+            _ = sync_interval.tick() => {
+                tracing::info!("Running bot sync cycle");
+
+                // Get approved tokens from latest backtest results
+                match selector.get_selection_details(strategy_name).await {
+                    Ok(results) => {
+                        // Filter approved results
+                        let approved: Vec<_> = results.iter()
+                            .filter(|r| r.approved)
+                            .collect();
+
+                        tracing::info!("Token selection: {}/{} approved", approved.len(), results.len());
+
+                        // Convert to BacktestResultRecord (need to query again to get full records with parameters)
+                        match timescale_client.query_latest_backtest_results(
+                            strategy_name,
+                            config.token_selector.lookback_hours
+                        ).await {
+                            Ok(all_results) => {
+                                // Filter to approved symbols
+                                let approved_symbols: std::collections::HashSet<String> =
+                                    approved.iter().map(|r| r.symbol.clone()).collect();
+
+                                let approved_results: Vec<_> = all_results.into_iter()
+                                    .filter(|r| approved_symbols.contains(&r.symbol))
+                                    .collect();
+
+                                // Sync bots with approved tokens (includes parameters)
+                                match registry.sync_bots_with_backtest_results(
+                                    &approved_results,
+                                    strategy_name,
+                                    &base_config
+                                ).await {
+                                    Ok((started, stopped)) => {
+                                        if !started.is_empty() {
+                                            tracing::info!("Started {} new bot(s): {:?}", started.len(), started);
+                                        }
+                                        if !stopped.is_empty() {
+                                            tracing::info!("Stopped {} bot(s): {:?}", stopped.len(), stopped);
+                                        }
+                                        if started.is_empty() && stopped.is_empty() {
+                                            tracing::info!("No changes to bot deployment");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!("Failed to sync bots: {}", e);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to query backtest results: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Token selection failed: {}", e);
+                    }
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received Ctrl+C, shutting down");
+                break;
+            }
+        }
+    }
+
+    // Graceful shutdown
+    tracing::info!("Shutting down all bots...");
+    if let Err(e) = registry.shutdown_all().await {
+        tracing::error!("Error during bot shutdown: {}", e);
+    }
+
+    tracing::info!("Backtest daemon stopped");
     Ok(())
 }
