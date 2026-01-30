@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/core",
+    "crates/signals",
     "crates/exchange-hyperliquid",
     "crates/data",
     "crates/strategy",

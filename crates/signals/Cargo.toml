@@ -1,0 +1,46 @@
+[package]
+name = "algo-trade-signals"
+version = "0.1.0"
+edition = "2021"
+description = "Signal generators for statistical trading engine"
+license = "MIT"
+readme = false
+
+[dependencies]
+algo-trade-core = { path = "../core" }
+tokio = { workspace = true }
+serde = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+chrono-tz = "0.8"
+colored = "2"
+url = "2"
+rust_decimal = "1.33"
+async-trait = "0.1.89"
+
+[dev-dependencies]
+rust_decimal_macros = "1.33"
+
+[[bin]]
+name = "funding"
+path = "src/bin/funding.rs"
+
+[[bin]]
+name = "big_liquidations"
+path = "src/bin/big_liquidations.rs"
+
+[[bin]]
+name = "huge_trades"
+path = "src/bin/huge_trades.rs"
+
+[[bin]]
+name = "liquidations"
+path = "src/bin/liquidations.rs"
+
+[[bin]]
+name = "recent_trades"
+path = "src/bin/recent_trades.rs"
