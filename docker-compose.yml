@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   timescaledb:
     image: timescale/timescaledb:latest-pg17
@@ -9,11 +7,12 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD_FILE: /run/secrets/db_password
       TIMESCALEDB_TELEMETRY: 'off'
-      TS_TUNE_MEMORY: 4GB
-      TS_TUNE_NUM_CPUS: 4
+      TS_TUNE_MEMORY: ${TS_TUNE_MEMORY:-4GB}
+      TS_TUNE_NUM_CPUS: ${TS_TUNE_NUM_CPUS:-4}
     volumes:
       - timescale-data:/var/lib/postgresql/data
       - ./scripts/setup_timescale.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./scripts/migrations/V001__phase1_tables.sql:/docker-entrypoint-initdb.d/02-phase1.sql:ro
     secrets:
       - db_password
     healthcheck:
@@ -163,6 +162,36 @@ services:
     stop_grace_period: 30s
     networks:
       - algo-trade-network
+
+  # ==========================================================================
+  # Phase 1: Signal Data Collection
+  # ==========================================================================
+  signal-collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: algo-trade-signal-collector
+    environment:
+      # Database connection
+      DATABASE_URL: postgresql://postgres:${DB_PASSWORD}@timescaledb:5432/algo_trade
+
+      # CryptoPanic API for news collection (optional)
+      CRYPTOPANIC_API_KEY: ${CRYPTOPANIC_API_KEY:-}
+
+      # Logging
+      RUST_LOG: ${RUST_LOG:-info}
+    secrets:
+      - db_password
+    depends_on:
+      timescaledb:
+        condition: service_healthy
+    command: ["collect-signals", "--duration", "${COLLECT_DURATION:-24h}", "--sources", "${COLLECT_SOURCES:-orderbook,funding,liquidations}"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    networks:
+      - algo-trade-network
+    profiles:
+      - collect  # Only start with: docker compose --profile collect up
 
 volumes:
   timescale-data:

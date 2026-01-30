@@ -2,6 +2,44 @@
 
 This guide covers setting up and running the real-time data collection system for the Bitcoin 15-minute Polymarket trading engine.
 
+## Quick Start with Docker
+
+```bash
+# 1. Set up secrets
+echo "your_secure_password" > secrets/db_password.txt
+
+# 2. Create .env file
+cp .env.example .env
+# Edit .env and set DB_PASSWORD to match secrets/db_password.txt
+
+# 3. Start database
+docker compose up -d timescaledb
+
+# 4. Wait for database to be ready
+docker compose logs -f timescaledb  # Wait for "database system is ready"
+
+# 5. Start signal collection (5 minute test)
+COLLECT_DURATION=5m docker compose --profile collect up signal-collector
+
+# 6. Check data health
+curl http://localhost:8080/api/data/health
+```
+
+For production collection:
+```bash
+# Collect all sources for 24 hours
+docker compose --profile collect up -d signal-collector
+
+# Monitor logs
+docker compose logs -f signal-collector
+
+# Check database records
+docker compose exec timescaledb psql -U postgres -d algo_trade \
+  -c "SELECT COUNT(*) FROM orderbook_snapshots;"
+```
+
+---
+
 ## Overview
 
 Phase 1 implements data collection from multiple sources:
@@ -319,6 +357,88 @@ RUST_LOG=debug cargo run -p algo-trade-cli -- collect-signals --duration 5m
 ```bash
 RUST_LOG=algo_trade_signals::collector=debug cargo run -p algo-trade-cli -- collect-signals
 ```
+
+## Docker Deployment
+
+### Services
+
+| Service | Description | Profile |
+|---------|-------------|---------|
+| `timescaledb` | TimescaleDB database | default |
+| `app` | Web API + Trading daemon | default |
+| `signal-collector` | Data collection | `collect` |
+
+### Environment Variables
+
+Set these in `.env`:
+
+```bash
+# Required
+DB_PASSWORD=your_secure_password
+
+# Optional - Signal Collection
+COLLECT_DURATION=24h                    # How long to collect
+COLLECT_SOURCES=orderbook,funding,liquidations  # Which sources
+CRYPTOPANIC_API_KEY=your_key            # For news collection
+
+# Optional - Tuning
+TS_TUNE_MEMORY=4GB
+TS_TUNE_NUM_CPUS=4
+RUST_LOG=info
+```
+
+### Running Signal Collection
+
+**Start database only:**
+```bash
+docker compose up -d timescaledb
+```
+
+**Start signal collector (foreground for testing):**
+```bash
+COLLECT_DURATION=5m docker compose --profile collect up signal-collector
+```
+
+**Start signal collector (background for production):**
+```bash
+docker compose --profile collect up -d signal-collector
+```
+
+**View logs:**
+```bash
+docker compose logs -f signal-collector
+```
+
+**Stop collection:**
+```bash
+docker compose --profile collect down signal-collector
+```
+
+### Database Access
+
+**Connect to database:**
+```bash
+docker compose exec timescaledb psql -U postgres -d algo_trade
+```
+
+**Check table counts:**
+```bash
+docker compose exec timescaledb psql -U postgres -d algo_trade -c "
+SELECT
+  'orderbook_snapshots' as table_name, COUNT(*) as count FROM orderbook_snapshots
+UNION ALL SELECT 'funding_rates', COUNT(*) FROM funding_rates
+UNION ALL SELECT 'liquidations', COUNT(*) FROM liquidations;
+"
+```
+
+### Rebuilding After Code Changes
+
+```bash
+docker compose build signal-collector
+docker compose --profile collect up -d signal-collector
+```
+
+---
 
 ## Architecture
 
