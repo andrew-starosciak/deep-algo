@@ -18,7 +18,7 @@ pub struct BackfillOhlcvArgs {
     #[arg(long)]
     pub end: String,
 
-    /// Trading symbol (default: BTCUSDT)
+    /// Trading symbol (default: BTCUSDT for Binance, BTC for Hyperliquid)
     #[arg(long, default_value = "BTCUSDT")]
     pub symbol: String,
 
@@ -26,6 +26,11 @@ pub struct BackfillOhlcvArgs {
     /// Valid values: 1m, 3m, 5m, 15m, 30m, 1h, 2h, 4h, 6h, 8h, 12h, 1d, 3d, 1w, 1M
     #[arg(long, default_value = "1m")]
     pub interval: String,
+
+    /// Exchange to fetch data from (default: hyperliquid)
+    /// Valid values: binance, hyperliquid
+    #[arg(long, default_value = "hyperliquid")]
+    pub exchange: String,
 
     /// Batch size for database inserts (default: 1000)
     #[arg(long, default_value = "1000")]
@@ -84,12 +89,22 @@ impl BackfillOhlcvStats {
 /// Returns an error if database connection fails, API requests fail,
 /// or the time range is invalid.
 pub async fn run_backfill_ohlcv(args: BackfillOhlcvArgs) -> Result<()> {
+    use algo_trade_data::database::OhlcvRecord;
     use algo_trade_data::repositories::ohlcv_repo::OhlcvRepository;
     use algo_trade_signals::collector::{
         calculate_expected_candles, calculate_required_requests, Interval, OhlcvCollector,
     };
     use sqlx::postgres::PgPoolOptions;
     use std::str::FromStr;
+
+    // Validate exchange
+    let exchange = args.exchange.to_lowercase();
+    if exchange != "binance" && exchange != "hyperliquid" {
+        return Err(anyhow!(
+            "Invalid exchange '{}'. Valid values: binance, hyperliquid",
+            args.exchange
+        ));
+    }
 
     // Parse arguments
     let start: DateTime<Utc> = args.start.parse().map_err(|_| {
@@ -110,10 +125,11 @@ pub async fn run_backfill_ohlcv(args: BackfillOhlcvArgs) -> Result<()> {
     let expected_requests = calculate_required_requests(start, end, interval);
 
     tracing::info!(
-        "Backfilling OHLCV data for {} from {} to {}",
+        "Backfilling OHLCV data for {} from {} to {} (exchange: {})",
         args.symbol,
         start.format("%Y-%m-%d %H:%M"),
-        end.format("%Y-%m-%d %H:%M")
+        end.format("%Y-%m-%d %H:%M"),
+        exchange
     );
     tracing::info!("Interval: {}", args.interval);
     tracing::info!(
@@ -142,7 +158,7 @@ pub async fn run_backfill_ohlcv(args: BackfillOhlcvArgs) -> Result<()> {
     // Check existing data bounds if not forcing
     if !args.force {
         if let Some((existing_start, existing_end)) =
-            repo.get_data_bounds(&args.symbol, "binance").await?
+            repo.get_data_bounds(&args.symbol, &exchange).await?
         {
             tracing::info!(
                 "Existing data: {} to {}",
@@ -153,7 +169,7 @@ pub async fn run_backfill_ohlcv(args: BackfillOhlcvArgs) -> Result<()> {
             // Check if we already have all the data
             if existing_start <= start && existing_end >= end {
                 let count = repo
-                    .count_records(&args.symbol, "binance", start, end)
+                    .count_records(&args.symbol, &exchange, start, end)
                     .await?;
                 if count as u64 >= expected_candles {
                     tracing::info!(
@@ -166,18 +182,33 @@ pub async fn run_backfill_ohlcv(args: BackfillOhlcvArgs) -> Result<()> {
         }
     }
 
-    // Create collector
-    let collector = OhlcvCollector::new();
+    // Fetch data based on exchange
+    let records: Vec<OhlcvRecord> = match exchange.as_str() {
+        "hyperliquid" => {
+            tracing::info!("Fetching data from Hyperliquid API...");
+            let api_url = std::env::var("HYPERLIQUID_API_URL")
+                .unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string());
+            let client = algo_trade_hyperliquid::HyperliquidClient::new(api_url);
+            client
+                .fetch_candles(&args.symbol, &args.interval, start, end)
+                .await?
+        }
+        "binance" => {
+            tracing::info!("Fetching data from Binance Futures API...");
+            let collector = OhlcvCollector::new();
+            let (records, fetch_stats) =
+                collector.fetch(&args.symbol, interval, start, end).await?;
+            tracing::info!(
+                "Fetched {} candles in {} requests",
+                fetch_stats.total_candles,
+                fetch_stats.total_requests
+            );
+            records
+        }
+        _ => unreachable!(),
+    };
 
-    // Fetch data
-    tracing::info!("Fetching data from Binance Futures API...");
-    let (records, fetch_stats) = collector.fetch(&args.symbol, interval, start, end).await?;
-
-    tracing::info!(
-        "Fetched {} candles in {} requests",
-        fetch_stats.total_candles,
-        fetch_stats.total_requests
-    );
+    tracing::info!("Fetched {} candles", records.len());
 
     if records.is_empty() {
         tracing::warn!("No data fetched. Check symbol and date range.");
@@ -217,9 +248,9 @@ pub async fn run_backfill_ohlcv(args: BackfillOhlcvArgs) -> Result<()> {
     );
 
     // Verify data
-    if let Some((data_start, data_end)) = repo.get_data_bounds(&args.symbol, "binance").await? {
+    if let Some((data_start, data_end)) = repo.get_data_bounds(&args.symbol, &exchange).await? {
         let total_count = repo
-            .count_records(&args.symbol, "binance", data_start, data_end)
+            .count_records(&args.symbol, &exchange, data_start, data_end)
             .await?;
         tracing::info!(
             "Database now has {} records from {} to {}",
