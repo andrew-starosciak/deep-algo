@@ -29,17 +29,17 @@ pub struct QuadMaStrategy {
     symbol: String,
 
     // MA periods
-    short_period_1: usize,  // default 5
-    short_period_2: usize,  // default 10
-    long_period_1: usize,   // default 20
-    long_period_2: usize,   // default 50
-    trend_period: usize,    // default 100
+    short_period_1: usize, // default 5
+    short_period_2: usize, // default 10
+    long_period_1: usize,  // default 20
+    long_period_2: usize,  // default 50
+    trend_period: usize,   // default 100
 
     // Filters
-    volume_filter_enabled: bool,  // default true
-    volume_factor: f64,      // default 1.5
-    take_profit_pct: f64,    // default 0.02 (2%)
-    stop_loss_pct: f64,      // default 0.01 (1%)
+    volume_filter_enabled: bool, // default true
+    volume_factor: f64,          // default 1.5
+    take_profit_pct: f64,        // default 0.02 (2%)
+    stop_loss_pct: f64,          // default 0.01 (1%)
 
     // Price buffers for MAs
     short_1_prices: VecDeque<Decimal>,
@@ -61,13 +61,13 @@ pub struct QuadMaStrategy {
     prev_long_2: Option<Decimal>,
 
     last_signal: Option<SignalDirection>,
-    entry_price: Option<Decimal>,  // Track entry price for TP/SL
+    entry_price: Option<Decimal>, // Track entry price for TP/SL
 
     // Reversal confirmation to reduce whipsaws
-    reversal_confirmation_bars: usize,  // How many bars to confirm opposite signal (default 2)
-    bars_since_entry: usize,            // Bars since last position entry
-    pending_reversal: Option<SignalDirection>,  // Opposite signal waiting for confirmation
-    pending_reversal_count: usize,      // How many consecutive bars opposite signal persisted
+    reversal_confirmation_bars: usize, // How many bars to confirm opposite signal (default 2)
+    bars_since_entry: usize,           // Bars since last position entry
+    pending_reversal: Option<SignalDirection>, // Opposite signal waiting for confirmation
+    pending_reversal_count: usize,     // How many consecutive bars opposite signal persisted
 }
 
 impl QuadMaStrategy {
@@ -248,7 +248,6 @@ impl QuadMaStrategy {
         }
     }
 
-
     /// Check if conditions are met for entering a long position.
     ///
     /// Entry requirements (all must be true):
@@ -273,12 +272,8 @@ impl QuadMaStrategy {
         prev_short_2: Option<Decimal>,
     ) -> bool {
         // Check for bullish crossover (MA5 crossing above MA10)
-        let has_crossover = Self::detect_crossover(
-            prev_short_1,
-            short_1,
-            prev_short_2,
-            short_2,
-        ) == Some(true);
+        let has_crossover =
+            Self::detect_crossover(prev_short_1, short_1, prev_short_2, short_2) == Some(true);
 
         if !has_crossover {
             return false;
@@ -325,12 +320,8 @@ impl QuadMaStrategy {
         prev_short_2: Option<Decimal>,
     ) -> bool {
         // Check for bearish crossover (MA5 crossing below MA10)
-        let has_crossover = Self::detect_crossover(
-            prev_short_1,
-            short_1,
-            prev_short_2,
-            short_2,
-        ) == Some(false);
+        let has_crossover =
+            Self::detect_crossover(prev_short_1, short_1, prev_short_2, short_2) == Some(false);
 
         if !has_crossover {
             return false;
@@ -401,7 +392,13 @@ impl Strategy for QuadMaStrategy {
     #[allow(clippy::too_many_lines)]
     async fn on_market_event(&mut self, event: &MarketEvent) -> Result<Option<SignalEvent>> {
         // Only process Bar events (need volume data)
-        let MarketEvent::Bar { symbol, close: price, volume, .. } = event else {
+        let MarketEvent::Bar {
+            symbol,
+            close: price,
+            volume,
+            ..
+        } = event
+        else {
             return Ok(None);
         };
 
@@ -446,12 +443,15 @@ impl Strategy for QuadMaStrategy {
         self.prev_trend_ma = Some(trend_ma);
 
         // Convert volume_factor to Decimal
-        let volume_factor = Decimal::from_f64(self.volume_factor).unwrap_or_else(|| Decimal::from(15) / Decimal::from(10));
+        let volume_factor = Decimal::from_f64(self.volume_factor)
+            .unwrap_or_else(|| Decimal::from(15) / Decimal::from(10));
 
         // Check TP/SL if in a position
         if let (Some(entry), Some(direction)) = (self.entry_price, &self.last_signal) {
-            let tp_pct = Decimal::from_f64(self.take_profit_pct).unwrap_or_else(|| Decimal::from(2) / Decimal::from(100));
-            let sl_pct = Decimal::from_f64(self.stop_loss_pct).unwrap_or_else(|| Decimal::from(1) / Decimal::from(100));
+            let tp_pct = Decimal::from_f64(self.take_profit_pct)
+                .unwrap_or_else(|| Decimal::from(2) / Decimal::from(100));
+            let sl_pct = Decimal::from_f64(self.stop_loss_pct)
+                .unwrap_or_else(|| Decimal::from(1) / Decimal::from(100));
 
             // Debug: Log TP/SL check
             if let Ok(mut file) = std::fs::OpenOptions::new()
@@ -480,7 +480,7 @@ impl Strategy for QuadMaStrategy {
                     let profit = (entry - *price) / entry;
                     profit >= tp_pct || profit <= -sl_pct
                 }
-                SignalDirection::Exit => false,  // Already exiting
+                SignalDirection::Exit => false, // Already exiting
             };
 
             if hit_tp_or_sl {
@@ -514,9 +514,15 @@ impl Strategy for QuadMaStrategy {
 
         // Check entry conditions
         let should_long = Self::should_enter_long(
-            short_1, short_2, long_1, long_2,
-            trend_ma, prev_trend,
-            *price, *volume, avg_volume,
+            short_1,
+            short_2,
+            long_1,
+            long_2,
+            trend_ma,
+            prev_trend,
+            *price,
+            *volume,
+            avg_volume,
             volume_factor,
             self.volume_filter_enabled,
             self.prev_short_1,
@@ -524,9 +530,15 @@ impl Strategy for QuadMaStrategy {
         );
 
         let should_short = Self::should_enter_short(
-            short_1, short_2, long_1, long_2,
-            trend_ma, prev_trend,
-            *price, *volume, avg_volume,
+            short_1,
+            short_2,
+            long_1,
+            long_2,
+            trend_ma,
+            prev_trend,
+            *price,
+            *volume,
+            avg_volume,
             volume_factor,
             self.volume_filter_enabled,
             self.prev_short_1,
@@ -598,7 +610,7 @@ impl Strategy for QuadMaStrategy {
             Ok(None)
         } else {
             self.last_signal.clone_from(&final_signal);
-            self.bars_since_entry = 0;  // Reset counter on new position
+            self.bars_since_entry = 0; // Reset counter on new position
 
             if let Some(direction) = final_signal {
                 self.entry_price = Some(*price);

@@ -23,7 +23,13 @@ pub struct PolymarketClient {
     /// Base URL for API
     base_url: String,
     /// Rate limiter (requests per minute)
-    rate_limiter: Arc<RateLimiter<governor::state::NotKeyed, governor::state::InMemoryState, governor::clock::DefaultClock>>,
+    rate_limiter: Arc<
+        RateLimiter<
+            governor::state::NotKeyed,
+            governor::state::InMemoryState,
+            governor::clock::DefaultClock,
+        >,
+    >,
 }
 
 impl PolymarketClient {
@@ -67,7 +73,8 @@ impl PolymarketClient {
         let url = format!("{}{}", self.base_url, path);
         tracing::debug!("GET {}", url);
 
-        let response = self.http
+        let response = self
+            .http
             .get(&url)
             .header("Accept", "application/json")
             .send()
@@ -175,13 +182,16 @@ impl PolymarketClient {
         } else if let Some(obj) = response.as_object() {
             for (token_id, value) in obj {
                 if let Ok(price) = serde_json::from_value::<PriceValue>(value.clone()) {
-                    prices.insert(token_id.clone(), Price {
-                        token_id: token_id.clone(),
-                        bid: price.bid.and_then(|v| Decimal::try_from(v).ok()),
-                        ask: price.ask.and_then(|v| Decimal::try_from(v).ok()),
-                        last: price.last.and_then(|v| Decimal::try_from(v).ok()),
-                        spread: price.spread.and_then(|v| Decimal::try_from(v).ok()),
-                    });
+                    prices.insert(
+                        token_id.clone(),
+                        Price {
+                            token_id: token_id.clone(),
+                            bid: price.bid.and_then(|v| Decimal::try_from(v).ok()),
+                            ask: price.ask.and_then(|v| Decimal::try_from(v).ok()),
+                            last: price.last.and_then(|v| Decimal::try_from(v).ok()),
+                            spread: price.spread.and_then(|v| Decimal::try_from(v).ok()),
+                        },
+                    );
                 }
             }
         }
@@ -197,10 +207,7 @@ impl PolymarketClient {
         let (markets, _) = self.get_markets(Some(&filter), None).await?;
 
         // Additional client-side filtering to ensure BTC relevance
-        let btc_markets: Vec<Market> = markets
-            .into_iter()
-            .filter(|m| m.is_btc_related())
-            .collect();
+        let btc_markets: Vec<Market> = markets.into_iter().filter(|m| m.is_btc_related()).collect();
 
         Ok(btc_markets)
     }
@@ -257,8 +264,7 @@ mod tests {
 
     #[test]
     fn test_client_with_base_url() {
-        let client = PolymarketClient::new()
-            .with_base_url("http://localhost:8080");
+        let client = PolymarketClient::new().with_base_url("http://localhost:8080");
         assert_eq!(client.base_url(), "http://localhost:8080");
     }
 
@@ -474,7 +480,10 @@ mod tests {
             .await;
 
         let client = PolymarketClient::new().with_base_url(mock_server.uri());
-        let markets = client.discover_tradeable_btc_markets(dec!(50000)).await.unwrap();
+        let markets = client
+            .discover_tradeable_btc_markets(dec!(50000))
+            .await
+            .unwrap();
 
         // Only btc-1 has sufficient liquidity
         assert_eq!(markets.len(), 1);
@@ -511,12 +520,12 @@ mod tests {
                 "data": [],
                 "next_cursor": null
             })))
-            .expect(3)  // Expect exactly 3 calls
+            .expect(3) // Expect exactly 3 calls
             .mount(&mock_server)
             .await;
 
-        let client = PolymarketClient::with_rate_limit(nonzero!(1000u32))
-            .with_base_url(mock_server.uri());
+        let client =
+            PolymarketClient::with_rate_limit(nonzero!(1000u32)).with_base_url(mock_server.uri());
 
         // Make 3 rapid requests - should all succeed with high rate limit
         for _ in 0..3 {

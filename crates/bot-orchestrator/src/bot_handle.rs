@@ -21,7 +21,11 @@ impl BotHandle {
         event_tx: broadcast::Sender<BotEvent>,
         status_rx: watch::Receiver<EnhancedBotStatus>,
     ) -> Self {
-        Self { tx, event_tx, status_rx }
+        Self {
+            tx,
+            event_tx,
+            status_rx,
+        }
     }
 
     /// Starts the bot.
@@ -65,7 +69,9 @@ impl BotHandle {
     /// # Errors
     /// Returns an error if the command cannot be sent to the bot actor.
     pub async fn update_config(&self, config: BotConfig) -> Result<()> {
-        self.tx.send(BotCommand::UpdateConfig(Box::new(config))).await?;
+        self.tx
+            .send(BotCommand::UpdateConfig(Box::new(config)))
+            .await?;
         Ok(())
     }
 

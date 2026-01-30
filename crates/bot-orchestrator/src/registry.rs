@@ -386,7 +386,11 @@ impl BotRegistry {
 
             match self.spawn_bot(config).await {
                 Ok(_) => {
-                    tracing::info!("Started paper bot {} for token {} with optimal params", bot_id, symbol);
+                    tracing::info!(
+                        "Started paper bot {} for token {} with optimal params",
+                        bot_id,
+                        symbol
+                    );
                     started.push(bot_id);
                 }
                 Err(e) => {

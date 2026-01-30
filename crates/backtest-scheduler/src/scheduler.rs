@@ -80,7 +80,11 @@ async fn run_backtest_batch(
     info!(
         "Running backtest batch for {} tokens from {}",
         token_universe.len(),
-        if config.fetch_universe_from_exchange { "Hyperliquid API" } else { "config" }
+        if config.fetch_universe_from_exchange {
+            "Hyperliquid API"
+        } else {
+            "config"
+        }
     );
 
     let end_time = Utc::now();
@@ -134,7 +138,10 @@ async fn fetch_token_universe(config: &BacktestSchedulerConfig) -> Result<Vec<St
                 Ok(symbols)
             }
             Err(e) => {
-                warn!("Failed to fetch symbols from exchange: {}. Falling back to config.", e);
+                warn!(
+                    "Failed to fetch symbols from exchange: {}. Falling back to config.",
+                    e
+                );
 
                 // Fallback to config if available
                 if let Some(ref token_universe) = config.token_universe {
@@ -146,8 +153,9 @@ async fn fetch_token_universe(config: &BacktestSchedulerConfig) -> Result<Vec<St
         }
     } else {
         // Use token list from config
-        config.token_universe.clone()
-            .ok_or_else(|| anyhow::anyhow!("token_universe is required when fetch_universe_from_exchange = false"))
+        config.token_universe.clone().ok_or_else(|| {
+            anyhow::anyhow!("token_universe is required when fetch_universe_from_exchange = false")
+        })
     }
 }
 
@@ -223,7 +231,8 @@ fn calculate_simple_metrics(
 
     // Calculate mean and std dev
     let mean = returns.iter().sum::<f64>() / returns.len() as f64;
-    let variance: f64 = returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
+    let variance: f64 =
+        returns.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / returns.len() as f64;
     let std_dev = variance.sqrt();
 
     // Calculate Sharpe ratio (annualized, assuming daily data)

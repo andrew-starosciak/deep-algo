@@ -44,37 +44,44 @@ impl ExecutionHandler for LiveExecutionHandler {
         let response = self.client.post_signed("/exchange", order_request).await?;
 
         // Parse Hyperliquid response
-        let status = response.get("status")
+        let status = response
+            .get("status")
             .and_then(|s| s.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing status in order response"))?;
 
         if status != "ok" {
-            let error = response.get("response")
+            let error = response
+                .get("response")
                 .and_then(|r| r.as_str())
                 .unwrap_or("Unknown error");
             anyhow::bail!("Order failed: {error}");
         }
 
-        let statuses = response.get("response")
+        let statuses = response
+            .get("response")
             .and_then(|r| r.get("data"))
             .and_then(|d| d.get("statuses"))
             .and_then(|s| s.as_array())
             .ok_or_else(|| anyhow::anyhow!("Invalid response format"))?;
 
-        let first_status = statuses.first()
+        let first_status = statuses
+            .first()
             .ok_or_else(|| anyhow::anyhow!("No order status in response"))?;
 
-        let filled = first_status.get("filled")
+        let filled = first_status
+            .get("filled")
             .and_then(|f| f.as_object())
             .ok_or_else(|| anyhow::anyhow!("Order not filled"))?;
 
-        let avg_price = filled.get("avgPx")
+        let avg_price = filled
+            .get("avgPx")
             .and_then(|p| p.as_str())
             .and_then(|p| Decimal::from_str_exact(p).ok())
             .unwrap_or_else(|| order.price.unwrap_or(Decimal::ZERO));
 
         let fill = FillEvent {
-            order_id: filled.get("oid")
+            order_id: filled
+                .get("oid")
                 .and_then(serde_json::Value::as_u64)
                 .map(|o| o.to_string())
                 .unwrap_or_default(),

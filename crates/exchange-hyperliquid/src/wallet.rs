@@ -10,8 +10,7 @@ pub fn create_wallet_from_private_key(private_key: &str) -> Result<LocalWallet> 
     // Remove 0x prefix if present
     let key = private_key.strip_prefix("0x").unwrap_or(private_key);
 
-    LocalWallet::from_str(key)
-        .context("Failed to create wallet from private key")
+    LocalWallet::from_str(key).context("Failed to create wallet from private key")
 }
 
 /// Load wallet from environment variable

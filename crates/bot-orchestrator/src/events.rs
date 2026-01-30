@@ -1,5 +1,5 @@
-use algo_trade_core::events::{ClosedTrade, FillEvent, OrderEvent, SignalEvent};
 use crate::commands::{BotState, ExecutionMode};
+use algo_trade_core::events::{ClosedTrade, FillEvent, OrderEvent, SignalEvent};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

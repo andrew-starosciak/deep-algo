@@ -1,4 +1,6 @@
-use algo_trade_core::events::{OrderDirection, OrderEvent, OrderType, SignalDirection, SignalEvent};
+use algo_trade_core::events::{
+    OrderDirection, OrderEvent, OrderType, SignalDirection, SignalEvent,
+};
 use algo_trade_core::position_sizing::calculate_position_size;
 use algo_trade_core::traits::RiskManager;
 use anyhow::Result;
@@ -7,9 +9,9 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 
 pub struct SimpleRiskManager {
-    risk_per_trade_pct: Decimal,  // Percentage of equity to risk per trade (e.g., 0.05 = 5%)
-    max_position_pct: Decimal,     // Maximum position size as % of equity (e.g., 0.20 = 20%)
-    leverage: u8,                  // Leverage multiplier (1-50 for Hyperliquid)
+    risk_per_trade_pct: Decimal, // Percentage of equity to risk per trade (e.g., 0.05 = 5%)
+    max_position_pct: Decimal,   // Maximum position size as % of equity (e.g., 0.20 = 20%)
+    leverage: u8,                // Leverage multiplier (1-50 for Hyperliquid)
 }
 
 impl SimpleRiskManager {
@@ -42,20 +44,25 @@ impl SimpleRiskManager {
 
 #[async_trait]
 impl RiskManager for SimpleRiskManager {
-    async fn evaluate_signal(&self, signal: &SignalEvent, account_equity: Decimal, current_position: Option<Decimal>) -> Result<Vec<OrderEvent>> {
+    async fn evaluate_signal(
+        &self,
+        signal: &SignalEvent,
+        account_equity: Decimal,
+        current_position: Option<Decimal>,
+    ) -> Result<Vec<OrderEvent>> {
         // Handle Exit signals
         if signal.direction == SignalDirection::Exit {
             return current_position.map_or_else(
-                || Ok(vec![]),  // No position to close
+                || Ok(vec![]), // No position to close
                 |pos| {
                     if pos == Decimal::ZERO {
-                        return Ok(vec![]);  // Already flat
+                        return Ok(vec![]); // Already flat
                     }
 
                     let direction = if pos > Decimal::ZERO {
-                        OrderDirection::Sell  // Close long
+                        OrderDirection::Sell // Close long
                     } else {
-                        OrderDirection::Buy   // Close short
+                        OrderDirection::Buy // Close short
                     };
 
                     let close_order = OrderEvent {
@@ -88,12 +95,12 @@ impl RiskManager for SimpleRiskManager {
         )?;
 
         // Round to 8 decimal places (standard for crypto)
-        let rounded_qty = (target_quantity * Decimal::from(100_000_000))
-            .round() / Decimal::from(100_000_000);
+        let rounded_qty =
+            (target_quantity * Decimal::from(100_000_000)).round() / Decimal::from(100_000_000);
 
         // Step 5: Check if we need to flip positions
         let needs_flip = match (&signal.direction, current_position) {
-            (SignalDirection::Long, Some(pos)) if pos < Decimal::ZERO => true,  // Short → Long
+            (SignalDirection::Long, Some(pos)) if pos < Decimal::ZERO => true, // Short → Long
             (SignalDirection::Short, Some(pos)) if pos > Decimal::ZERO => true, // Long → Short
             _ => false,
         };

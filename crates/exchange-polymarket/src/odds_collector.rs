@@ -186,16 +186,14 @@ impl OddsCollector {
         };
 
         // Limit number of tracked markets
-        let markets: Vec<Market> = markets
-            .into_iter()
-            .take(self.config.max_markets)
-            .collect();
+        let markets: Vec<Market> = markets.into_iter().take(self.config.max_markets).collect();
 
         let count = markets.len();
         self.tracked_markets = markets;
         self.stats.record_discovery(count);
 
-        self.emit_event(OddsCollectorEvent::MarketsDiscovered { count }).await;
+        self.emit_event(OddsCollectorEvent::MarketsDiscovered { count })
+            .await;
 
         tracing::info!("Discovered {} BTC-related markets", count);
         Ok(count)
@@ -224,11 +222,7 @@ impl OddsCollector {
                 yes_price,
                 no_price,
             )
-            .with_metadata(
-                market.volume_24h,
-                market.liquidity,
-                market.end_date,
-            );
+            .with_metadata(market.volume_24h, market.liquidity, market.end_date);
 
             if self.tx.send(record).await.is_err() {
                 tracing::warn!("Odds record channel closed");
@@ -239,7 +233,10 @@ impl OddsCollector {
         }
 
         self.stats.record_poll(records_emitted);
-        self.emit_event(OddsCollectorEvent::PollCompleted { records: records_emitted }).await;
+        self.emit_event(OddsCollectorEvent::PollCompleted {
+            records: records_emitted,
+        })
+        .await;
 
         Ok(records_emitted)
     }
@@ -388,29 +385,26 @@ mod tests {
 
     #[test]
     fn test_config_with_poll_interval() {
-        let config = OddsCollectorConfig::default()
-            .with_poll_interval(Duration::from_secs(10));
+        let config = OddsCollectorConfig::default().with_poll_interval(Duration::from_secs(10));
         assert_eq!(config.poll_interval, Duration::from_secs(10));
     }
 
     #[test]
     fn test_config_with_discovery_interval() {
-        let config = OddsCollectorConfig::default()
-            .with_discovery_interval(Duration::from_secs(1800));
+        let config =
+            OddsCollectorConfig::default().with_discovery_interval(Duration::from_secs(1800));
         assert_eq!(config.discovery_interval, Duration::from_secs(1800));
     }
 
     #[test]
     fn test_config_with_min_liquidity() {
-        let config = OddsCollectorConfig::default()
-            .with_min_liquidity(dec!(10000));
+        let config = OddsCollectorConfig::default().with_min_liquidity(dec!(10000));
         assert_eq!(config.min_liquidity, dec!(10000));
     }
 
     #[test]
     fn test_config_with_max_markets() {
-        let config = OddsCollectorConfig::default()
-            .with_max_markets(100);
+        let config = OddsCollectorConfig::default().with_max_markets(100);
         assert_eq!(config.max_markets, 100);
     }
 
@@ -502,8 +496,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(100);
         let (event_tx, _event_rx) = mpsc::channel(100);
 
-        let _collector = OddsCollector::new(client, config, tx)
-            .with_event_channel(event_tx);
+        let _collector = OddsCollector::new(client, config, tx).with_event_channel(event_tx);
     }
 
     #[tokio::test]
@@ -676,8 +669,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel(100);
         let (event_tx, mut event_rx) = mpsc::channel(100);
 
-        let mut collector = OddsCollector::new(client, config, tx)
-            .with_event_channel(event_tx);
+        let mut collector = OddsCollector::new(client, config, tx).with_event_channel(event_tx);
 
         collector.tracked_markets = vec![sample_btc_market()];
 

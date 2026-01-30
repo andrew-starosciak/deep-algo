@@ -24,24 +24,30 @@ impl LiveDataProvider {
         let mut ws = HyperliquidWebSocket::new(ws_url.clone());
 
         // Connect to WebSocket
-        ws.connect().await
-            .map_err(|e| {
-                tracing::error!("WebSocket connection failed: {:?}", e);
-                e
-            })?;
+        ws.connect().await.map_err(|e| {
+            tracing::error!("WebSocket connection failed: {:?}", e);
+            e
+        })?;
 
         // Subscribe to candles for the symbol
         let subscription = Self::create_subscription(&symbol, &interval);
 
         tracing::debug!("Subscribing to candles: {}", subscription);
-        ws.subscribe(subscription).await
-            .map_err(|e| {
-                tracing::error!("WebSocket subscription failed: {:?}", e);
-                e
-            })?;
+        ws.subscribe(subscription).await.map_err(|e| {
+            tracing::error!("WebSocket subscription failed: {:?}", e);
+            e
+        })?;
 
-        tracing::info!("Successfully subscribed to {} candles (interval: {})", symbol, interval);
-        Ok(Self { ws, symbol, interval })
+        tracing::info!(
+            "Successfully subscribed to {} candles (interval: {})",
+            symbol,
+            interval
+        );
+        Ok(Self {
+            ws,
+            symbol,
+            interval,
+        })
     }
 
     /// Create subscription JSON for candle data
@@ -64,16 +70,21 @@ impl LiveDataProvider {
     ///
     /// # Errors
     /// Returns error if API request fails or data parsing fails
-    pub async fn warmup(&self, api_url: String, lookback_periods: usize) -> Result<Vec<MarketEvent>> {
+    pub async fn warmup(
+        &self,
+        api_url: String,
+        lookback_periods: usize,
+    ) -> Result<Vec<MarketEvent>> {
         let client = HyperliquidClient::new(api_url);
         let end = Utc::now();
         let interval_minutes = self.parse_interval_minutes()?;
         let total_minutes = lookback_periods * interval_minutes;
-        let minutes_i64 = i64::try_from(total_minutes)
-            .context("Lookback period too large")?;
+        let minutes_i64 = i64::try_from(total_minutes).context("Lookback period too large")?;
         let start = end - Duration::minutes(minutes_i64);
 
-        let records = client.fetch_candles(&self.symbol, &self.interval, start, end).await?;
+        let records = client
+            .fetch_candles(&self.symbol, &self.interval, start, end)
+            .await?;
 
         let events = records
             .into_iter()
@@ -109,7 +120,9 @@ impl LiveDataProvider {
     }
 
     /// Extract candle object from data field (handles both object and array formats)
-    fn extract_candle_from_data(data: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    fn extract_candle_from_data(
+        data: &serde_json::Value,
+    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
         if let Some(obj) = data.as_object() {
             Some(obj)
         } else if let Some(arr) = data.as_array() {
@@ -120,28 +133,38 @@ impl LiveDataProvider {
     }
 
     /// Parse candle fields into `MarketEvent`
-    fn parse_candle_to_event(&self, candle: &serde_json::Map<String, serde_json::Value>) -> Result<MarketEvent> {
-        let symbol = candle.get("s")
+    fn parse_candle_to_event(
+        &self,
+        candle: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<MarketEvent> {
+        let symbol = candle
+            .get("s")
             .and_then(|v| v.as_str())
             .unwrap_or(&self.symbol)
             .to_string();
 
-        let open = candle.get("o")
+        let open = candle
+            .get("o")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'o' (open) field in candle"))?;
-        let high = candle.get("h")
+        let high = candle
+            .get("h")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'h' (high) field in candle"))?;
-        let low = candle.get("l")
+        let low = candle
+            .get("l")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'l' (low) field in candle"))?;
-        let close = candle.get("c")
+        let close = candle
+            .get("c")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'c' (close) field in candle"))?;
-        let volume = candle.get("v")
+        let volume = candle
+            .get("v")
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'v' (volume) field in candle"))?;
-        let timestamp = candle.get("t")
+        let timestamp = candle
+            .get("t")
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(|| anyhow::anyhow!("Missing 't' (timestamp) field in candle"))?;
 
@@ -153,8 +176,16 @@ impl LiveDataProvider {
         let timestamp = chrono::DateTime::from_timestamp_millis(timestamp)
             .ok_or_else(|| anyhow::anyhow!("Invalid timestamp: {timestamp}"))?;
 
-        tracing::debug!("Parsed candle: {} @ {} (OHLCV: {}/{}/{}/{}/{})",
-            symbol, timestamp, open, high, low, close, volume);
+        tracing::debug!(
+            "Parsed candle: {} @ {} (OHLCV: {}/{}/{}/{}/{})",
+            symbol,
+            timestamp,
+            open,
+            high,
+            low,
+            close,
+            volume
+        );
 
         Ok(MarketEvent::Bar {
             symbol,

@@ -146,8 +146,7 @@ impl WalletConfig {
         }
 
         let timestamp = chrono::Utc::now().timestamp_millis();
-        let nonce = u64::try_from(timestamp)
-            .context("Timestamp must be positive")?;
+        let nonce = u64::try_from(timestamp).context("Timestamp must be positive")?;
 
         Ok(Self {
             account_address,

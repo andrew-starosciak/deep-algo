@@ -49,7 +49,10 @@ impl TokenSelector {
             .query_latest_backtest_results(strategy_name, self.config.lookback_hours)
             .await?;
 
-        info!("Evaluating {} backtest results for token selection", results.len());
+        info!(
+            "Evaluating {} backtest results for token selection",
+            results.len()
+        );
 
         // Filter and rank tokens
         let mut approved_tokens: Vec<(String, f64)> = results
@@ -61,7 +64,10 @@ impl TokenSelector {
         // Sort by Sharpe ratio (descending)
         approved_tokens.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
-        let token_list: Vec<String> = approved_tokens.iter().map(|(symbol, _)| symbol.clone()).collect();
+        let token_list: Vec<String> = approved_tokens
+            .iter()
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
 
         info!(
             "Token selection complete: {} tokens approved out of {}",
@@ -104,7 +110,11 @@ impl TokenSelector {
             .collect();
 
         // Sort by Sharpe ratio
-        selection_results.sort_by(|a, b| b.sharpe_ratio.partial_cmp(&a.sharpe_ratio).unwrap_or(std::cmp::Ordering::Equal));
+        selection_results.sort_by(|a, b| {
+            b.sharpe_ratio
+                .partial_cmp(&a.sharpe_ratio)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Ok(selection_results)
     }

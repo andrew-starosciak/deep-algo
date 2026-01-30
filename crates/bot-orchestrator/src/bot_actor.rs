@@ -2,9 +2,9 @@ use crate::commands::{BotCommand, BotConfig, BotState, BotStatus, ExecutionMode}
 use crate::events::{BotEvent, EnhancedBotStatus};
 use crate::execution_wrapper::ExecutionHandlerWrapper;
 use algo_trade_core::TradingSystem;
-use algo_trade_hyperliquid::{LiveDataProvider, HyperliquidClient, PaperTradingExecutionHandler};
-use algo_trade_strategy::{SimpleRiskManager, create_strategy};
-use anyhow::{Result, Context};
+use algo_trade_hyperliquid::{HyperliquidClient, LiveDataProvider, PaperTradingExecutionHandler};
+use algo_trade_strategy::{create_strategy, SimpleRiskManager};
+use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -57,16 +57,18 @@ impl BotActor {
             self.config.ws_url.clone(),
             self.config.symbol.clone(),
             self.config.interval.clone(),
-        ).await.context(format!(
+        )
+        .await
+        .context(format!(
             "Failed to create live data provider (ws_url={}, symbol={}, interval={})",
             self.config.ws_url, self.config.symbol, self.config.interval
         ))?;
 
         // Warmup with historical data
-        let warmup_events = data_provider.warmup(
-            self.config.api_url.clone(),
-            self.config.warmup_periods,
-        ).await.context("Failed to warmup with historical data")?;
+        let warmup_events = data_provider
+            .warmup(self.config.api_url.clone(), self.config.warmup_periods)
+            .await
+            .context("Failed to warmup with historical data")?;
 
         tracing::info!(
             "Warmed up bot {} with {} historical candles",
@@ -81,26 +83,39 @@ impl BotActor {
 
                 // Create HTTP client (requires wallet for live trading)
                 let client = if let Some(ref wallet_config) = self.config.wallet {
-                    tracing::info!("Creating authenticated Hyperliquid client with wallet {}", wallet_config.account_address);
-                    let private_key = wallet_config.api_wallet_private_key.as_ref()
+                    tracing::info!(
+                        "Creating authenticated Hyperliquid client with wallet {}",
+                        wallet_config.account_address
+                    );
+                    let private_key = wallet_config
+                        .api_wallet_private_key
+                        .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("Live mode requires wallet private key"))?;
                     HyperliquidClient::with_wallet(
                         self.config.api_url.clone(),
                         private_key,
                         wallet_config.account_address.clone(),
                         wallet_config.nonce_counter.clone(),
-                    ).context("Failed to create authenticated client")?
+                    )
+                    .context("Failed to create authenticated client")?
                 } else {
                     anyhow::bail!("Live trading mode requires wallet configuration");
                 };
 
-                ExecutionHandlerWrapper::Live(Box::new(algo_trade_hyperliquid::LiveExecutionHandler::new(client)))
+                ExecutionHandlerWrapper::Live(Box::new(
+                    algo_trade_hyperliquid::LiveExecutionHandler::new(client),
+                ))
             }
             ExecutionMode::Paper => {
-                tracing::info!("Bot {} configured for PAPER TRADING (simulated fills, no real money)", self.config.bot_id);
+                tracing::info!(
+                    "Bot {} configured for PAPER TRADING (simulated fills, no real money)",
+                    self.config.bot_id
+                );
 
                 if self.config.wallet.is_some() {
-                    tracing::warn!("Wallet provided but paper trading mode active - wallet will NOT be used");
+                    tracing::warn!(
+                        "Wallet provided but paper trading mode active - wallet will NOT be used"
+                    );
                 }
 
                 ExecutionHandlerWrapper::Paper(PaperTradingExecutionHandler::new(
@@ -115,7 +130,8 @@ impl BotActor {
             &self.config.strategy,
             self.config.symbol.clone(),
             self.config.strategy_config.clone(),
-        ).context("Failed to create strategy")?;
+        )
+        .context("Failed to create strategy")?;
 
         // Feed warmup events to strategy to initialize state
         for event in warmup_events {
@@ -125,12 +141,11 @@ impl BotActor {
         tracing::info!("Bot {} strategy initialized", self.config.bot_id);
 
         // Create risk manager with bot config parameters
-        let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
-            Arc::new(SimpleRiskManager::new(
-                self.config.risk_per_trade_pct,
-                self.config.max_position_pct,
-                self.config.leverage,
-            ));
+        let risk_manager: Arc<dyn algo_trade_core::RiskManager> = Arc::new(SimpleRiskManager::new(
+            self.config.risk_per_trade_pct,
+            self.config.max_position_pct,
+            self.config.leverage,
+        ));
 
         // Create trading system
         let system = TradingSystem::new(
@@ -193,7 +208,10 @@ impl BotActor {
             let market_event = BotEvent::MarketUpdate {
                 symbol: cycle.market_event.symbol().to_string(),
                 price: close,
-                volume: cycle.market_event.volume().unwrap_or(rust_decimal::Decimal::ZERO),
+                volume: cycle
+                    .market_event
+                    .volume()
+                    .unwrap_or(rust_decimal::Decimal::ZERO),
                 timestamp: cycle.market_event.timestamp(),
             };
             self.add_event(market_event);
@@ -234,15 +252,33 @@ impl BotActor {
             execution_mode: self.config.execution_mode,
             last_heartbeat: Utc::now(),
             started_at: self.started_at,
-            current_equity: self.system.as_ref().map_or(self.config.initial_capital, algo_trade_core::TradingSystem::current_equity),
+            current_equity: self.system.as_ref().map_or(
+                self.config.initial_capital,
+                algo_trade_core::TradingSystem::current_equity,
+            ),
             initial_capital: self.config.initial_capital,
-            total_return_pct: self.system.as_ref().map_or(0.0, algo_trade_core::TradingSystem::total_return_pct),
-            sharpe_ratio: self.system.as_ref().map_or(0.0, algo_trade_core::TradingSystem::sharpe_ratio),
-            max_drawdown: self.system.as_ref().map_or(0.0, algo_trade_core::TradingSystem::max_drawdown),
-            win_rate: self.system.as_ref().map_or(0.0, algo_trade_core::TradingSystem::win_rate),
+            total_return_pct: self
+                .system
+                .as_ref()
+                .map_or(0.0, algo_trade_core::TradingSystem::total_return_pct),
+            sharpe_ratio: self
+                .system
+                .as_ref()
+                .map_or(0.0, algo_trade_core::TradingSystem::sharpe_ratio),
+            max_drawdown: self
+                .system
+                .as_ref()
+                .map_or(0.0, algo_trade_core::TradingSystem::max_drawdown),
+            win_rate: self
+                .system
+                .as_ref()
+                .map_or(0.0, algo_trade_core::TradingSystem::win_rate),
             num_trades: self.system.as_ref().map_or(0, |s| s.open_positions().len()),
             open_positions: Vec::new(), // Skip position details without current price
-            closed_trades: self.system.as_ref().map_or_else(Vec::new, |s| s.closed_trades().to_vec()),
+            closed_trades: self
+                .system
+                .as_ref()
+                .map_or_else(Vec::new, |s| s.closed_trades().to_vec()),
             recent_events: self.recent_events.iter().cloned().collect(),
             error: if matches!(self.state, BotState::Error) {
                 self.recent_events.iter().rev().find_map(|e| {
@@ -273,7 +309,8 @@ impl BotActor {
             let win_rate = system.win_rate();
 
             // Get open positions
-            let open_positions: Vec<PositionInfo> = system.open_positions()
+            let open_positions: Vec<PositionInfo> = system
+                .open_positions()
                 .iter()
                 .map(|(sym, pos)| {
                     let unrealized_pnl = if sym == symbol {
@@ -284,7 +321,8 @@ impl BotActor {
 
                     let unrealized_pnl_pct = if pos.avg_price > rust_decimal::Decimal::ZERO {
                         let pnl_f64: f64 = unrealized_pnl.try_into().unwrap_or(0.0);
-                        let cost_f64: f64 = (pos.avg_price * pos.quantity).try_into().unwrap_or(1.0);
+                        let cost_f64: f64 =
+                            (pos.avg_price * pos.quantity).try_into().unwrap_or(1.0);
                         (pnl_f64 / cost_f64) * 100.0
                     } else {
                         0.0
@@ -294,7 +332,11 @@ impl BotActor {
                         symbol: sym.clone(),
                         quantity: pos.quantity,
                         avg_price: pos.avg_price,
-                        current_price: if sym == symbol { current_price } else { pos.avg_price },
+                        current_price: if sym == symbol {
+                            current_price
+                        } else {
+                            pos.avg_price
+                        },
                         unrealized_pnl,
                         unrealized_pnl_pct,
                     }
@@ -366,7 +408,11 @@ impl BotActor {
 
                     // Defensive: Only start if stopped or error (allow restart from error)
                     if matches!(self.state, BotState::Running | BotState::Paused) {
-                        tracing::warn!("Bot {} in invalid state for start (state: {:?}), ignoring command", self.config.bot_id, self.state);
+                        tracing::warn!(
+                            "Bot {} in invalid state for start (state: {:?}), ignoring command",
+                            self.config.bot_id,
+                            self.state
+                        );
                         continue;
                     }
 
@@ -398,7 +444,10 @@ impl BotActor {
                 BotCommand::Stop => {
                     // Defensive: Only stop if running or paused
                     if matches!(self.state, BotState::Stopped | BotState::Error) {
-                        tracing::warn!("Bot {} already stopped, ignoring stop command", self.config.bot_id);
+                        tracing::warn!(
+                            "Bot {} already stopped, ignoring stop command",
+                            self.config.bot_id
+                        );
                         continue;
                     }
 
@@ -409,7 +458,11 @@ impl BotActor {
                 BotCommand::Pause => {
                     // Defensive: Only pause if running
                     if !matches!(self.state, BotState::Running) {
-                        tracing::warn!("Bot {} not running (state: {:?}), cannot pause", self.config.bot_id, self.state);
+                        tracing::warn!(
+                            "Bot {} not running (state: {:?}), cannot pause",
+                            self.config.bot_id,
+                            self.state
+                        );
                         continue;
                     }
 
@@ -420,7 +473,11 @@ impl BotActor {
                 BotCommand::Resume => {
                     // Defensive: Only resume if paused
                     if !matches!(self.state, BotState::Paused) {
-                        tracing::warn!("Bot {} not paused (state: {:?}), cannot resume", self.config.bot_id, self.state);
+                        tracing::warn!(
+                            "Bot {} not paused (state: {:?}), cannot resume",
+                            self.config.bot_id,
+                            self.state
+                        );
                         continue;
                     }
 
@@ -433,11 +490,18 @@ impl BotActor {
 
                     // Resume trading loop
                     if let Err(e) = self.trading_loop().await {
-                        tracing::error!("Bot {} trading loop error after resume: {}", self.config.bot_id, e);
+                        tracing::error!(
+                            "Bot {} trading loop error after resume: {}",
+                            self.config.bot_id,
+                            e
+                        );
                         self.state = BotState::Error;
                         self.emit_error_event(format!("Trading loop error: {e}"));
                     } else {
-                        tracing::info!("Bot {} trading loop exited after resume", self.config.bot_id);
+                        tracing::info!(
+                            "Bot {} trading loop exited after resume",
+                            self.config.bot_id
+                        );
                         self.state = BotState::Stopped;
                     }
                     self.update_status_without_market_data();

@@ -4,16 +4,36 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MarketEvent {
-    Quote { symbol: String, bid: Decimal, ask: Decimal, timestamp: DateTime<Utc> },
-    Trade { symbol: String, price: Decimal, size: Decimal, timestamp: DateTime<Utc> },
-    Bar { symbol: String, open: Decimal, high: Decimal, low: Decimal, close: Decimal, volume: Decimal, timestamp: DateTime<Utc> },
+    Quote {
+        symbol: String,
+        bid: Decimal,
+        ask: Decimal,
+        timestamp: DateTime<Utc>,
+    },
+    Trade {
+        symbol: String,
+        price: Decimal,
+        size: Decimal,
+        timestamp: DateTime<Utc>,
+    },
+    Bar {
+        symbol: String,
+        open: Decimal,
+        high: Decimal,
+        low: Decimal,
+        close: Decimal,
+        volume: Decimal,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl MarketEvent {
     #[must_use]
     pub const fn timestamp(&self) -> DateTime<Utc> {
         match self {
-            Self::Quote { timestamp, .. } | Self::Trade { timestamp, .. } | Self::Bar { timestamp, .. } => *timestamp,
+            Self::Quote { timestamp, .. }
+            | Self::Trade { timestamp, .. }
+            | Self::Bar { timestamp, .. } => *timestamp,
         }
     }
 
@@ -29,7 +49,9 @@ impl MarketEvent {
     #[must_use]
     pub fn symbol(&self) -> &str {
         match self {
-            Self::Quote { symbol, .. } | Self::Trade { symbol, .. } | Self::Bar { symbol, .. } => symbol,
+            Self::Quote { symbol, .. } | Self::Trade { symbol, .. } | Self::Bar { symbol, .. } => {
+                symbol
+            }
         }
     }
 

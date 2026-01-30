@@ -64,9 +64,7 @@ impl ApiServer {
             bot_routes
         };
 
-        router
-            .layer(cors)
-            .layer(TraceLayer::new_for_http())
+        router.layer(cors).layer(TraceLayer::new_for_http())
     }
 
     /// Starts the web server listening on the specified address.

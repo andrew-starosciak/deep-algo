@@ -33,13 +33,17 @@ impl Market {
     /// Returns the "Yes" token if present.
     #[must_use]
     pub fn yes_token(&self) -> Option<&Token> {
-        self.tokens.iter().find(|t| t.outcome.eq_ignore_ascii_case("yes"))
+        self.tokens
+            .iter()
+            .find(|t| t.outcome.eq_ignore_ascii_case("yes"))
     }
 
     /// Returns the "No" token if present.
     #[must_use]
     pub fn no_token(&self) -> Option<&Token> {
-        self.tokens.iter().find(|t| t.outcome.eq_ignore_ascii_case("no"))
+        self.tokens
+            .iter()
+            .find(|t| t.outcome.eq_ignore_ascii_case("no"))
     }
 
     /// Returns the yes price (0.0 to 1.0).
@@ -212,8 +216,14 @@ impl From<RawMarket> for Market {
             tokens,
             active: raw.active,
             tags: raw.tags,
-            volume_24h: raw.volume_num_24hr.map(Decimal::try_from).and_then(Result::ok),
-            liquidity: raw.liquidity_num.map(Decimal::try_from).and_then(Result::ok),
+            volume_24h: raw
+                .volume_num_24hr
+                .map(Decimal::try_from)
+                .and_then(Result::ok),
+            liquidity: raw
+                .liquidity_num
+                .map(Decimal::try_from)
+                .and_then(Result::ok),
         }
     }
 }
@@ -223,7 +233,8 @@ impl From<RawToken> for Token {
         Self {
             token_id: raw.token_id,
             outcome: raw.outcome,
-            price: raw.price
+            price: raw
+                .price
                 .map(Decimal::try_from)
                 .and_then(Result::ok)
                 .unwrap_or(Decimal::ZERO),
@@ -390,8 +401,7 @@ mod tests {
 
     #[test]
     fn test_market_filter_with_liquidity() {
-        let filter = MarketFilter::btc_markets()
-            .with_min_liquidity(dec!(10000));
+        let filter = MarketFilter::btc_markets().with_min_liquidity(dec!(10000));
         assert_eq!(filter.min_liquidity, Some(dec!(10000)));
     }
 

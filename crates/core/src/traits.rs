@@ -42,5 +42,10 @@ pub trait RiskManager: Send + Sync {
     ///
     /// # Exit Signals
     /// When signal direction is Exit and a position exists, returns close order.
-    async fn evaluate_signal(&self, signal: &SignalEvent, account_equity: Decimal, current_position: Option<Decimal>) -> Result<Vec<OrderEvent>>;
+    async fn evaluate_signal(
+        &self,
+        signal: &SignalEvent,
+        account_equity: Decimal,
+        current_position: Option<Decimal>,
+    ) -> Result<Vec<OrderEvent>>;
 }

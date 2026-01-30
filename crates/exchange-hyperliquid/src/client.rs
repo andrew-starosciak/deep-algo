@@ -4,7 +4,7 @@ use algo_trade_data::database::OhlcvRecord;
 use anyhow::{Context as _, Result};
 use chrono::{DateTime, Duration, Utc};
 use ethers::signers::LocalWallet;
-use governor::{Quota, RateLimiter, state::InMemoryState, clock::DefaultClock};
+use governor::{clock::DefaultClock, state::InMemoryState, Quota, RateLimiter};
 use reqwest::Client;
 use rust_decimal::Decimal;
 use std::collections::HashMap;
@@ -114,7 +114,9 @@ impl HyperliquidClient {
         endpoint: &str,
         order_payload: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        let wallet = self.wallet.as_ref()
+        let wallet = self
+            .wallet
+            .as_ref()
             .context("Client not authenticated - use with_wallet()")?;
 
         let nonce = self.nonce_counter.fetch_add(1, Ordering::SeqCst);
@@ -158,12 +160,22 @@ impl HyperliquidClient {
             "Fetching {total_candles} candles for {symbol} (interval: {interval}, {start} to {end})"
         );
 
-        let mut all_records = HashMap::new();  // Deduplicate by timestamp
+        let mut all_records = HashMap::new(); // Deduplicate by timestamp
 
         if total_candles <= MAX_CANDLES_PER_REQUEST {
-            self.fetch_single_request(symbol, interval, start, end, &mut all_records).await?;
+            self.fetch_single_request(symbol, interval, start, end, &mut all_records)
+                .await?;
         } else {
-            self.fetch_paginated_requests(symbol, interval, start, end, total_candles, interval_millis, &mut all_records).await?;
+            self.fetch_paginated_requests(
+                symbol,
+                interval,
+                start,
+                end,
+                total_candles,
+                interval_millis,
+                &mut all_records,
+            )
+            .await?;
         }
 
         let records = Self::finalize_records(all_records, total_candles, symbol);
@@ -174,7 +186,11 @@ impl HyperliquidClient {
     ///
     /// # Errors
     /// Returns error if time range is negative or calculation overflows
-    fn calculate_total_candles(start: DateTime<Utc>, end: DateTime<Utc>, interval_millis: i64) -> Result<usize> {
+    fn calculate_total_candles(
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+        interval_millis: i64,
+    ) -> Result<usize> {
         let duration_millis = end.timestamp_millis() - start.timestamp_millis();
         if duration_millis < 0 {
             anyhow::bail!("End time must be after start time");
@@ -193,7 +209,9 @@ impl HyperliquidClient {
         end: DateTime<Utc>,
         all_records: &mut HashMap<DateTime<Utc>, OhlcvRecord>,
     ) -> Result<()> {
-        let records = self.fetch_candles_chunk(symbol, interval, start, end).await?;
+        let records = self
+            .fetch_candles_chunk(symbol, interval, start, end)
+            .await?;
         for record in records {
             all_records.insert(record.timestamp, record);
         }
@@ -213,16 +231,23 @@ impl HyperliquidClient {
         all_records: &mut HashMap<DateTime<Utc>, OhlcvRecord>,
     ) -> Result<()> {
         let num_requests = total_candles.div_ceil(MAX_CANDLES_PER_REQUEST);
-        tracing::info!("Requires {num_requests} paginated requests (Hyperliquid limit: 5000 candles/request)");
+        tracing::info!(
+            "Requires {num_requests} paginated requests (Hyperliquid limit: 5000 candles/request)"
+        );
 
         let mut current_end = end;
         for i in 0..num_requests {
             let chunk_duration = Self::calculate_chunk_duration(interval_millis)?;
             let chunk_start = (current_end - chunk_duration).max(start);
 
-            tracing::debug!("Request {}/{num_requests}: {chunk_start} to {current_end}", i + 1);
+            tracing::debug!(
+                "Request {}/{num_requests}: {chunk_start} to {current_end}",
+                i + 1
+            );
 
-            let records = self.fetch_candles_chunk(symbol, interval, chunk_start, current_end).await?;
+            let records = self
+                .fetch_candles_chunk(symbol, interval, chunk_start, current_end)
+                .await?;
             for record in records {
                 all_records.insert(record.timestamp, record);
             }
@@ -240,9 +265,12 @@ impl HyperliquidClient {
     /// # Errors
     /// Returns error if calculation would overflow
     fn calculate_chunk_duration(interval_millis: i64) -> Result<Duration> {
-        let chunk_millis = interval_millis.checked_mul(
-            i64::try_from(MAX_CANDLES_PER_REQUEST).context("MAX_CANDLES_PER_REQUEST too large")?
-        ).context("Chunk duration calculation overflow")?;
+        let chunk_millis = interval_millis
+            .checked_mul(
+                i64::try_from(MAX_CANDLES_PER_REQUEST)
+                    .context("MAX_CANDLES_PER_REQUEST too large")?,
+            )
+            .context("Chunk duration calculation overflow")?;
 
         Ok(Duration::milliseconds(chunk_millis))
     }
@@ -316,12 +344,14 @@ impl HyperliquidClient {
         let response = self.post("/info", request_body).await?;
 
         // Parse response array
-        let candles = response.as_array()
+        let candles = response
+            .as_array()
             .ok_or_else(|| anyhow::anyhow!("Hyperliquid response is not an array"))?;
 
         let mut records = Vec::new();
         for candle in candles {
-            let timestamp_millis = candle["t"].as_i64()
+            let timestamp_millis = candle["t"]
+                .as_i64()
                 .ok_or_else(|| anyhow::anyhow!("Missing timestamp in candle data"))?;
             let timestamp = DateTime::from_timestamp_millis(timestamp_millis)
                 .ok_or_else(|| anyhow::anyhow!("Invalid timestamp: {timestamp_millis}"))?;

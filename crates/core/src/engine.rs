@@ -175,11 +175,16 @@ where
                     let current_equity = *self.equity_curve.last().unwrap();
 
                     // Get current position for the signal's symbol (for position flipping)
-                    let current_position = self.position_tracker.get_position(&signal.symbol)
+                    let current_position = self
+                        .position_tracker
+                        .get_position(&signal.symbol)
                         .map(|p| p.quantity);
 
                     // Risk management evaluation (returns Vec of orders)
-                    let orders = self.risk_manager.evaluate_signal(&signal, current_equity, current_position).await?;
+                    let orders = self
+                        .risk_manager
+                        .evaluate_signal(&signal, current_equity, current_position)
+                        .await?;
 
                     // Execute all orders sequentially
                     for order in orders {
@@ -227,11 +232,18 @@ where
         self.returns.push(return_pct);
 
         // Find matching entry fill for this symbol (most recent opposite direction)
-        let entry_fill = self.fills.iter().rev()
-            .find(|f| f.symbol == exit_fill.symbol &&
-                     matches!((&f.direction, &exit_fill.direction),
-                              (OrderDirection::Buy, OrderDirection::Sell) |
-                              (OrderDirection::Sell, OrderDirection::Buy)))
+        let entry_fill = self
+            .fills
+            .iter()
+            .rev()
+            .find(|f| {
+                f.symbol == exit_fill.symbol
+                    && matches!(
+                        (&f.direction, &exit_fill.direction),
+                        (OrderDirection::Buy, OrderDirection::Sell)
+                            | (OrderDirection::Sell, OrderDirection::Buy)
+                    )
+            })
             .cloned();
 
         if let Some(entry) = entry_fill {
@@ -240,7 +252,9 @@ where
                 OrderDirection::Sell => crate::events::TradeDirection::Short,
             };
 
-            let pnl_pct = (pnl / (entry.price * entry.quantity)).try_into().unwrap_or(0.0);
+            let pnl_pct = (pnl / (entry.price * entry.quantity))
+                .try_into()
+                .unwrap_or(0.0);
 
             let closed_trade = crate::events::ClosedTrade {
                 symbol: exit_fill.symbol.clone(),
@@ -304,7 +318,8 @@ where
         };
 
         // Calculate buy & hold return
-        let buy_hold_return = if let (Some(first), Some(last)) = (self.first_price, self.last_price) {
+        let buy_hold_return = if let (Some(first), Some(last)) = (self.first_price, self.last_price)
+        {
             (last - first) / first
         } else {
             Decimal::ZERO
@@ -389,14 +404,15 @@ where
                     cycle_signals.push(signal.clone());
 
                     let current_equity = *self.equity_curve.last().unwrap();
-                    let current_position = self.position_tracker.get_position(&signal.symbol)
+                    let current_position = self
+                        .position_tracker
+                        .get_position(&signal.symbol)
                         .map(|p| p.quantity);
 
-                    let orders = self.risk_manager.evaluate_signal(
-                        &signal,
-                        current_equity,
-                        current_position,
-                    ).await?;
+                    let orders = self
+                        .risk_manager
+                        .evaluate_signal(&signal, current_equity, current_position)
+                        .await?;
 
                     for order in &orders {
                         cycle_orders.push(order.clone());
@@ -468,7 +484,10 @@ where
     /// Get current equity
     #[must_use]
     pub fn current_equity(&self) -> Decimal {
-        self.equity_curve.last().copied().unwrap_or(self.initial_capital)
+        self.equity_curve
+            .last()
+            .copied()
+            .unwrap_or(self.initial_capital)
     }
 
     /// Get initial capital
@@ -549,7 +568,9 @@ where
 
     /// Get open positions
     #[must_use]
-    pub const fn open_positions(&self) -> &std::collections::HashMap<String, crate::position::Position> {
+    pub const fn open_positions(
+        &self,
+    ) -> &std::collections::HashMap<String, crate::position::Position> {
         self.position_tracker.all_positions()
     }
 
@@ -562,8 +583,8 @@ where
     /// Calculate unrealized `PnL` for a position
     #[must_use]
     pub fn unrealized_pnl(&self, symbol: &str, current_price: Decimal) -> Option<Decimal> {
-        self.position_tracker.get_position(symbol).map(|pos| {
-            (current_price - pos.avg_price) * pos.quantity
-        })
+        self.position_tracker
+            .get_position(symbol)
+            .map(|pos| (current_price - pos.avg_price) * pos.quantity)
     }
 }

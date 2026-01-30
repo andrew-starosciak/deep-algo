@@ -27,15 +27,18 @@ impl HyperliquidWebSocket {
     pub async fn connect(&mut self) -> Result<()> {
         tracing::debug!("Attempting WebSocket connection to: {}", self.ws_url);
 
-        let (ws_stream, response) = connect_async(&self.ws_url).await
-            .map_err(|e| {
-                tracing::error!("WebSocket connection error: {}", e);
-                tracing::debug!("WebSocket error details: {:?}", e);
-                anyhow::anyhow!("Failed to connect to WebSocket at {}: {}", self.ws_url, e)
-            })?;
+        let (ws_stream, response) = connect_async(&self.ws_url).await.map_err(|e| {
+            tracing::error!("WebSocket connection error: {}", e);
+            tracing::debug!("WebSocket error details: {:?}", e);
+            anyhow::anyhow!("Failed to connect to WebSocket at {}: {}", self.ws_url, e)
+        })?;
 
         self.stream = Some(ws_stream);
-        tracing::info!("WebSocket connected to {} (HTTP status: {})", self.ws_url, response.status());
+        tracing::info!(
+            "WebSocket connected to {} (HTTP status: {})",
+            self.ws_url,
+            response.status()
+        );
         Ok(())
     }
 
@@ -64,7 +67,9 @@ impl HyperliquidWebSocket {
             self.last_ping = std::time::Instant::now();
         }
 
-        let stream = self.stream.as_mut()
+        let stream = self
+            .stream
+            .as_mut()
             .ok_or_else(|| anyhow::anyhow!("WebSocket not connected"))?;
 
         if let Some(msg) = stream.next().await {

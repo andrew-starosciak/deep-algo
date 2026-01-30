@@ -38,9 +38,7 @@ impl BotDatabase {
             .await?;
 
         // Run migrations
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -57,9 +55,7 @@ impl BotDatabase {
             .connect("sqlite::memory:")
             .await?;
 
-        sqlx::migrate!("./migrations")
-            .run(&pool)
-            .await?;
+        sqlx::migrate!("./migrations").run(&pool).await?;
 
         Ok(Self { pool })
     }
@@ -84,7 +80,7 @@ impl BotDatabase {
             ON CONFLICT(bot_id) DO UPDATE SET
                 config_json = excluded.config_json,
                 updated_at = excluded.updated_at
-            "
+            ",
         )
         .bind(&config.bot_id)
         .bind(config_json)
@@ -102,7 +98,7 @@ impl BotDatabase {
     /// Returns error if database query or deserialization fails.
     pub async fn load_all_bots(&self) -> Result<Vec<BotConfig>> {
         let rows = sqlx::query_as::<_, (String,)>(
-            "SELECT config_json FROM bot_configs ORDER BY created_at DESC"
+            "SELECT config_json FROM bot_configs ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -143,7 +139,7 @@ impl BotDatabase {
                 state = excluded.state,
                 started_at = excluded.started_at,
                 last_heartbeat = excluded.last_heartbeat
-            "
+            ",
         )
         .bind(bot_id)
         .bind(state)
@@ -187,7 +183,7 @@ impl BotDatabase {
     /// Returns error if database query or deserialization fails.
     pub async fn get_enabled_bots(&self) -> Result<Vec<BotConfig>> {
         let rows = sqlx::query_as::<_, (String,)>(
-            "SELECT config_json FROM bot_configs WHERE enabled = 1 ORDER BY created_at DESC"
+            "SELECT config_json FROM bot_configs WHERE enabled = 1 ORDER BY created_at DESC",
         )
         .fetch_all(&self.pool)
         .await?;

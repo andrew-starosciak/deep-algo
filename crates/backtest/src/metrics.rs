@@ -115,16 +115,22 @@ impl MetricsCalculator {
         #[allow(clippy::cast_precision_loss)]
         let returns_len_f64 = self.returns.len() as f64;
 
-        let mean_return: f64 = self.returns.iter()
+        let mean_return: f64 = self
+            .returns
+            .iter()
             .map(|r| r.to_string().parse::<f64>().unwrap_or(0.0))
-            .sum::<f64>() / returns_len_f64;
+            .sum::<f64>()
+            / returns_len_f64;
 
-        let variance: f64 = self.returns.iter()
+        let variance: f64 = self
+            .returns
+            .iter()
             .map(|r| {
                 let val = r.to_string().parse::<f64>().unwrap_or(0.0);
                 (val - mean_return).powi(2)
             })
-            .sum::<f64>() / returns_len_f64;
+            .sum::<f64>()
+            / returns_len_f64;
 
         let std_dev = variance.sqrt();
         let sharpe_ratio = if std_dev > 0.0 {

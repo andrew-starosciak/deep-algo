@@ -29,9 +29,9 @@ pub struct KellySizer {
 impl Default for KellySizer {
     fn default() -> Self {
         Self {
-            fraction: Decimal::new(25, 2), // 0.25 (quarter Kelly)
+            fraction: Decimal::new(25, 2),  // 0.25 (quarter Kelly)
             max_bet: Decimal::new(1000, 0), // $1000
-            min_edge: Decimal::new(1, 2),  // 0.01 (1% minimum edge)
+            min_edge: Decimal::new(1, 2),   // 0.01 (1% minimum edge)
         }
     }
 }

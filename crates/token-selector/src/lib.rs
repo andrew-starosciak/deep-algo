@@ -1,3 +1,3 @@
 mod selector;
 
-pub use selector::{TokenSelector, TokenSelectionCriteria, TokenSelectionResult};
+pub use selector::{TokenSelectionCriteria, TokenSelectionResult, TokenSelector};
