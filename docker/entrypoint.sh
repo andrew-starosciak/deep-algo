@@ -12,6 +12,12 @@ if [ "$(id -u)" = "0" ]; then
     exec gosu algotrader "$0" "$@"
 fi
 
+# If command arguments are passed (e.g., from docker-compose command:), execute them directly
+if [ $# -gt 0 ]; then
+    echo "Running command: algo-trade $@"
+    exec algo-trade "$@"
+fi
+
 # Function to handle graceful shutdown
 shutdown() {
     echo "Shutting down gracefully..."
