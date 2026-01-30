@@ -8,6 +8,7 @@ pub mod liquidation;
 pub mod news;
 pub mod orderbook;
 pub mod polymarket;
+pub mod signal_snapshot;
 pub mod trade;
 
 pub use funding::{FundingBias, FundingRateRecord};
@@ -17,6 +18,7 @@ pub use liquidation::{
 pub use news::{NewsEventRecord, NewsSentiment, NewsSignalDirection};
 pub use orderbook::OrderBookSnapshotRecord;
 pub use polymarket::PolymarketOddsRecord;
+pub use signal_snapshot::{SignalDirection, SignalSnapshotRecord};
 pub use trade::{BinaryTradeRecord, TradeDirection, TradeOutcome};
 
 #[cfg(test)]

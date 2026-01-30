@@ -25,7 +25,7 @@ use async_trait::async_trait;
 /// # Example
 ///
 /// ```rust,no_run
-/// use algo_trade_exchange_hyperliquid::PaperTradingExecutionHandler;
+/// use algo_trade_hyperliquid::PaperTradingExecutionHandler;
 ///
 /// let handler = PaperTradingExecutionHandler::new(0.001, 10.0);
 /// // Use with LiveDataProvider for paper trading with live data
@@ -50,7 +50,7 @@ impl PaperTradingExecutionHandler {
     /// # Example
     ///
     /// ```rust
-    /// use algo_trade_exchange_hyperliquid::PaperTradingExecutionHandler;
+    /// use algo_trade_hyperliquid::PaperTradingExecutionHandler;
     ///
     /// // Conservative defaults
     /// let handler = PaperTradingExecutionHandler::new(0.00025, 10.0);

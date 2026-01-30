@@ -1,13 +1,22 @@
 pub mod collector;
 pub mod common;
+pub mod context_builder;
 pub mod funding;
 pub mod generator;
 pub mod liquidations;
+pub mod registry;
 pub mod trades;
+pub mod validation;
 
 // Re-export signal generators for convenience
 pub use generator::{
-    CompositeSignal, FundingRateSignal, LiquidationCascadeSignal, OrderBookImbalanceSignal,
+    adjust_weights_for_multicollinearity, calculate_correlation_matrix, calculate_imbalance_zscore,
+    calculate_net_delta, calculate_news_impact, calculate_time_decay, calculate_weighted_imbalance,
+    combine_bayesian, default_category_weights, detect_exhaustion, detect_reversal, detect_walls,
+    is_cascade, parse_sentiment, percentile_signal, CascadeConfig, CombinationMethod,
+    CompositeSignal, CorrelationMatrix, ExhaustionConfig, ExhaustionSignal, FundingRateSignal,
+    FundingReversalConfig, FundingSignalMode, LiquidationCascadeSignal, LiquidationSignalMode,
+    NewsSignal, OrderBookImbalanceSignal, ReversalSignal, Side, Wall, WallDetectionConfig,
 };
 
 // Re-export collectors for convenience
@@ -15,4 +24,17 @@ pub use collector::{
     calculate_urgency, categorize_news, determine_sentiment, CollectorConfig, CollectorEvent,
     CollectorStats, FundingCollector, LiquidationCollector, LiquidationCollectorConfig,
     NewsCategory, NewsCollector, NewsCollectorConfig, OrderBookCollector, RollingWindows,
+};
+
+// Re-export registry
+pub use registry::SignalRegistry;
+
+// Re-export context builder
+pub use context_builder::SignalContextBuilder;
+
+// Re-export validation framework
+pub use validation::{
+    analyze_signal_correlation, calculate_ic, calculate_ranks, determine_recommendation,
+    test_directional_accuracy, test_return_significance, CorrelationAnalysis, ICAnalysis,
+    Recommendation, SignificanceTest, TestType, ValidationReport, ValidationResult,
 };

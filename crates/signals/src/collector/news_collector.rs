@@ -132,17 +132,54 @@ pub fn categorize_news(title: &str) -> Vec<NewsCategory> {
     let mut categories = Vec::new();
 
     // Check each category's keywords
-    let hack_keywords = ["hack", "exploit", "vulnerability", "breach", "attack", "stolen"];
-    let regulation_keywords = ["sec", "regulation", "ban", "legal", "court", "lawsuit", "congress", "cftc"];
-    let whale_keywords = ["whale", "large", "million", "billion", "dormant", "massive", "huge"];
-    let etf_keywords = ["etf", "fund", "blackrock", "fidelity", "grayscale", "ishares"];
-    let exchange_keywords = ["binance", "coinbase", "kraken", "exchange", "listing", "delist"];
-    let technical_keywords = ["halving", "difficulty", "hashrate", "mining", "block", "mempool"];
+    let hack_keywords = [
+        "hack",
+        "exploit",
+        "vulnerability",
+        "breach",
+        "attack",
+        "stolen",
+    ];
+    let regulation_keywords = [
+        "sec",
+        "regulation",
+        "ban",
+        "legal",
+        "court",
+        "lawsuit",
+        "congress",
+        "cftc",
+    ];
+    let whale_keywords = [
+        "whale", "large", "million", "billion", "dormant", "massive", "huge",
+    ];
+    let etf_keywords = [
+        "etf",
+        "fund",
+        "blackrock",
+        "fidelity",
+        "grayscale",
+        "ishares",
+    ];
+    let exchange_keywords = [
+        "binance", "coinbase", "kraken", "exchange", "listing", "delist",
+    ];
+    let technical_keywords = [
+        "halving",
+        "difficulty",
+        "hashrate",
+        "mining",
+        "block",
+        "mempool",
+    ];
 
     if hack_keywords.iter().any(|kw| title_lower.contains(kw)) {
         categories.push(NewsCategory::Hack);
     }
-    if regulation_keywords.iter().any(|kw| title_lower.contains(kw)) {
+    if regulation_keywords
+        .iter()
+        .any(|kw| title_lower.contains(kw))
+    {
         categories.push(NewsCategory::Regulation);
     }
     if whale_keywords.iter().any(|kw| title_lower.contains(kw)) {
@@ -180,7 +217,11 @@ pub fn categorize_news(title: &str) -> Vec<NewsCategory> {
 /// - At 0 hours: 100% of base urgency
 /// - At 7 hours: ~50% of base urgency
 /// - At 23 hours: ~10% of base urgency
-pub fn calculate_urgency(categories: &[NewsCategory], published_at: DateTime<Utc>, now: DateTime<Utc>) -> Decimal {
+pub fn calculate_urgency(
+    categories: &[NewsCategory],
+    published_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Decimal {
     if categories.is_empty() {
         return Decimal::ZERO;
     }
@@ -290,9 +331,12 @@ impl NewsCollector {
     /// Fetches news from the API.
     pub async fn fetch_news(&self) -> Result<Vec<CryptoPanicPost>> {
         let url = self.build_url();
-        tracing::debug!("Fetching news from: {}", url);
+        // Log URL without exposing API key
+        tracing::debug!("Fetching news from: {}/posts/", self.base_url);
 
-        let response = self.http.get(&url)
+        let response = self
+            .http
+            .get(&url)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -308,7 +352,11 @@ impl NewsCollector {
     }
 
     /// Processes a single news post into a record.
-    pub fn process_post(&self, post: &CryptoPanicPost, now: DateTime<Utc>) -> Option<NewsEventRecord> {
+    pub fn process_post(
+        &self,
+        post: &CryptoPanicPost,
+        now: DateTime<Utc>,
+    ) -> Option<NewsEventRecord> {
         // Parse published time
         let published_at = DateTime::parse_from_rfc3339(&post.published_at)
             .map(|dt| dt.with_timezone(&Utc))
@@ -322,18 +370,22 @@ impl NewsCollector {
 
         // Categorize
         let categories = categorize_news(&post.title);
-        let category_strs: Vec<String> = categories.iter().map(|c| c.as_str().to_string()).collect();
+        let category_strs: Vec<String> =
+            categories.iter().map(|c| c.as_str().to_string()).collect();
 
         // Calculate urgency
         let urgency = calculate_urgency(&categories, published_at, now);
 
         // Determine sentiment from votes
-        let sentiment = post.votes.as_ref().map(|v| {
-            determine_sentiment(v.positive, v.negative)
-        }).unwrap_or(NewsSentiment::Neutral);
+        let sentiment = post
+            .votes
+            .as_ref()
+            .map(|v| determine_sentiment(v.positive, v.negative))
+            .unwrap_or(NewsSentiment::Neutral);
 
         // Extract currencies
-        let currencies: Vec<String> = post.currencies
+        let currencies: Vec<String> = post
+            .currencies
             .as_ref()
             .map(|c| c.iter().map(|curr| curr.code.clone()).collect())
             .unwrap_or_default();
@@ -350,7 +402,7 @@ impl NewsCollector {
                     "kind": post.kind,
                     "source": post.source,
                     "votes": post.votes,
-                }))
+                })),
         )
     }
 
@@ -542,8 +594,7 @@ mod tests {
 
     #[test]
     fn test_config_with_poll_interval() {
-        let config = NewsCollectorConfig::new("key")
-            .with_poll_interval(Duration::from_secs(30));
+        let config = NewsCollectorConfig::new("key").with_poll_interval(Duration::from_secs(30));
 
         assert_eq!(config.poll_interval, Duration::from_secs(30));
     }
@@ -558,16 +609,14 @@ mod tests {
 
     #[test]
     fn test_config_with_filter() {
-        let config = NewsCollectorConfig::new("key")
-            .with_filter(Some("rising".to_string()));
+        let config = NewsCollectorConfig::new("key").with_filter(Some("rising".to_string()));
 
         assert_eq!(config.filter, Some("rising".to_string()));
     }
 
     #[test]
     fn test_config_with_max_age() {
-        let config = NewsCollectorConfig::new("key")
-            .with_max_age(ChronoDuration::hours(12));
+        let config = NewsCollectorConfig::new("key").with_max_age(ChronoDuration::hours(12));
 
         assert_eq!(config.max_age, ChronoDuration::hours(12));
     }
@@ -875,16 +924,23 @@ mod tests {
 
         assert_eq!(record.title, "Major Bitcoin hack discovered");
         assert_eq!(record.source, "cryptopanic");
-        assert!(record.categories.as_ref().unwrap().contains(&"hack".to_string()));
-        assert!(record.currencies.as_ref().unwrap().contains(&"BTC".to_string()));
+        assert!(record
+            .categories
+            .as_ref()
+            .unwrap()
+            .contains(&"hack".to_string()));
+        assert!(record
+            .currencies
+            .as_ref()
+            .unwrap()
+            .contains(&"BTC".to_string()));
         assert_eq!(record.sentiment, Some("positive".to_string()));
         assert!(record.urgency_score.is_some());
     }
 
     #[test]
     fn test_process_post_too_old() {
-        let config = NewsCollectorConfig::new("key")
-            .with_max_age(ChronoDuration::hours(1));
+        let config = NewsCollectorConfig::new("key").with_max_age(ChronoDuration::hours(1));
         let (tx, _rx) = mpsc::channel::<NewsEventRecord>(100);
         let collector = NewsCollector::new(config, tx);
 

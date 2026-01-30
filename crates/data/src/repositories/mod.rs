@@ -8,6 +8,7 @@ pub mod liquidation_repo;
 pub mod news_repo;
 pub mod orderbook_repo;
 pub mod polymarket_repo;
+pub mod signal_snapshot_repo;
 pub mod trade_repo;
 
 pub use funding_repo::FundingRateRepository;
@@ -15,6 +16,7 @@ pub use liquidation_repo::LiquidationRepository;
 pub use news_repo::NewsEventRepository;
 pub use orderbook_repo::OrderBookRepository;
 pub use polymarket_repo::PolymarketOddsRepository;
+pub use signal_snapshot_repo::{SignalSnapshotRepository, ValidationStats};
 pub use trade_repo::BinaryTradeRepository;
 
 use sqlx::PgPool;
@@ -27,6 +29,7 @@ pub struct Repositories {
     pub polymarket: PolymarketOddsRepository,
     pub news: NewsEventRepository,
     pub trades: BinaryTradeRepository,
+    pub signal_snapshots: SignalSnapshotRepository,
 }
 
 impl Repositories {
@@ -39,7 +42,8 @@ impl Repositories {
             liquidation: LiquidationRepository::new(pool.clone()),
             polymarket: PolymarketOddsRepository::new(pool.clone()),
             news: NewsEventRepository::new(pool.clone()),
-            trades: BinaryTradeRepository::new(pool),
+            trades: BinaryTradeRepository::new(pool.clone()),
+            signal_snapshots: SignalSnapshotRepository::new(pool),
         }
     }
 }
