@@ -8,6 +8,40 @@ use chrono::{DateTime, Utc};
 use clap::Args;
 use rust_decimal::Decimal;
 
+/// Price source for return calculations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PriceSource {
+    /// Use OHLCV close prices (default, more reliable)
+    #[default]
+    Ohlcv,
+    /// Use order book mid prices (real-time snapshots)
+    Orderbook,
+}
+
+impl std::str::FromStr for PriceSource {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "ohlcv" | "candle" | "candles" => Ok(PriceSource::Ohlcv),
+            "orderbook" | "ob" | "midprice" => Ok(PriceSource::Orderbook),
+            _ => Err(anyhow!(
+                "Invalid price source: '{}'. Valid values: ohlcv, orderbook",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for PriceSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PriceSource::Ohlcv => write!(f, "ohlcv"),
+            PriceSource::Orderbook => write!(f, "orderbook"),
+        }
+    }
+}
+
 /// Arguments for the calculate-returns command.
 #[derive(Args, Debug, Clone)]
 pub struct CalculateReturnsArgs {
@@ -38,6 +72,11 @@ pub struct CalculateReturnsArgs {
     /// Batch size for updates (default: 1000)
     #[arg(long, default_value = "1000")]
     pub batch_size: i64,
+
+    /// Price source for return calculations (default: ohlcv)
+    /// Valid values: ohlcv (OHLCV close prices), orderbook (mid prices)
+    #[arg(long, default_value = "ohlcv")]
+    pub price_source: String,
 
     /// Database connection URL (uses DATABASE_URL env var if not provided)
     #[arg(long, env = "DATABASE_URL")]
@@ -102,8 +141,9 @@ impl ReturnStats {
 /// # Errors
 /// Returns an error if database connection fails or queries fail.
 pub async fn run_calculate_returns(args: CalculateReturnsArgs) -> Result<()> {
-    use algo_trade_data::{OrderBookRepository, SignalSnapshotRepository};
+    use algo_trade_data::{OhlcvRepository, OrderBookRepository, SignalSnapshotRepository};
     use sqlx::postgres::PgPoolOptions;
+    use std::str::FromStr;
 
     // Parse arguments
     let start: DateTime<Utc> = args
@@ -118,6 +158,8 @@ pub async fn run_calculate_returns(args: CalculateReturnsArgs) -> Result<()> {
     if start >= end {
         return Err(anyhow!("Start time must be before end time"));
     }
+
+    let price_source = PriceSource::from_str(&args.price_source)?;
 
     // Calculate the cutoff: snapshots need T+forward_minutes to have a price
     let effective_end = end - chrono::Duration::minutes(args.forward_minutes);
@@ -135,6 +177,7 @@ pub async fn run_calculate_returns(args: CalculateReturnsArgs) -> Result<()> {
         start.format("%Y-%m-%d %H:%M"),
         end.format("%Y-%m-%d %H:%M")
     );
+    tracing::info!("Price source: {}", price_source);
 
     // Get database URL
     let db_url = args
@@ -153,6 +196,7 @@ pub async fn run_calculate_returns(args: CalculateReturnsArgs) -> Result<()> {
     // Create repositories
     let snapshot_repo = SignalSnapshotRepository::new(pool.clone());
     let orderbook_repo = OrderBookRepository::new(pool.clone());
+    let ohlcv_repo = OhlcvRepository::new(pool.clone());
 
     // Track statistics
     let mut stats = ReturnStats::new();
@@ -183,25 +227,58 @@ pub async fn run_calculate_returns(args: CalculateReturnsArgs) -> Result<()> {
             };
 
             // Query price at T0 (snapshot timestamp)
-            let price_t0 = orderbook_repo
-                .query_mid_price_at(
-                    &args.symbol,
-                    &args.exchange,
-                    snapshot.timestamp,
-                    args.max_lookback_seconds,
-                )
-                .await?;
+            let price_t0 = match price_source {
+                PriceSource::Ohlcv => {
+                    ohlcv_repo
+                        .query_close_price_at(
+                            &args.symbol,
+                            &args.exchange,
+                            snapshot.timestamp,
+                            args.max_lookback_seconds,
+                        )
+                        .await?
+                }
+                PriceSource::Orderbook => {
+                    orderbook_repo
+                        .query_mid_price_at(
+                            &args.symbol,
+                            &args.exchange,
+                            snapshot.timestamp,
+                            args.max_lookback_seconds,
+                        )
+                        .await?
+                }
+            };
 
-            // Query price at T+15m
-            let t15 = snapshot.timestamp + chrono::Duration::minutes(args.forward_minutes);
-            let price_t15 = orderbook_repo
-                .query_mid_price_at(&args.symbol, &args.exchange, t15, args.max_lookback_seconds)
-                .await?;
+            // Query price at T+forward_minutes
+            let t_forward = snapshot.timestamp + chrono::Duration::minutes(args.forward_minutes);
+            let price_t_forward = match price_source {
+                PriceSource::Ohlcv => {
+                    ohlcv_repo
+                        .query_close_price_at(
+                            &args.symbol,
+                            &args.exchange,
+                            t_forward,
+                            args.max_lookback_seconds,
+                        )
+                        .await?
+                }
+                PriceSource::Orderbook => {
+                    orderbook_repo
+                        .query_mid_price_at(
+                            &args.symbol,
+                            &args.exchange,
+                            t_forward,
+                            args.max_lookback_seconds,
+                        )
+                        .await?
+                }
+            };
 
             // Calculate return if both prices available
-            match (price_t0, price_t15) {
-                (Some(p0), Some(p15)) => {
-                    let forward_return = calculate_return(p0, p15);
+            match (price_t0, price_t_forward) {
+                (Some(p0), Some(p_forward)) => {
+                    let forward_return = calculate_return(p0, p_forward);
                     updates.push((id, forward_return));
                     stats.calculated += 1;
                 }
@@ -366,5 +443,65 @@ mod tests {
         let t15 = t0 + chrono::Duration::minutes(forward_minutes);
 
         assert_eq!(t15, Utc.with_ymd_and_hms(2026, 1, 30, 10, 15, 0).unwrap());
+    }
+
+    // ============================================
+    // PriceSource Tests
+    // ============================================
+
+    #[test]
+    fn price_source_default_is_ohlcv() {
+        let source = PriceSource::default();
+        assert_eq!(source, PriceSource::Ohlcv);
+    }
+
+    #[test]
+    fn price_source_from_str_ohlcv() {
+        use std::str::FromStr;
+
+        assert_eq!(PriceSource::from_str("ohlcv").unwrap(), PriceSource::Ohlcv);
+        assert_eq!(PriceSource::from_str("OHLCV").unwrap(), PriceSource::Ohlcv);
+        assert_eq!(PriceSource::from_str("candle").unwrap(), PriceSource::Ohlcv);
+        assert_eq!(
+            PriceSource::from_str("candles").unwrap(),
+            PriceSource::Ohlcv
+        );
+    }
+
+    #[test]
+    fn price_source_from_str_orderbook() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            PriceSource::from_str("orderbook").unwrap(),
+            PriceSource::Orderbook
+        );
+        assert_eq!(
+            PriceSource::from_str("ORDERBOOK").unwrap(),
+            PriceSource::Orderbook
+        );
+        assert_eq!(PriceSource::from_str("ob").unwrap(), PriceSource::Orderbook);
+        assert_eq!(
+            PriceSource::from_str("midprice").unwrap(),
+            PriceSource::Orderbook
+        );
+    }
+
+    #[test]
+    fn price_source_from_str_invalid() {
+        use std::str::FromStr;
+
+        let result = PriceSource::from_str("invalid");
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid price source"));
+    }
+
+    #[test]
+    fn price_source_display() {
+        assert_eq!(format!("{}", PriceSource::Ohlcv), "ohlcv");
+        assert_eq!(format!("{}", PriceSource::Orderbook), "orderbook");
     }
 }

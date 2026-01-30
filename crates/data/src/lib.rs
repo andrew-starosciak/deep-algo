@@ -28,6 +28,6 @@ pub use models::{
 // Re-export repositories
 pub use repositories::{
     BinaryTradeRepository, FundingRateRepository, LiquidationRepository, NewsEventRepository,
-    OrderBookRepository, PolymarketOddsRepository, Repositories, SignalSnapshotRepository,
-    ValidationStats,
+    OhlcvRepository, OrderBookRepository, PolymarketOddsRepository, Repositories,
+    SignalSnapshotRepository, ValidationStats,
 };

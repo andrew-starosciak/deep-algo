@@ -13,6 +13,7 @@ services:
       - timescale-data:/var/lib/postgresql/data
       - ./scripts/setup_timescale.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./scripts/migrations/V001__phase1_tables.sql:/docker-entrypoint-initdb.d/02-phase1.sql:ro
+      - ./scripts/migrations/V002__signal_snapshots.sql:/docker-entrypoint-initdb.d/03-signal-snapshots.sql:ro
     secrets:
       - db_password
     healthcheck:

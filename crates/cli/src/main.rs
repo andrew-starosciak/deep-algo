@@ -6,7 +6,8 @@ mod tui_backtest_manager;
 mod tui_live_bot;
 
 use commands::{
-    BackfillSignalsArgs, CalculateReturnsArgs, CollectSignalsArgs, ValidateSignalsArgs,
+    BackfillOhlcvArgs, BackfillSignalsArgs, CalculateReturnsArgs, CollectSignalsArgs,
+    ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -110,6 +111,8 @@ enum Commands {
     CollectSignals(CollectSignalsArgs),
     /// Backfill historical signals from stored data
     BackfillSignals(BackfillSignalsArgs),
+    /// Backfill historical OHLCV data from Binance Futures
+    BackfillOhlcv(BackfillOhlcvArgs),
     /// Calculate forward returns for signal snapshots
     CalculateReturns(CalculateReturnsArgs),
     /// Generate validation reports for signals
@@ -203,6 +206,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::BackfillSignals(args) => {
             commands::run_backfill_signals(args).await?;
+        }
+        Commands::BackfillOhlcv(args) => {
+            commands::run_backfill_ohlcv(args).await?;
         }
         Commands::CalculateReturns(args) => {
             commands::run_calculate_returns(args).await?;
