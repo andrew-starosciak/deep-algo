@@ -5,7 +5,9 @@ mod tui_backtest;
 mod tui_backtest_manager;
 mod tui_live_bot;
 
-use commands::CollectSignalsArgs;
+use commands::{
+    BackfillSignalsArgs, CalculateReturnsArgs, CollectSignalsArgs, ValidateSignalsArgs,
+};
 
 #[derive(Parser)]
 #[command(name = "algo-trade")]
@@ -106,6 +108,12 @@ enum Commands {
     },
     /// Collect real-time signal data from multiple sources
     CollectSignals(CollectSignalsArgs),
+    /// Backfill historical signals from stored data
+    BackfillSignals(BackfillSignalsArgs),
+    /// Calculate forward returns for signal snapshots
+    CalculateReturns(CalculateReturnsArgs),
+    /// Generate validation reports for signals
+    ValidateSignals(ValidateSignalsArgs),
 }
 
 #[tokio::main]
@@ -192,6 +200,15 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::CollectSignals(args) => {
             commands::run_collect_signals(args).await?;
+        }
+        Commands::BackfillSignals(args) => {
+            commands::run_backfill_signals(args).await?;
+        }
+        Commands::CalculateReturns(args) => {
+            commands::run_calculate_returns(args).await?;
+        }
+        Commands::ValidateSignals(args) => {
+            commands::run_validate_signals(args).await?;
         }
     }
 

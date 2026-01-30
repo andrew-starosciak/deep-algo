@@ -35,7 +35,7 @@ impl ValidationResult {
 }
 
 /// Recommendation based on validation results.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Recommendation {
     /// Signal approved for production use (p < 0.05)
     Approved,

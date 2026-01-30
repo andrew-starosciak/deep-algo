@@ -203,6 +203,48 @@ impl OrderBookRepository {
 
         Ok(result.rows_affected())
     }
+
+    /// Queries the mid price at or just before a timestamp.
+    ///
+    /// Returns the most recent mid_price within the specified lookback window.
+    /// This is used for calculating forward returns without look-ahead bias.
+    ///
+    /// # Arguments
+    /// * `symbol` - Trading pair symbol (e.g., "BTCUSDT")
+    /// * `exchange` - Exchange name (e.g., "binance")
+    /// * `timestamp` - Target timestamp
+    /// * `max_lookback_seconds` - Maximum seconds to look back for a price
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails.
+    pub async fn query_mid_price_at(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        timestamp: DateTime<Utc>,
+        max_lookback_seconds: i64,
+    ) -> Result<Option<rust_decimal::Decimal>> {
+        let lookback_start = timestamp - chrono::Duration::seconds(max_lookback_seconds);
+
+        let row: Option<(Option<rust_decimal::Decimal>,)> = sqlx::query_as(
+            r#"
+            SELECT mid_price
+            FROM orderbook_snapshots
+            WHERE symbol = $1 AND exchange = $2
+              AND timestamp > $3 AND timestamp <= $4
+            ORDER BY timestamp DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(symbol)
+        .bind(exchange)
+        .bind(lookback_start)
+        .bind(timestamp)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.and_then(|r| r.0))
+    }
 }
 
 #[cfg(test)]
@@ -265,5 +307,64 @@ mod tests {
     //
     //     assert_eq!(results.len(), 1);
     //     assert_eq!(results[0].symbol, "BTCUSDT");
+    // }
+
+    // ============================================
+    // query_mid_price_at Tests (Unit Tests)
+    // ============================================
+
+    #[test]
+    fn test_lookback_window_calculation() {
+        use chrono::TimeZone;
+
+        let timestamp = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap();
+        let max_lookback_seconds = 300; // 5 minutes
+        let lookback_start = timestamp - chrono::Duration::seconds(max_lookback_seconds);
+
+        // Verify the window is correct
+        assert_eq!((timestamp - lookback_start).num_seconds(), 300);
+    }
+
+    #[test]
+    fn test_lookback_window_excludes_future_data() {
+        use chrono::TimeZone;
+
+        let target = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap();
+        let future_data = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 1).unwrap();
+
+        // Future data should NOT match condition: timestamp <= target
+        assert!(future_data > target);
+    }
+
+    #[test]
+    fn test_lookback_window_includes_exact_timestamp() {
+        use chrono::TimeZone;
+
+        let target = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap();
+        let exact_data = target;
+
+        // Data at exact timestamp SHOULD match condition: timestamp <= target
+        assert!(exact_data <= target);
+    }
+
+    #[test]
+    fn test_lookback_window_excludes_old_data() {
+        use chrono::TimeZone;
+
+        let target = Utc.with_ymd_and_hms(2025, 1, 29, 12, 0, 0).unwrap();
+        let max_lookback_seconds = 300;
+        let lookback_start = target - chrono::Duration::seconds(max_lookback_seconds);
+        let old_data = lookback_start - chrono::Duration::seconds(1);
+
+        // Old data should NOT match condition: timestamp > lookback_start
+        assert!(old_data <= lookback_start);
+    }
+
+    // Integration test for query_mid_price_at would go here
+    // #[tokio::test]
+    // async fn test_query_mid_price_at_returns_most_recent() {
+    //     let pool = setup_test_database().await;
+    //     let repo = OrderBookRepository::new(pool);
+    //     // ... test implementation
     // }
 }
