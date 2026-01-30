@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde_json::Value as JsonValue;
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{postgres::PgPoolOptions, PgPool};
 
 pub struct DatabaseClient {
     pool: PgPool,
@@ -25,10 +25,7 @@ impl DatabaseClient {
     ///
     /// # Errors
     /// Returns an error if the database transaction fails or any record insertion fails.
-    pub async fn insert_ohlcv_batch(
-        &self,
-        records: Vec<OhlcvRecord>,
-    ) -> Result<()> {
+    pub async fn insert_ohlcv_batch(&self, records: Vec<OhlcvRecord>) -> Result<()> {
         let mut tx = self.pool.begin().await?;
 
         for record in records {
@@ -86,10 +83,7 @@ impl DatabaseClient {
     ///
     /// # Errors
     /// Returns an error if the database insertion fails.
-    pub async fn insert_backtest_result(
-        &self,
-        record: BacktestResultRecord,
-    ) -> Result<()> {
+    pub async fn insert_backtest_result(&self, record: BacktestResultRecord) -> Result<()> {
         sqlx::query(
             r"
             INSERT INTO backtest_results

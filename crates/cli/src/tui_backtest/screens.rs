@@ -33,7 +33,11 @@ fn render_strategy_selection(f: &mut Frame, app: &App) {
 
     // Title
     let title = Paragraph::new("Select Strategy")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -49,13 +53,16 @@ fn render_strategy_selection(f: &mut Frame, app: &App) {
             } else {
                 Style::default()
             };
-            let marker = if i == app.selected_strategy_index { "● " } else { "○ " };
+            let marker = if i == app.selected_strategy_index {
+                "● "
+            } else {
+                "○ "
+            };
             ListItem::new(format!("{marker}{strategy}")).style(style)
         })
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Strategies"));
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Strategies"));
     f.render_widget(list, chunks[1]);
 
     // Instructions
@@ -80,7 +87,11 @@ fn render_token_selection(f: &mut Frame, app: &App) {
         "Select Tokens ({} selected)",
         app.selected_tokens.len()
     ))
-    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -111,8 +122,7 @@ fn render_token_selection(f: &mut Frame, app: &App) {
             })
             .collect();
 
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title("Tokens"));
+        let list = List::new(items).block(Block::default().borders(Borders::ALL).title("Tokens"));
         f.render_widget(list, chunks[1]);
     }
 
@@ -138,27 +148,65 @@ fn build_date_line<'a>(
 ) -> Line<'a> {
     use super::DateField;
 
-    let cyan = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let cyan = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let normal = Style::default();
 
     Line::from(vec![
         Span::raw(prefix),
-        Span::styled(year, if editing_date_field == Some(DateField::Year) { cyan } else { normal }),
+        Span::styled(
+            year,
+            if editing_date_field == Some(DateField::Year) {
+                cyan
+            } else {
+                normal
+            },
+        ),
         Span::raw("-"),
-        Span::styled(month, if editing_date_field == Some(DateField::Month) { cyan } else { normal }),
+        Span::styled(
+            month,
+            if editing_date_field == Some(DateField::Month) {
+                cyan
+            } else {
+                normal
+            },
+        ),
         Span::raw("-"),
-        Span::styled(day, if editing_date_field == Some(DateField::Day) { cyan } else { normal }),
+        Span::styled(
+            day,
+            if editing_date_field == Some(DateField::Day) {
+                cyan
+            } else {
+                normal
+            },
+        ),
         Span::raw(" "),
-        Span::styled(hour, if editing_date_field == Some(DateField::Hour) { cyan } else { normal }),
+        Span::styled(
+            hour,
+            if editing_date_field == Some(DateField::Hour) {
+                cyan
+            } else {
+                normal
+            },
+        ),
         Span::raw(":"),
-        Span::styled(minute, if editing_date_field == Some(DateField::Minute) { cyan } else { normal }),
+        Span::styled(
+            minute,
+            if editing_date_field == Some(DateField::Minute) {
+                cyan
+            } else {
+                normal
+            },
+        ),
     ])
 }
 
 /// Build interval text with option highlighting
 fn build_interval_text(app: &App) -> String {
     if app.editing_field == Some(super::TimeframeField::Interval) {
-        let options_str = app.interval_options
+        let options_str = app
+            .interval_options
             .iter()
             .enumerate()
             .map(|(i, opt)| {
@@ -190,7 +238,11 @@ fn render_timeframe_config(f: &mut Frame, app: &App) {
 
     // Title
     let title = Paragraph::new("Configure Timeframe")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -211,19 +263,20 @@ fn render_timeframe_config(f: &mut Frame, app: &App) {
     let start_line = if start_is_editing {
         build_date_line(
             "Start: ",
-            &app.start_year, &app.start_month, &app.start_day,
-            &app.start_hour, &app.start_minute,
-            app.editing_date_field
+            &app.start_year,
+            &app.start_month,
+            &app.start_day,
+            &app.start_hour,
+            &app.start_minute,
+            app.editing_date_field,
         )
     } else {
         Line::from(format!(
             "Start: {}-{}-{} {}:{}",
-            app.start_year, app.start_month, app.start_day,
-            app.start_hour, app.start_minute
+            app.start_year, app.start_month, app.start_day, app.start_hour, app.start_minute
         ))
     };
-    let start_field = Paragraph::new(start_line)
-        .block(Block::default().borders(Borders::ALL));
+    let start_field = Paragraph::new(start_line).block(Block::default().borders(Borders::ALL));
     f.render_widget(start_field, form_chunks[0]);
 
     // End date field
@@ -231,25 +284,28 @@ fn render_timeframe_config(f: &mut Frame, app: &App) {
     let end_line = if end_is_editing {
         build_date_line(
             "End:   ",
-            &app.end_year, &app.end_month, &app.end_day,
-            &app.end_hour, &app.end_minute,
-            app.editing_date_field
+            &app.end_year,
+            &app.end_month,
+            &app.end_day,
+            &app.end_hour,
+            &app.end_minute,
+            app.editing_date_field,
         )
     } else {
         Line::from(format!(
             "End:   {}-{}-{} {}:{}",
-            app.end_year, app.end_month, app.end_day,
-            app.end_hour, app.end_minute
+            app.end_year, app.end_month, app.end_day, app.end_hour, app.end_minute
         ))
     };
-    let end_field = Paragraph::new(end_line)
-        .block(Block::default().borders(Borders::ALL));
+    let end_field = Paragraph::new(end_line).block(Block::default().borders(Borders::ALL));
     f.render_widget(end_field, form_chunks[1]);
 
     // Interval selector
     let interval_text = build_interval_text(app);
     let interval_style = if app.editing_field == Some(TimeframeField::Interval) {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -287,7 +343,9 @@ fn build_ma_crossover_edit_lines(
         };
         spans.push(Span::styled(
             text,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         spans.push(Span::raw(fast.to_string()));
@@ -302,7 +360,9 @@ fn build_ma_crossover_edit_lines(
         };
         spans.push(Span::styled(
             text,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
         spans.push(Span::raw(slow.to_string()));
@@ -346,7 +406,9 @@ fn build_quad_ma_edit_lines(
             };
             line1_spans.push(Span::styled(
                 text,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ));
         } else {
             line1_spans.push(Span::raw(value.to_string()));
@@ -358,7 +420,11 @@ fn build_quad_ma_edit_lines(
         (ParamField::VolumeFactor, volume_factor, ", Vol: "),
         (ParamField::TakeProfit, take_profit, ", TP: "),
         (ParamField::StopLoss, stop_loss, ", SL: "),
-        (ParamField::ReversalConfirmBars, reversal_confirmation_bars, ", RevConf: "),
+        (
+            ParamField::ReversalConfirmBars,
+            reversal_confirmation_bars,
+            ", RevConf: ",
+        ),
     ];
 
     let mut line2_spans = Vec::new();
@@ -372,7 +438,9 @@ fn build_quad_ma_edit_lines(
             };
             line2_spans.push(Span::styled(
                 text,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ));
         } else {
             line2_spans.push(Span::raw(value.to_string()));
@@ -383,12 +451,7 @@ fn build_quad_ma_edit_lines(
 }
 
 /// Build parameter list item for a configuration
-fn build_param_list_item(
-    i: usize,
-    config: &super::ParamConfig,
-    app: &App,
-) -> ListItem<'static> {
-
+fn build_param_list_item(i: usize, config: &super::ParamConfig, app: &App) -> ListItem<'static> {
     let is_selected = i == app.selected_param_index;
     let style = if is_selected {
         Style::default().bg(Color::Blue).fg(Color::White)
@@ -402,20 +465,46 @@ fn build_param_list_item(
             super::StrategyType::MaCrossover { fast, slow } => {
                 build_ma_crossover_edit_lines(*fast, *slow, editing_field, &app.param_input_buffer)
             }
-            super::StrategyType::QuadMa { ma1, ma2, ma3, ma4, trend_period, volume_factor, take_profit, stop_loss, reversal_confirmation_bars } => {
-                build_quad_ma_edit_lines(
-                    *ma1, *ma2, *ma3, *ma4, *trend_period, *volume_factor,
-                    *take_profit, *stop_loss, *reversal_confirmation_bars,
-                    editing_field, &app.param_input_buffer
-                )
-            }
+            super::StrategyType::QuadMa {
+                ma1,
+                ma2,
+                ma3,
+                ma4,
+                trend_period,
+                volume_factor,
+                take_profit,
+                stop_loss,
+                reversal_confirmation_bars,
+            } => build_quad_ma_edit_lines(
+                *ma1,
+                *ma2,
+                *ma3,
+                *ma4,
+                *trend_period,
+                *volume_factor,
+                *take_profit,
+                *stop_loss,
+                *reversal_confirmation_bars,
+                editing_field,
+                &app.param_input_buffer,
+            ),
         }
     } else {
         match &config.strategy {
             super::StrategyType::MaCrossover { fast, slow } => {
                 vec![Line::from(format!("Fast: {fast}, Slow: {slow}"))]
             }
-            super::StrategyType::QuadMa { ma1, ma2, ma3, ma4, trend_period, volume_factor, take_profit, stop_loss, reversal_confirmation_bars } => {
+            super::StrategyType::QuadMa {
+                ma1,
+                ma2,
+                ma3,
+                ma4,
+                trend_period,
+                volume_factor,
+                take_profit,
+                stop_loss,
+                reversal_confirmation_bars,
+            } => {
                 vec![
                     Line::from(format!("MA1: {ma1}, MA2: {ma2}, MA3: {ma3}, MA4: {ma4}")),
                     Line::from(format!("Trend: {trend_period}, Vol: {volume_factor}, TP: {take_profit}, SL: {stop_loss}, RevConf: {reversal_confirmation_bars}")),
@@ -426,7 +515,7 @@ fn build_param_list_item(
 
     let mut lines = vec![Line::from(Span::styled(
         config.name.clone(),
-        Style::default().add_modifier(Modifier::BOLD)
+        Style::default().add_modifier(Modifier::BOLD),
     ))];
     lines.extend(params_lines);
 
@@ -437,9 +526,9 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(10),    // Config list
-            Constraint::Length(6),  // Instructions
+            Constraint::Length(3), // Title
+            Constraint::Min(10),   // Config list
+            Constraint::Length(6), // Instructions
         ])
         .split(f.area());
 
@@ -448,7 +537,11 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
         "Parameter Configurations ({} configs)",
         app.param_configs.len()
     ))
-    .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+    .style(
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )
     .alignment(Alignment::Center)
     .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -461,8 +554,11 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
         .map(|(i, config)| build_param_list_item(i, config, app))
         .collect();
 
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Configurations"));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Configurations"),
+    );
     f.render_widget(list, chunks[1]);
 
     // Instructions
@@ -494,17 +590,21 @@ fn render_running(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Length(3),  // Progress bar
-            Constraint::Length(3),  // Current backtest
-            Constraint::Min(5),     // Status messages
-            Constraint::Length(3),  // Instructions
+            Constraint::Length(3), // Title
+            Constraint::Length(3), // Progress bar
+            Constraint::Length(3), // Current backtest
+            Constraint::Min(5),    // Status messages
+            Constraint::Length(3), // Instructions
         ])
         .split(f.area());
 
     // Title
     let title = Paragraph::new("Running Backtests")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -541,7 +641,8 @@ fn render_running(f: &mut Frame, app: &App) {
     f.render_widget(info, chunks[2]);
 
     // Status messages (last 5)
-    let status_lines: Vec<Line> = app.status_messages
+    let status_lines: Vec<Line> = app
+        .status_messages
         .iter()
         .rev()
         .take(5)
@@ -582,9 +683,9 @@ fn calculate_profit_factor(trades: &[super::TradeRecord]) -> f64 {
     if gross_loss > Decimal::ZERO {
         (gross_profit / gross_loss).to_f64().unwrap_or(0.0)
     } else if gross_profit > Decimal::ZERO {
-        999.0  // All wins, no losses - display as "999+"
+        999.0 // All wins, no losses - display as "999+"
     } else {
-        0.0  // No closed trades
+        0.0 // No closed trades
     }
 }
 
@@ -593,33 +694,85 @@ fn render_results(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(10),    // Results table
-            Constraint::Length(4),  // Instructions
+            Constraint::Length(3), // Title
+            Constraint::Min(10),   // Results table
+            Constraint::Length(4), // Instructions
         ])
         .split(f.area());
 
     // Title
     let title = Paragraph::new(format!("Results ({} backtests)", app.results.len()))
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
     // Results table
     let header_cells = [
-        if app.sort_column == 0 { format!("Token {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Token".to_string() },
-        if app.sort_column == 1 { format!("Config {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Config".to_string() },
-        if app.sort_column == 2 { format!("Ret% {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Ret%".to_string() },
-        if app.sort_column == 3 { format!("Ret$ {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Ret$".to_string() },
-        if app.sort_column == 4 { format!("DD% {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "DD%".to_string() },
-        if app.sort_column == 5 { format!("Shrp {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Shrp".to_string() },
-        if app.sort_column == 6 { format!("#Tr {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "#Tr".to_string() },
-        if app.sort_column == 7 { format!("Win% {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Win%".to_string() },
-        if app.sort_column == 8 { format!("Fin$ {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Fin$".to_string() },
-        if app.sort_column == 9 { format!("Peak$ {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "Peak$".to_string() },
-        if app.sort_column == 10 { format!("B&H% {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "B&H%".to_string() },
-        if app.sort_column == 11 { format!("PF {}", if app.sort_ascending { "↑" } else { "↓" }) } else { "PF".to_string() },
+        if app.sort_column == 0 {
+            format!("Token {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Token".to_string()
+        },
+        if app.sort_column == 1 {
+            format!("Config {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Config".to_string()
+        },
+        if app.sort_column == 2 {
+            format!("Ret% {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Ret%".to_string()
+        },
+        if app.sort_column == 3 {
+            format!("Ret$ {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Ret$".to_string()
+        },
+        if app.sort_column == 4 {
+            format!("DD% {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "DD%".to_string()
+        },
+        if app.sort_column == 5 {
+            format!("Shrp {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Shrp".to_string()
+        },
+        if app.sort_column == 6 {
+            format!("#Tr {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "#Tr".to_string()
+        },
+        if app.sort_column == 7 {
+            format!("Win% {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Win%".to_string()
+        },
+        if app.sort_column == 8 {
+            format!("Fin$ {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Fin$".to_string()
+        },
+        if app.sort_column == 9 {
+            format!("Peak$ {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "Peak$".to_string()
+        },
+        if app.sort_column == 10 {
+            format!("B&H% {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "B&H%".to_string()
+        },
+        if app.sort_column == 11 {
+            format!("PF {}", if app.sort_ascending { "↑" } else { "↓" })
+        } else {
+            "PF".to_string()
+        },
     ];
 
     let header = Row::new(header_cells)
@@ -637,18 +790,29 @@ fn render_results(f: &mut Frame, app: &App) {
             };
 
             // Get extended metrics from embedded PerformanceMetrics
-            let (return_dollars, final_capital, equity_peak, buy_hold_pct) = result.metrics.as_ref().map_or_else(
-                || ("—".to_string(), "—".to_string(), "—".to_string(), "—".to_string()),
-                |metrics| {
-                    let ret_dollars = metrics.final_capital - metrics.initial_capital;
-                    (
-                        format!("{:.2}", ret_dollars.to_f64().unwrap_or(0.0)),
-                        format!("{:.2}", metrics.final_capital.to_f64().unwrap_or(0.0)),
-                        format!("{:.2}", metrics.equity_peak.to_f64().unwrap_or(0.0)),
-                        format!("{:.2}", metrics.buy_hold_return.to_f64().unwrap_or(0.0) * 100.0),
-                    )
-                }
-            );
+            let (return_dollars, final_capital, equity_peak, buy_hold_pct) =
+                result.metrics.as_ref().map_or_else(
+                    || {
+                        (
+                            "—".to_string(),
+                            "—".to_string(),
+                            "—".to_string(),
+                            "—".to_string(),
+                        )
+                    },
+                    |metrics| {
+                        let ret_dollars = metrics.final_capital - metrics.initial_capital;
+                        (
+                            format!("{:.2}", ret_dollars.to_f64().unwrap_or(0.0)),
+                            format!("{:.2}", metrics.final_capital.to_f64().unwrap_or(0.0)),
+                            format!("{:.2}", metrics.equity_peak.to_f64().unwrap_or(0.0)),
+                            format!(
+                                "{:.2}",
+                                metrics.buy_hold_return.to_f64().unwrap_or(0.0) * 100.0
+                            ),
+                        )
+                    },
+                );
 
             // Calculate Profit Factor from trades
             let profit_factor = calculate_profit_factor(&result.trades);
@@ -681,28 +845,34 @@ fn render_results(f: &mut Frame, app: &App) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(8),   // Token
-            Constraint::Length(12),  // Config
-            Constraint::Length(7),   // Ret%
-            Constraint::Length(9),   // Ret$
-            Constraint::Length(7),   // DD%
-            Constraint::Length(6),   // Shrp
-            Constraint::Length(5),   // #Tr
-            Constraint::Length(6),   // Win%
-            Constraint::Length(9),   // Fin$
-            Constraint::Length(9),   // Peak$
-            Constraint::Length(7),   // B&H%
-            Constraint::Length(6),   // PF
+            Constraint::Length(8),  // Token
+            Constraint::Length(12), // Config
+            Constraint::Length(7),  // Ret%
+            Constraint::Length(9),  // Ret$
+            Constraint::Length(7),  // DD%
+            Constraint::Length(6),  // Shrp
+            Constraint::Length(5),  // #Tr
+            Constraint::Length(6),  // Win%
+            Constraint::Length(9),  // Fin$
+            Constraint::Length(9),  // Peak$
+            Constraint::Length(7),  // B&H%
+            Constraint::Length(6),  // PF
         ],
     )
     .header(header)
-    .block(Block::default().borders(Borders::ALL).title("Backtest Results"));
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Backtest Results"),
+    );
 
     f.render_widget(table, chunks[1]);
 
     // Instructions
     let instructions = Paragraph::new(vec![
-        Line::from("↑↓: Scroll | Enter: View Trades | m: View Metrics | s: Change Sort | r: Reverse Sort"),
+        Line::from(
+            "↑↓: Scroll | Enter: View Trades | m: View Metrics | s: Change Sort | r: Reverse Sort",
+        ),
         Line::from("b: Back to Start | q: Quit"),
     ])
     .alignment(Alignment::Center)
@@ -715,50 +885,71 @@ fn render_trade_detail(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(10),    // Trades table
-            Constraint::Length(3),  // Instructions
+            Constraint::Length(3), // Title
+            Constraint::Min(10),   // Trades table
+            Constraint::Length(3), // Instructions
         ])
         .split(f.area());
 
     // Get selected result
-    let result = app.selected_result_index
+    let result = app
+        .selected_result_index
         .and_then(|idx| app.results.get(idx));
 
     let title_text = result.map_or_else(
         || "Trade History".to_string(),
-        |r| format!("Trade History: {} - {} ({} trades)", r.token, r.config_name, r.trades.len())
+        |r| {
+            format!(
+                "Trade History: {} - {} ({} trades)",
+                r.token,
+                r.config_name,
+                r.trades.len()
+            )
+        },
     );
 
     // Title
     let title = Paragraph::new(title_text)
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
     // Trades table
     if let Some(r) = result {
-        let header = Row::new(vec!["Timestamp", "Action", "Price", "Quantity", "Value (USDC)", "PnL", "Commission"])
-            .style(Style::default().add_modifier(Modifier::BOLD))
-            .bottom_margin(1);
+        let header = Row::new(vec![
+            "Timestamp",
+            "Action",
+            "Price",
+            "Quantity",
+            "Value (USDC)",
+            "PnL",
+            "Commission",
+        ])
+        .style(Style::default().add_modifier(Modifier::BOLD))
+        .bottom_margin(1);
 
-        let rows: Vec<Row> = r.trades
+        let rows: Vec<Row> = r
+            .trades
             .iter()
             .skip(app.trade_scroll_offset)
             .map(|trade| {
                 // Color based on action type
                 let action_color = if trade.action.contains("LONG") {
                     if trade.action.starts_with("CLOSE") {
-                        Color::Blue  // Closing long
+                        Color::Blue // Closing long
                     } else {
-                        Color::Green  // Open/Add long
+                        Color::Green // Open/Add long
                     }
                 } else if trade.action.contains("SHORT") {
                     if trade.action.starts_with("CLOSE") {
-                        Color::Blue  // Closing short
+                        Color::Blue // Closing short
                     } else {
-                        Color::Red  // Open/Add short
+                        Color::Red // Open/Add short
                     }
                 } else {
                     Color::White
@@ -776,34 +967,39 @@ fn render_trade_detail(f: &mut Frame, app: &App) {
                         } else {
                             ("$0.00".to_string(), Color::White)
                         }
-                    }
+                    },
                 );
 
                 Row::new(vec![
                     Span::styled(
                         trade.timestamp.format("%Y-%m-%d %H:%M:%S").to_string(),
-                        Style::default().fg(action_color)
+                        Style::default().fg(action_color),
                     ),
                     Span::styled(
                         trade.action.clone(),
-                        Style::default().fg(action_color).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(action_color)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!("${:.2}", trade.price.to_f64().unwrap_or(0.0)),
-                        Style::default().fg(action_color)
+                        Style::default().fg(action_color),
                     ),
                     Span::styled(
                         format!("{:.8}", trade.quantity.to_f64().unwrap_or(0.0)),
-                        Style::default().fg(action_color)
+                        Style::default().fg(action_color),
                     ),
                     Span::styled(
                         format!("${:.2}", trade.position_value.to_f64().unwrap_or(0.0)),
-                        Style::default().fg(action_color)
+                        Style::default().fg(action_color),
                     ),
-                    Span::styled(pnl_text, Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        pnl_text,
+                        Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("${:.4}", trade.commission.to_f64().unwrap_or(0.0)),
-                        Style::default().fg(action_color)
+                        Style::default().fg(action_color),
                     ),
                 ])
             })
@@ -844,24 +1040,29 @@ fn render_metrics_detail(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),  // Title
-            Constraint::Min(10),    // Metrics content
-            Constraint::Length(3),  // Instructions
+            Constraint::Length(3), // Title
+            Constraint::Min(10),   // Metrics content
+            Constraint::Length(3), // Instructions
         ])
         .split(f.area());
 
     // Get selected result
-    let result = app.selected_result_index
+    let result = app
+        .selected_result_index
         .and_then(|idx| app.results.get(idx));
 
     let title_text = result.map_or_else(
         || "Performance Metrics".to_string(),
-        |r| format!("Performance Metrics: {} - {}", r.token, r.config_name)
+        |r| format!("Performance Metrics: {} - {}", r.token, r.config_name),
     );
 
     // Title
     let title = Paragraph::new(title_text)
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -886,49 +1087,93 @@ fn render_metrics_detail(f: &mut Frame, app: &App) {
                     Span::raw(format!("{duration_days} days {duration_hours} hours")),
                 ]),
                 Line::from(vec![
-                    Span::styled("Exposure Time: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Exposure Time: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(format!("{exposure_pct:.1}%")),
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Initial Capital: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(format!("${:.2}", metrics.initial_capital.to_f64().unwrap_or(0.0))),
+                    Span::styled(
+                        "Initial Capital: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(
+                        "${:.2}",
+                        metrics.initial_capital.to_f64().unwrap_or(0.0)
+                    )),
                 ]),
                 Line::from(vec![
-                    Span::styled("Final Capital: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(format!("${:.2}", metrics.final_capital.to_f64().unwrap_or(0.0))),
+                    Span::styled(
+                        "Final Capital: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(
+                        "${:.2}",
+                        metrics.final_capital.to_f64().unwrap_or(0.0)
+                    )),
                 ]),
                 Line::from(vec![
-                    Span::styled("Equity Peak: ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(format!("${:.2}", metrics.equity_peak.to_f64().unwrap_or(0.0))),
+                    Span::styled(
+                        "Equity Peak: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(format!(
+                        "${:.2}",
+                        metrics.equity_peak.to_f64().unwrap_or(0.0)
+                    )),
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Total Return: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Total Return: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("{total_return_pct:+.2}%"),
-                        if total_return_pct >= 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) }
+                        if total_return_pct >= 0.0 {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Red)
+                        },
                     ),
                 ]),
                 Line::from(vec![
-                    Span::styled("Buy & Hold: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Buy & Hold: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(
                         format!("{buy_hold_pct:+.2}%"),
-                        if buy_hold_pct >= 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) }
+                        if buy_hold_pct >= 0.0 {
+                            Style::default().fg(Color::Green)
+                        } else {
+                            Style::default().fg(Color::Red)
+                        },
                     ),
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Sharpe Ratio: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Sharpe Ratio: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(format!("{:.2}", metrics.sharpe_ratio)),
                 ]),
                 Line::from(vec![
-                    Span::styled("Max Drawdown: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Max Drawdown: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::styled(format!("{max_dd_pct:.2}%"), Style::default().fg(Color::Red)),
                 ]),
                 Line::from(""),
                 Line::from(vec![
-                    Span::styled("Total Trades: ", Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        "Total Trades: ",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
                     Span::raw(format!("{}", metrics.num_trades)),
                 ]),
                 Line::from(vec![

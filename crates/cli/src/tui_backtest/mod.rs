@@ -20,28 +20,31 @@ use std::io;
 #[derive(Debug, Clone)]
 pub struct TradeRecord {
     pub timestamp: DateTime<Utc>,
-    pub action: String,  // "OPEN LONG" | "ADD LONG" | "CLOSE LONG" | "OPEN SHORT" | "ADD SHORT" | "CLOSE SHORT"
+    pub action: String, // "OPEN LONG" | "ADD LONG" | "CLOSE LONG" | "OPEN SHORT" | "ADD SHORT" | "CLOSE SHORT"
     pub price: rust_decimal::Decimal,
     pub quantity: rust_decimal::Decimal,
     pub commission: rust_decimal::Decimal,
-    pub pnl: Option<rust_decimal::Decimal>,  // PnL for closing trades, None for opening
-    pub position_value: rust_decimal::Decimal,  // quantity × price in USDC
+    pub pnl: Option<rust_decimal::Decimal>, // PnL for closing trades, None for opening
+    pub position_value: rust_decimal::Decimal, // quantity × price in USDC
 }
 
 /// Strategy configuration
 #[derive(Debug, Clone)]
 pub enum StrategyType {
-    MaCrossover { fast: usize, slow: usize },
+    MaCrossover {
+        fast: usize,
+        slow: usize,
+    },
     QuadMa {
         ma1: usize,
         ma2: usize,
         ma3: usize,
         ma4: usize,
         trend_period: usize,
-        volume_factor: usize,  // hundredths (150 = 1.5x)
-        take_profit: usize,    // basis points (200 = 2.0%)
-        stop_loss: usize,      // basis points (100 = 1.0%)
-        reversal_confirmation_bars: usize,  // bars to confirm reversal (2 = default)
+        volume_factor: usize,              // hundredths (150 = 1.5x)
+        take_profit: usize,                // basis points (200 = 2.0%)
+        stop_loss: usize,                  // basis points (100 = 1.0%)
+        reversal_confirmation_bars: usize, // bars to confirm reversal (2 = default)
     },
 }
 
@@ -92,10 +95,10 @@ impl ParamConfig {
                 ma3: 20,
                 ma4: 50,
                 trend_period: 100,
-                volume_factor: 150,  // 1.5x
-                take_profit: 200,    // 2.0%
-                stop_loss: 100,      // 1.0%
-                reversal_confirmation_bars: 2,  // 2 bars confirmation
+                volume_factor: 150,            // 1.5x
+                take_profit: 200,              // 2.0%
+                stop_loss: 100,                // 1.0%
+                reversal_confirmation_bars: 2, // 2 bars confirmation
             },
         }
     }
@@ -232,9 +235,9 @@ fn calculate_profit_factor(trades: &[TradeRecord]) -> f64 {
     if gross_loss > Decimal::ZERO {
         (gross_profit / gross_loss).to_f64().unwrap_or(0.0)
     } else if gross_profit > Decimal::ZERO {
-        999.0  // All wins, no losses - display as "999+"
+        999.0 // All wins, no losses - display as "999+"
     } else {
-        0.0  // No closed trades
+        0.0 // No closed trades
     }
 }
 
@@ -389,10 +392,14 @@ impl App {
     fn get_date_field_mut(&mut self) -> Option<&mut String> {
         match (self.editing_field, self.editing_date_field) {
             (Some(TimeframeField::StartDate), Some(DateField::Year)) => Some(&mut self.start_year),
-            (Some(TimeframeField::StartDate), Some(DateField::Month)) => Some(&mut self.start_month),
+            (Some(TimeframeField::StartDate), Some(DateField::Month)) => {
+                Some(&mut self.start_month)
+            }
             (Some(TimeframeField::StartDate), Some(DateField::Day)) => Some(&mut self.start_day),
             (Some(TimeframeField::StartDate), Some(DateField::Hour)) => Some(&mut self.start_hour),
-            (Some(TimeframeField::StartDate), Some(DateField::Minute)) => Some(&mut self.start_minute),
+            (Some(TimeframeField::StartDate), Some(DateField::Minute)) => {
+                Some(&mut self.start_minute)
+            }
             (Some(TimeframeField::EndDate), Some(DateField::Year)) => Some(&mut self.end_year),
             (Some(TimeframeField::EndDate), Some(DateField::Month)) => Some(&mut self.end_month),
             (Some(TimeframeField::EndDate), Some(DateField::Day)) => Some(&mut self.end_day),
@@ -423,7 +430,10 @@ impl App {
             });
 
             // When entering a date field, auto-initialize to Year component
-            if matches!(new_field, Some(TimeframeField::StartDate | TimeframeField::EndDate)) {
+            if matches!(
+                new_field,
+                Some(TimeframeField::StartDate | TimeframeField::EndDate)
+            ) {
                 self.editing_date_field = Some(DateField::Year);
             } else {
                 self.editing_date_field = None;
@@ -458,13 +468,11 @@ impl App {
 
         let start_str = format!(
             "{}-{}-{}T{}:{}:00Z",
-            self.start_year, self.start_month, self.start_day,
-            self.start_hour, self.start_minute
+            self.start_year, self.start_month, self.start_day, self.start_hour, self.start_minute
         );
         let end_str = format!(
             "{}-{}-{}T{}:{}:00Z",
-            self.end_year, self.end_month, self.end_day,
-            self.end_hour, self.end_minute
+            self.end_year, self.end_month, self.end_day, self.end_hour, self.end_minute
         );
 
         if let (Ok(start), Ok(end)) = (
@@ -516,16 +524,34 @@ impl App {
 
     fn increment_date_field(&mut self, increment: bool) {
         let (field_ref, max_val) = match (self.editing_field, self.editing_date_field) {
-            (Some(TimeframeField::StartDate), Some(DateField::Year)) => (Some(&mut self.start_year), 9999),
-            (Some(TimeframeField::StartDate), Some(DateField::Month)) => (Some(&mut self.start_month), 12),
-            (Some(TimeframeField::StartDate), Some(DateField::Day)) => (Some(&mut self.start_day), 31),
-            (Some(TimeframeField::StartDate), Some(DateField::Hour)) => (Some(&mut self.start_hour), 23),
-            (Some(TimeframeField::StartDate), Some(DateField::Minute)) => (Some(&mut self.start_minute), 59),
-            (Some(TimeframeField::EndDate), Some(DateField::Year)) => (Some(&mut self.end_year), 9999),
-            (Some(TimeframeField::EndDate), Some(DateField::Month)) => (Some(&mut self.end_month), 12),
+            (Some(TimeframeField::StartDate), Some(DateField::Year)) => {
+                (Some(&mut self.start_year), 9999)
+            }
+            (Some(TimeframeField::StartDate), Some(DateField::Month)) => {
+                (Some(&mut self.start_month), 12)
+            }
+            (Some(TimeframeField::StartDate), Some(DateField::Day)) => {
+                (Some(&mut self.start_day), 31)
+            }
+            (Some(TimeframeField::StartDate), Some(DateField::Hour)) => {
+                (Some(&mut self.start_hour), 23)
+            }
+            (Some(TimeframeField::StartDate), Some(DateField::Minute)) => {
+                (Some(&mut self.start_minute), 59)
+            }
+            (Some(TimeframeField::EndDate), Some(DateField::Year)) => {
+                (Some(&mut self.end_year), 9999)
+            }
+            (Some(TimeframeField::EndDate), Some(DateField::Month)) => {
+                (Some(&mut self.end_month), 12)
+            }
             (Some(TimeframeField::EndDate), Some(DateField::Day)) => (Some(&mut self.end_day), 31),
-            (Some(TimeframeField::EndDate), Some(DateField::Hour)) => (Some(&mut self.end_hour), 23),
-            (Some(TimeframeField::EndDate), Some(DateField::Minute)) => (Some(&mut self.end_minute), 59),
+            (Some(TimeframeField::EndDate), Some(DateField::Hour)) => {
+                (Some(&mut self.end_hour), 23)
+            }
+            (Some(TimeframeField::EndDate), Some(DateField::Minute)) => {
+                (Some(&mut self.end_minute), 59)
+            }
             _ => (None, 0),
         };
 
@@ -534,10 +560,23 @@ impl App {
                 if increment {
                     val = (val + 1).min(max_val);
                 } else {
-                    let min_val = usize::from(matches!(self.editing_date_field, Some(DateField::Month | DateField::Day)));
+                    let min_val = usize::from(matches!(
+                        self.editing_date_field,
+                        Some(DateField::Month | DateField::Day)
+                    ));
                     val = val.saturating_sub(1).max(min_val);
                 }
-                *field = format!("{:0width$}", val, width = field.len().max(if matches!(self.editing_date_field, Some(DateField::Year)) { 4 } else { 2 }));
+                *field = format!(
+                    "{:0width$}",
+                    val,
+                    width = field.len().max(
+                        if matches!(self.editing_date_field, Some(DateField::Year)) {
+                            4
+                        } else {
+                            2
+                        }
+                    )
+                );
             }
         }
     }
@@ -563,15 +602,16 @@ impl App {
             }
             KeyCode::Char('a') => {
                 // Add new config (copy of selected or default)
-                let new_config = if let Some(config) = self.param_configs.get(self.selected_param_index) {
-                    let mut new = config.clone();
-                    new.name = format!("Config {}", self.param_configs.len() + 1);
-                    new
-                } else if self.selected_strategy_index == 0 {
-                    ParamConfig::default_ma_crossover()
-                } else {
-                    ParamConfig::default_quad_ma()
-                };
+                let new_config =
+                    if let Some(config) = self.param_configs.get(self.selected_param_index) {
+                        let mut new = config.clone();
+                        new.name = format!("Config {}", self.param_configs.len() + 1);
+                        new
+                    } else if self.selected_strategy_index == 0 {
+                        ParamConfig::default_ma_crossover()
+                    } else {
+                        ParamConfig::default_quad_ma()
+                    };
                 self.param_configs.push(new_config);
             }
             KeyCode::Char('d') | KeyCode::Delete => {
@@ -613,19 +653,53 @@ impl App {
                 if !self.param_input_buffer.is_empty() {
                     if let Ok(value) = self.param_input_buffer.parse::<usize>() {
                         if value > 0 {
-                            if let Some(config) = self.param_configs.get_mut(self.selected_param_index) {
+                            if let Some(config) =
+                                self.param_configs.get_mut(self.selected_param_index)
+                            {
                                 match (&mut config.strategy, self.editing_param.unwrap()) {
-                                    (StrategyType::MaCrossover { fast, .. }, ParamField::FastPeriod) => *fast = value,
-                                    (StrategyType::MaCrossover { slow, .. }, ParamField::SlowPeriod) => *slow = value,
-                                    (StrategyType::QuadMa { ma1, .. }, ParamField::Ma1Period) => *ma1 = value,
-                                    (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => *ma2 = value,
-                                    (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => *ma3 = value,
-                                    (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => *ma4 = value,
-                                    (StrategyType::QuadMa { trend_period, .. }, ParamField::TrendPeriod) => *trend_period = value,
-                                    (StrategyType::QuadMa { volume_factor, .. }, ParamField::VolumeFactor) => *volume_factor = value,
-                                    (StrategyType::QuadMa { take_profit, .. }, ParamField::TakeProfit) => *take_profit = value,
-                                    (StrategyType::QuadMa { stop_loss, .. }, ParamField::StopLoss) => *stop_loss = value,
-                                    (StrategyType::QuadMa { reversal_confirmation_bars, .. }, ParamField::ReversalConfirmBars) => *reversal_confirmation_bars = value,
+                                    (
+                                        StrategyType::MaCrossover { fast, .. },
+                                        ParamField::FastPeriod,
+                                    ) => *fast = value,
+                                    (
+                                        StrategyType::MaCrossover { slow, .. },
+                                        ParamField::SlowPeriod,
+                                    ) => *slow = value,
+                                    (StrategyType::QuadMa { ma1, .. }, ParamField::Ma1Period) => {
+                                        *ma1 = value
+                                    }
+                                    (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => {
+                                        *ma2 = value
+                                    }
+                                    (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => {
+                                        *ma3 = value
+                                    }
+                                    (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => {
+                                        *ma4 = value
+                                    }
+                                    (
+                                        StrategyType::QuadMa { trend_period, .. },
+                                        ParamField::TrendPeriod,
+                                    ) => *trend_period = value,
+                                    (
+                                        StrategyType::QuadMa { volume_factor, .. },
+                                        ParamField::VolumeFactor,
+                                    ) => *volume_factor = value,
+                                    (
+                                        StrategyType::QuadMa { take_profit, .. },
+                                        ParamField::TakeProfit,
+                                    ) => *take_profit = value,
+                                    (
+                                        StrategyType::QuadMa { stop_loss, .. },
+                                        ParamField::StopLoss,
+                                    ) => *stop_loss = value,
+                                    (
+                                        StrategyType::QuadMa {
+                                            reversal_confirmation_bars,
+                                            ..
+                                        },
+                                        ParamField::ReversalConfirmBars,
+                                    ) => *reversal_confirmation_bars = value,
                                     _ => {}
                                 }
                             }
@@ -635,20 +709,43 @@ impl App {
 
                 // Cycle to next parameter field
                 if let Some(config) = self.param_configs.get(self.selected_param_index) {
-                    self.editing_param = Some(match (&config.strategy, self.editing_param.unwrap()) {
-                        (StrategyType::MaCrossover { .. }, ParamField::FastPeriod) => ParamField::SlowPeriod,
-                        (StrategyType::MaCrossover { .. }, ParamField::SlowPeriod) => ParamField::FastPeriod,
-                        (StrategyType::QuadMa { .. }, ParamField::Ma1Period) => ParamField::Ma2Period,
-                        (StrategyType::QuadMa { .. }, ParamField::Ma2Period) => ParamField::Ma3Period,
-                        (StrategyType::QuadMa { .. }, ParamField::Ma3Period) => ParamField::Ma4Period,
-                        (StrategyType::QuadMa { .. }, ParamField::Ma4Period) => ParamField::TrendPeriod,
-                        (StrategyType::QuadMa { .. }, ParamField::TrendPeriod) => ParamField::VolumeFactor,
-                        (StrategyType::QuadMa { .. }, ParamField::VolumeFactor) => ParamField::TakeProfit,
-                        (StrategyType::QuadMa { .. }, ParamField::TakeProfit) => ParamField::StopLoss,
-                        (StrategyType::QuadMa { .. }, ParamField::StopLoss) => ParamField::ReversalConfirmBars,
-                        (StrategyType::QuadMa { .. }, ParamField::ReversalConfirmBars) => ParamField::Ma1Period,
-                        _ => return, // Invalid combination
-                    });
+                    self.editing_param =
+                        Some(match (&config.strategy, self.editing_param.unwrap()) {
+                            (StrategyType::MaCrossover { .. }, ParamField::FastPeriod) => {
+                                ParamField::SlowPeriod
+                            }
+                            (StrategyType::MaCrossover { .. }, ParamField::SlowPeriod) => {
+                                ParamField::FastPeriod
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::Ma1Period) => {
+                                ParamField::Ma2Period
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::Ma2Period) => {
+                                ParamField::Ma3Period
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::Ma3Period) => {
+                                ParamField::Ma4Period
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::Ma4Period) => {
+                                ParamField::TrendPeriod
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::TrendPeriod) => {
+                                ParamField::VolumeFactor
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::VolumeFactor) => {
+                                ParamField::TakeProfit
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::TakeProfit) => {
+                                ParamField::StopLoss
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::StopLoss) => {
+                                ParamField::ReversalConfirmBars
+                            }
+                            (StrategyType::QuadMa { .. }, ParamField::ReversalConfirmBars) => {
+                                ParamField::Ma1Period
+                            }
+                            _ => return, // Invalid combination
+                        });
                     self.param_input_buffer.clear();
                 }
             }
@@ -664,19 +761,51 @@ impl App {
                 // Save the edit
                 if let Ok(value) = self.param_input_buffer.parse::<usize>() {
                     if value > 0 {
-                        if let Some(config) = self.param_configs.get_mut(self.selected_param_index) {
+                        if let Some(config) = self.param_configs.get_mut(self.selected_param_index)
+                        {
                             match (&mut config.strategy, self.editing_param.unwrap()) {
-                                (StrategyType::MaCrossover { fast, .. }, ParamField::FastPeriod) => *fast = value,
-                                (StrategyType::MaCrossover { slow, .. }, ParamField::SlowPeriod) => *slow = value,
-                                (StrategyType::QuadMa { ma1, .. }, ParamField::Ma1Period) => *ma1 = value,
-                                (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => *ma2 = value,
-                                (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => *ma3 = value,
-                                (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => *ma4 = value,
-                                (StrategyType::QuadMa { trend_period, .. }, ParamField::TrendPeriod) => *trend_period = value,
-                                (StrategyType::QuadMa { volume_factor, .. }, ParamField::VolumeFactor) => *volume_factor = value,
-                                (StrategyType::QuadMa { take_profit, .. }, ParamField::TakeProfit) => *take_profit = value,
-                                (StrategyType::QuadMa { stop_loss, .. }, ParamField::StopLoss) => *stop_loss = value,
-                                (StrategyType::QuadMa { reversal_confirmation_bars, .. }, ParamField::ReversalConfirmBars) => *reversal_confirmation_bars = value,
+                                (
+                                    StrategyType::MaCrossover { fast, .. },
+                                    ParamField::FastPeriod,
+                                ) => *fast = value,
+                                (
+                                    StrategyType::MaCrossover { slow, .. },
+                                    ParamField::SlowPeriod,
+                                ) => *slow = value,
+                                (StrategyType::QuadMa { ma1, .. }, ParamField::Ma1Period) => {
+                                    *ma1 = value
+                                }
+                                (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => {
+                                    *ma2 = value
+                                }
+                                (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => {
+                                    *ma3 = value
+                                }
+                                (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => {
+                                    *ma4 = value
+                                }
+                                (
+                                    StrategyType::QuadMa { trend_period, .. },
+                                    ParamField::TrendPeriod,
+                                ) => *trend_period = value,
+                                (
+                                    StrategyType::QuadMa { volume_factor, .. },
+                                    ParamField::VolumeFactor,
+                                ) => *volume_factor = value,
+                                (
+                                    StrategyType::QuadMa { take_profit, .. },
+                                    ParamField::TakeProfit,
+                                ) => *take_profit = value,
+                                (StrategyType::QuadMa { stop_loss, .. }, ParamField::StopLoss) => {
+                                    *stop_loss = value
+                                }
+                                (
+                                    StrategyType::QuadMa {
+                                        reversal_confirmation_bars,
+                                        ..
+                                    },
+                                    ParamField::ReversalConfirmBars,
+                                ) => *reversal_confirmation_bars = value,
                                 _ => {} // Invalid combination
                             }
                         }
@@ -762,14 +891,26 @@ impl App {
                 2 => a.total_return.cmp(&b.total_return),
                 3 => {
                     // Ret$ = final_capital - initial_capital
-                    let ret_a = a.metrics.as_ref().map(|m| m.final_capital - m.initial_capital);
-                    let ret_b = b.metrics.as_ref().map(|m| m.final_capital - m.initial_capital);
+                    let ret_a = a
+                        .metrics
+                        .as_ref()
+                        .map(|m| m.final_capital - m.initial_capital);
+                    let ret_b = b
+                        .metrics
+                        .as_ref()
+                        .map(|m| m.final_capital - m.initial_capital);
                     ret_a.cmp(&ret_b)
                 }
                 4 => a.max_drawdown.cmp(&b.max_drawdown),
-                5 => a.sharpe_ratio.partial_cmp(&b.sharpe_ratio).unwrap_or(std::cmp::Ordering::Equal),
+                5 => a
+                    .sharpe_ratio
+                    .partial_cmp(&b.sharpe_ratio)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 6 => a.num_trades.cmp(&b.num_trades),
-                7 => a.win_rate.partial_cmp(&b.win_rate).unwrap_or(std::cmp::Ordering::Equal),
+                7 => a
+                    .win_rate
+                    .partial_cmp(&b.win_rate)
+                    .unwrap_or(std::cmp::Ordering::Equal),
                 8 => {
                     // Fin$ = final_capital
                     let fin_a = a.metrics.as_ref().map(|m| m.final_capital);
@@ -844,11 +985,7 @@ fn interval_options_index(interval: &str) -> usize {
 }
 
 /// Main entry point for TUI application
-pub async fn run(
-    start: DateTime<Utc>,
-    end: DateTime<Utc>,
-    interval: String,
-) -> Result<()> {
+pub async fn run(start: DateTime<Utc>, end: DateTime<Utc>, interval: String) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -893,10 +1030,7 @@ pub async fn run(
     res
 }
 
-async fn run_app<B: Backend>(
-    terminal: &mut Terminal<B>,
-    app: &mut App,
-) -> Result<()> {
+async fn run_app<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| screens::render(f, app))?;
 
@@ -945,8 +1079,9 @@ async fn run_app<B: Backend>(
 
                     // Force redraw
                     let _ = terminal.draw(|f| screens::render(f, app));
-                }
-            ).await?;
+                },
+            )
+            .await?;
 
             app.results = results;
             app.current_screen = AppScreen::Results;

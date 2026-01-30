@@ -1,4 +1,6 @@
-use crate::common::{connect_websocket, format_time_eastern, format_usd, strip_usdt, BINANCE_FUTURES_WS};
+use crate::common::{
+    connect_websocket, format_time_eastern, format_usd, strip_usdt, BINANCE_FUTURES_WS,
+};
 use colored::Colorize;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -304,22 +306,20 @@ impl RecentTradesMonitor {
         let trade_type = if is_buyer_maker { "SELL" } else { "BUY" };
 
         let (color, stars) = if usd_size >= 500_000.0 {
-            (
-                if is_buyer_maker { "magenta" } else { "blue" },
-                "**",
-            )
+            (if is_buyer_maker { "magenta" } else { "blue" }, "**")
         } else if usd_size >= 100_000.0 {
-            (
-                if is_buyer_maker { "red" } else { "green" },
-                "*",
-            )
+            (if is_buyer_maker { "red" } else { "green" }, "*")
         } else {
             (if is_buyer_maker { "red" } else { "green" }, "")
         };
 
         let output = format!(
             "{} {} {} {} ${}",
-            stars, trade_type, symbol, time, format_usd(usd_size, 0)
+            stars,
+            trade_type,
+            symbol,
+            time,
+            format_usd(usd_size, 0)
         );
 
         let is_bold = usd_size >= 50_000.0;

@@ -1,4 +1,6 @@
-use algo_trade_bot_orchestrator::{BotConfig, BotEvent, BotRegistry, BotState, EnhancedBotStatus, ExecutionMode};
+use algo_trade_bot_orchestrator::{
+    BotConfig, BotEvent, BotRegistry, BotState, EnhancedBotStatus, ExecutionMode,
+};
 use algo_trade_hyperliquid::HyperliquidClient;
 use anyhow::Result;
 use chrono::Utc;
@@ -22,16 +24,19 @@ use std::sync::Arc;
 /// Strategy configuration (copied from backtest TUI)
 #[derive(Debug, Clone)]
 enum StrategyType {
-    MaCrossover { fast: usize, slow: usize },
+    MaCrossover {
+        fast: usize,
+        slow: usize,
+    },
     QuadMa {
         ma1: usize,
         ma2: usize,
         ma3: usize,
         ma4: usize,
         trend_period: usize,
-        volume_factor: usize,  // hundredths (150 = 1.5x)
-        take_profit: usize,    // basis points (200 = 2.0%)
-        stop_loss: usize,      // basis points (100 = 1.0%)
+        volume_factor: usize, // hundredths (150 = 1.5x)
+        take_profit: usize,   // basis points (200 = 2.0%)
+        stop_loss: usize,     // basis points (100 = 1.0%)
         reversal_confirmation_bars: usize,
     },
 }
@@ -145,7 +150,9 @@ impl App {
             cached_bots: Vec::new(),
             cached_bot_statuses: HashMap::new(),
             selected_bot: 0,
-            messages: vec!["Live Bot Manager - Press 'a' to add bot, 'v' to view bot, 'q' to quit".to_string()],
+            messages: vec![
+                "Live Bot Manager - Press 'a' to add bot, 'v' to view bot, 'q' to quit".to_string(),
+            ],
             monitored_bot_id: None,
             bot_events: Vec::new(),
             bot_status: None,
@@ -211,7 +218,8 @@ async fn run_app<B: ratatui::backend::Backend>(
             app.cached_bot_statuses.clear();
             for bot_id in &app.cached_bots {
                 if let Some(handle) = app.registry.get_bot(bot_id).await {
-                    app.cached_bot_statuses.insert(bot_id.clone(), handle.latest_status());
+                    app.cached_bot_statuses
+                        .insert(bot_id.clone(), handle.latest_status());
                 }
             }
         }
@@ -362,7 +370,9 @@ fn handle_strategy_selection_keys(key: crossterm::event::KeyEvent, app: &mut App
             app.current_screen = BotScreen::ParameterConfig;
             app.editing_param = None;
             app.param_input_buffer.clear();
-            app.add_message("Configure strategy parameters (Tab to edit, Enter when done)".to_string());
+            app.add_message(
+                "Configure strategy parameters (Tab to edit, Enter when done)".to_string(),
+            );
         }
         KeyCode::Up => {
             if app.selected_strategy_index > 0 {
@@ -393,7 +403,10 @@ fn handle_parameter_config_keys(key: crossterm::event::KeyEvent, app: &mut App) 
         }
         KeyCode::Tab => {
             // Cycle through editable fields
-            app.editing_param = Some(next_param_field(&app.param_config.strategy, app.editing_param));
+            app.editing_param = Some(next_param_field(
+                &app.param_config.strategy,
+                app.editing_param,
+            ));
             app.param_input_buffer.clear();
         }
         KeyCode::Char(c) if c.is_ascii_digit() && app.editing_param.is_some() => {
@@ -405,7 +418,11 @@ fn handle_parameter_config_keys(key: crossterm::event::KeyEvent, app: &mut App) 
         KeyCode::Enter if app.editing_param.is_some() => {
             // Apply edited value
             if let Ok(value) = app.param_input_buffer.parse::<usize>() {
-                apply_param_value(&mut app.param_config.strategy, app.editing_param.unwrap(), value);
+                apply_param_value(
+                    &mut app.param_config.strategy,
+                    app.editing_param.unwrap(),
+                    value,
+                );
             }
             app.editing_param = None;
             app.param_input_buffer.clear();
@@ -415,7 +432,10 @@ fn handle_parameter_config_keys(key: crossterm::event::KeyEvent, app: &mut App) 
     Ok(false)
 }
 
-async fn handle_token_selection_keys(key: crossterm::event::KeyEvent, app: &mut App) -> Result<bool> {
+async fn handle_token_selection_keys(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+) -> Result<bool> {
     match key.code {
         KeyCode::Esc => {
             app.current_screen = BotScreen::ParameterConfig;
@@ -449,8 +469,8 @@ async fn handle_token_selection_keys(key: crossterm::event::KeyEvent, app: &mut 
             app.selected_token_index = app.selected_token_index.saturating_sub(10);
         }
         KeyCode::PageDown => {
-            app.selected_token_index = (app.selected_token_index + 10)
-                .min(app.available_tokens.len().saturating_sub(1));
+            app.selected_token_index =
+                (app.selected_token_index + 10).min(app.available_tokens.len().saturating_sub(1));
         }
         _ => {}
     }
@@ -502,11 +522,21 @@ fn apply_param_value(strategy: &mut StrategyType, field: ParamField, value: usiz
         (StrategyType::QuadMa { ma2, .. }, ParamField::Ma2Period) => *ma2 = value,
         (StrategyType::QuadMa { ma3, .. }, ParamField::Ma3Period) => *ma3 = value,
         (StrategyType::QuadMa { ma4, .. }, ParamField::Ma4Period) => *ma4 = value,
-        (StrategyType::QuadMa { trend_period, .. }, ParamField::TrendPeriod) => *trend_period = value,
-        (StrategyType::QuadMa { volume_factor, .. }, ParamField::VolumeFactor) => *volume_factor = value,
+        (StrategyType::QuadMa { trend_period, .. }, ParamField::TrendPeriod) => {
+            *trend_period = value
+        }
+        (StrategyType::QuadMa { volume_factor, .. }, ParamField::VolumeFactor) => {
+            *volume_factor = value
+        }
         (StrategyType::QuadMa { take_profit, .. }, ParamField::TakeProfit) => *take_profit = value,
         (StrategyType::QuadMa { stop_loss, .. }, ParamField::StopLoss) => *stop_loss = value,
-        (StrategyType::QuadMa { reversal_confirmation_bars, .. }, ParamField::ReversalConfirmBars) => {
+        (
+            StrategyType::QuadMa {
+                reversal_confirmation_bars,
+                ..
+            },
+            ParamField::ReversalConfirmBars,
+        ) => {
             *reversal_confirmation_bars = value;
         }
         _ => {} // Mismatched strategy/field combination
@@ -626,7 +656,11 @@ fn execution_icon(mode: ExecutionMode) -> &'static str {
 
 /// Formats PnL with color (green for profit, red for loss)
 fn format_pnl(pnl_pct: f64) -> (String, Color) {
-    let color = if pnl_pct >= 0.0 { Color::Green } else { Color::Red };
+    let color = if pnl_pct >= 0.0 {
+        Color::Green
+    } else {
+        Color::Red
+    };
     let sign = if pnl_pct >= 0.0 { "+" } else { "" };
     (format!("{sign}{pnl_pct:.2}%"), color)
 }
@@ -663,7 +697,11 @@ fn render_bot_list(f: &mut Frame, app: &App) {
 
     // Title
     let title = Paragraph::new("Live Bot Manager")
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -684,11 +722,20 @@ fn render_bot_list(f: &mut Frame, app: &App) {
     }
 
     let summary_text = vec![
-        Span::styled(format!("{running} Running"), Style::default().fg(Color::Green)),
+        Span::styled(
+            format!("{running} Running"),
+            Style::default().fg(Color::Green),
+        ),
         Span::raw(" | "),
-        Span::styled(format!("{stopped} Stopped"), Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{stopped} Stopped"),
+            Style::default().fg(Color::Gray),
+        ),
         Span::raw(" | "),
-        Span::styled(format!("{paused} Paused"), Style::default().fg(Color::Yellow)),
+        Span::styled(
+            format!("{paused} Paused"),
+            Style::default().fg(Color::Yellow),
+        ),
         Span::raw(" | "),
         Span::styled(format!("{error} Error"), Style::default().fg(Color::Red)),
     ];
@@ -705,23 +752,27 @@ fn render_bot_list(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, bot_id)| {
             // Get bot status for color, icons, and metrics from cache
-            let (state_col, display_text) = if let Some(status) = app.cached_bot_statuses.get(bot_id) {
+            let (state_col, display_text) = if let Some(status) =
+                app.cached_bot_statuses.get(bot_id)
+            {
                 let state_col = state_color(&status.state);
                 let state_ico = state_icon(&status.state);
                 let exec_ico = execution_icon(status.execution_mode);
 
                 // Runtime display (only for running bots)
-                let runtime_str = if matches!(status.state, BotState::Running) && status.started_at.is_some() {
-                    format!(" | {}", format_duration(status.started_at.unwrap()))
-                } else {
-                    String::new()
-                };
+                let runtime_str =
+                    if matches!(status.state, BotState::Running) && status.started_at.is_some() {
+                        format!(" | {}", format_duration(status.started_at.unwrap()))
+                    } else {
+                        String::new()
+                    };
 
                 // Metrics display (trades and return)
                 let (pnl_str, _pnl_color) = format_pnl(status.total_return_pct);
                 let metrics_str = format!(" | {} trades | {}", status.num_trades, pnl_str);
 
-                let display_text = format!("{state_ico} {exec_ico} {bot_id}{runtime_str}{metrics_str}");
+                let display_text =
+                    format!("{state_ico} {exec_ico} {bot_id}{runtime_str}{metrics_str}");
                 (state_col, display_text)
             } else {
                 (Color::Gray, format!("? ? {bot_id}"))
@@ -729,7 +780,9 @@ fn render_bot_list(f: &mut Frame, app: &App) {
 
             // Highlight selected bot
             let style = if i == app.selected_bot {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(state_col)
             };
@@ -745,15 +798,21 @@ fn render_bot_list(f: &mut Frame, app: &App) {
     f.render_widget(list, chunks[2]);
 
     // Messages
-    let messages: Vec<Line> = app.messages.iter().map(|m| Line::from(m.as_str())).collect();
+    let messages: Vec<Line> = app
+        .messages
+        .iter()
+        .map(|m| Line::from(m.as_str()))
+        .collect();
     let messages_widget = Paragraph::new(messages)
         .block(Block::default().borders(Borders::ALL).title("Messages"))
         .wrap(ratatui::widgets::Wrap { trim: true });
     f.render_widget(messages_widget, chunks[3]);
 
     // Help
-    let help = Paragraph::new("a: Add Bot | v: View Bot | s: Start | x: Stop | r: Remove | ↑↓: Navigate | q: Quit")
-        .block(Block::default().borders(Borders::ALL).title("Help"));
+    let help = Paragraph::new(
+        "a: Add Bot | v: View Bot | s: Start | x: Stop | r: Remove | ↑↓: Navigate | q: Quit",
+    )
+    .block(Block::default().borders(Borders::ALL).title("Help"));
     f.render_widget(help, chunks[4]);
 }
 
@@ -761,19 +820,26 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),   // Title
-            Constraint::Length(8),   // Metrics panel
-            Constraint::Min(6),      // Open positions
-            Constraint::Min(6),      // Trade history
-            Constraint::Min(8),      // Events log
-            Constraint::Length(3),   // Help
+            Constraint::Length(3), // Title
+            Constraint::Length(8), // Metrics panel
+            Constraint::Min(6),    // Open positions
+            Constraint::Min(6),    // Trade history
+            Constraint::Min(8),    // Events log
+            Constraint::Length(3), // Help
         ])
         .split(f.area());
 
     // Title
-    let bot_id = app.monitored_bot_id.as_ref().map_or("Unknown", String::as_str);
+    let bot_id = app
+        .monitored_bot_id
+        .as_ref()
+        .map_or("Unknown", String::as_str);
     let title = Paragraph::new(format!("Bot Monitor - {bot_id}"))
-        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -781,7 +847,8 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
     // Metrics panel
     let metrics_text = if let Some(status) = &app.bot_status {
         // Calculate total unrealized P&L across all positions
-        let total_unrealized_pnl: rust_decimal::Decimal = status.open_positions
+        let total_unrealized_pnl: rust_decimal::Decimal = status
+            .open_positions
             .iter()
             .map(|pos| pos.unrealized_pnl)
             .sum();
@@ -789,49 +856,79 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
         vec![
             Line::from(vec![
                 Span::raw("Equity: "),
-                Span::styled(format!("${}", status.current_equity), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("${}", status.current_equity),
+                    Style::default().fg(Color::Green),
+                ),
                 Span::raw("  Return: "),
-                Span::styled(format!("{:.2}%", status.total_return_pct * 100.0),
-                    if status.total_return_pct >= 0.0 { Style::default().fg(Color::Green) } else { Style::default().fg(Color::Red) }),
+                Span::styled(
+                    format!("{:.2}%", status.total_return_pct * 100.0),
+                    if status.total_return_pct >= 0.0 {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Red)
+                    },
+                ),
             ]),
             Line::from(vec![
                 Span::raw("Sharpe: "),
-                Span::styled(format!("{:.2}", status.sharpe_ratio), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{:.2}", status.sharpe_ratio),
+                    Style::default().fg(Color::Yellow),
+                ),
                 Span::raw("  Max DD: "),
-                Span::styled(format!("{:.2}%", status.max_drawdown * 100.0), Style::default().fg(Color::Red)),
+                Span::styled(
+                    format!("{:.2}%", status.max_drawdown * 100.0),
+                    Style::default().fg(Color::Red),
+                ),
                 Span::raw("  Win Rate: "),
-                Span::styled(format!("{:.1}%", status.win_rate * 100.0), Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!("{:.1}%", status.win_rate * 100.0),
+                    Style::default().fg(Color::Cyan),
+                ),
             ]),
             Line::from(vec![
                 Span::raw("Trades: "),
-                Span::styled(status.num_trades.to_string(), Style::default().fg(Color::White)),
+                Span::styled(
+                    status.num_trades.to_string(),
+                    Style::default().fg(Color::White),
+                ),
                 Span::raw("  Open Positions: "),
-                Span::styled(status.open_positions.len().to_string(), Style::default().fg(Color::Magenta)),
+                Span::styled(
+                    status.open_positions.len().to_string(),
+                    Style::default().fg(Color::Magenta),
+                ),
             ]),
             Line::from(vec![
                 Span::raw("Unrealized P&L: "),
                 Span::styled(
                     format!("${:.2}", total_unrealized_pnl),
                     if total_unrealized_pnl > rust_decimal::Decimal::ZERO {
-                        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::Green)
+                            .add_modifier(Modifier::BOLD)
                     } else if total_unrealized_pnl < rust_decimal::Decimal::ZERO {
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::Yellow)
-                    }
+                    },
                 ),
                 Span::raw("  State: "),
-                Span::styled(format!("{:?}", status.state), Style::default().fg(Color::Green)),
+                Span::styled(
+                    format!("{:?}", status.state),
+                    Style::default().fg(Color::Green),
+                ),
             ]),
         ]
     } else {
-        vec![
-            Line::from("Waiting for bot data..."),
-        ]
+        vec![Line::from("Waiting for bot data...")]
     };
 
-    let metrics_panel = Paragraph::new(metrics_text)
-        .block(Block::default().borders(Borders::ALL).title("Performance Metrics"));
+    let metrics_panel = Paragraph::new(metrics_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Performance Metrics"),
+    );
     f.render_widget(metrics_panel, chunks[1]);
 
     // Open positions
@@ -839,10 +936,11 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
         if status.open_positions.is_empty() {
             vec![ListItem::new(Span::styled(
                 "No open positions",
-                Style::default().fg(Color::DarkGray)
+                Style::default().fg(Color::DarkGray),
             ))]
         } else {
-            status.open_positions
+            status
+                .open_positions
                 .iter()
                 .map(|pos| {
                     let pnl_color = if pos.unrealized_pnl > rust_decimal::Decimal::ZERO {
@@ -852,7 +950,11 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
                     } else {
                         Color::Yellow
                     };
-                    let pnl_sign = if pos.unrealized_pnl > rust_decimal::Decimal::ZERO { "+" } else { "" };
+                    let pnl_sign = if pos.unrealized_pnl > rust_decimal::Decimal::ZERO {
+                        "+"
+                    } else {
+                        ""
+                    };
 
                     let side_icon = if pos.quantity > rust_decimal::Decimal::ZERO {
                         "🟢" // Long
@@ -865,16 +967,17 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
                         Span::raw(format!("qty: {} ", pos.quantity.abs())),
                         Span::styled(
                             format!("${:.2} → ${:.2} ", pos.avg_price, pos.current_price),
-                            Style::default().fg(Color::Cyan)
+                            Style::default().fg(Color::Cyan),
                         ),
                         Span::styled(
-                            format!("{}${:.2} ({}{:.2}%)",
+                            format!(
+                                "{}${:.2} ({}{:.2}%)",
                                 pnl_sign,
                                 pos.unrealized_pnl.abs(),
                                 pnl_sign,
                                 pos.unrealized_pnl_pct
                             ),
-                            Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)
+                            Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
                         ),
                     ]))
                 })
@@ -884,13 +987,17 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
         vec![ListItem::new("Waiting for bot data...")]
     };
 
-    let positions_list = List::new(position_lines)
-        .block(Block::default().borders(Borders::ALL).title("Open Positions"));
+    let positions_list = List::new(position_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Open Positions"),
+    );
     f.render_widget(positions_list, chunks[2]);
 
     // Trade history
     let trade_lines: Vec<ListItem> = if let Some(status) = &app.bot_status {
-        status.closed_trades
+        status
+            .closed_trades
             .iter()
             .rev()
             .take(10)
@@ -904,13 +1011,17 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
                 } else {
                     Color::Red
                 };
-                let pnl_sign = if trade.pnl > rust_decimal::Decimal::ZERO { "+" } else { "" };
+                let pnl_sign = if trade.pnl > rust_decimal::Decimal::ZERO {
+                    "+"
+                } else {
+                    ""
+                };
 
                 ListItem::new(Line::from(vec![
                     Span::raw(format!("{} {} ", direction_icon, trade.symbol)),
                     Span::styled(
                         format!("{}{:.2}% ", pnl_sign, trade.pnl_pct),
-                        Style::default().fg(pnl_color).add_modifier(Modifier::BOLD)
+                        Style::default().fg(pnl_color).add_modifier(Modifier::BOLD),
                     ),
                     Span::raw(format!("(${} → ${})", trade.entry_price, trade.exit_price)),
                 ]))
@@ -920,12 +1031,16 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
         vec![ListItem::new("No trades yet")]
     };
 
-    let trades_list = List::new(trade_lines)
-        .block(Block::default().borders(Borders::ALL).title("Trade History (Last 10)"));
+    let trades_list = List::new(trade_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Trade History (Last 10)"),
+    );
     f.render_widget(trades_list, chunks[3]);
 
     // Events log
-    let event_lines: Vec<ListItem> = app.bot_events
+    let event_lines: Vec<ListItem> = app
+        .bot_events
         .iter()
         .rev()
         .take(20)
@@ -935,8 +1050,11 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
         })
         .collect();
 
-    let events_list = List::new(event_lines)
-        .block(Block::default().borders(Borders::ALL).title("Recent Events"));
+    let events_list = List::new(event_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("Recent Events"),
+    );
     f.render_widget(events_list, chunks[4]);
 
     // Help
@@ -947,20 +1065,57 @@ fn render_bot_monitor(f: &mut Frame, app: &App) {
 
 fn format_bot_event(event: &BotEvent) -> String {
     match event {
-        BotEvent::MarketUpdate { symbol, price, timestamp, .. } => {
-            format!("[{:}] Market: {} @ ${}", timestamp.format("%H:%M:%S"), symbol, price)
+        BotEvent::MarketUpdate {
+            symbol,
+            price,
+            timestamp,
+            ..
+        } => {
+            format!(
+                "[{:}] Market: {} @ ${}",
+                timestamp.format("%H:%M:%S"),
+                symbol,
+                price
+            )
         }
         BotEvent::SignalGenerated(signal) => {
-            format!("[{:}] Signal: {:?} {} @ ${}", signal.timestamp.format("%H:%M:%S"), signal.direction, signal.symbol, signal.price)
+            format!(
+                "[{:}] Signal: {:?} {} @ ${}",
+                signal.timestamp.format("%H:%M:%S"),
+                signal.direction,
+                signal.symbol,
+                signal.price
+            )
         }
         BotEvent::OrderPlaced(order) => {
-            format!("[{:}] Order: {:?} {} qty={}", order.timestamp.format("%H:%M:%S"), order.direction, order.symbol, order.quantity)
+            format!(
+                "[{:}] Order: {:?} {} qty={}",
+                order.timestamp.format("%H:%M:%S"),
+                order.direction,
+                order.symbol,
+                order.quantity
+            )
         }
         BotEvent::OrderFilled(fill) => {
-            format!("[{:}] Fill: {:?} {} qty={} @ ${}", fill.timestamp.format("%H:%M:%S"), fill.direction, fill.symbol, fill.quantity, fill.price)
+            format!(
+                "[{:}] Fill: {:?} {} qty={} @ ${}",
+                fill.timestamp.format("%H:%M:%S"),
+                fill.direction,
+                fill.symbol,
+                fill.quantity,
+                fill.price
+            )
         }
-        BotEvent::PositionUpdate { symbol, quantity, avg_price, unrealized_pnl } => {
-            format!("Position: {} qty={} avg=${} PnL=${}", symbol, quantity, avg_price, unrealized_pnl)
+        BotEvent::PositionUpdate {
+            symbol,
+            quantity,
+            avg_price,
+            unrealized_pnl,
+        } => {
+            format!(
+                "Position: {} qty={} avg=${} PnL=${}",
+                symbol, quantity, avg_price, unrealized_pnl
+            )
         }
         BotEvent::TradeClosed { symbol, pnl, win } => {
             let status = if *win { "WIN" } else { "LOSS" };
@@ -983,7 +1138,11 @@ fn render_strategy_selection(f: &mut Frame, app: &App) {
         .split(f.area());
 
     let title = Paragraph::new("Select Strategy")
-        .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -994,7 +1153,9 @@ fn render_strategy_selection(f: &mut Frame, app: &App) {
         .enumerate()
         .map(|(i, name)| {
             let style = if i == app.selected_strategy_index {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -1023,26 +1184,44 @@ fn render_parameter_config(f: &mut Frame, app: &App) {
         ])
         .split(f.area());
 
-    let title = Paragraph::new(format!("Configure {} Strategy", app.param_config.strategy.name()))
-        .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL));
+    let title = Paragraph::new(format!(
+        "Configure {} Strategy",
+        app.param_config.strategy.name()
+    ))
+    .style(
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+    )
+    .alignment(Alignment::Center)
+    .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
 
     // Build parameter display based on strategy type
-    let param_lines = build_param_display(&app.param_config.strategy, app.editing_param, &app.param_input_buffer);
+    let param_lines = build_param_display(
+        &app.param_config.strategy,
+        app.editing_param,
+        &app.param_input_buffer,
+    );
 
     let params = Paragraph::new(param_lines)
         .block(Block::default().borders(Borders::ALL).title("Parameters"));
     f.render_widget(params, chunks[1]);
 
-    let help = Paragraph::new("Tab: Edit Field | 0-9: Type Value | Enter: Confirm/Done | Esc: Back")
-        .block(Block::default().borders(Borders::ALL).title("Help"));
+    let help =
+        Paragraph::new("Tab: Edit Field | 0-9: Type Value | Enter: Confirm/Done | Esc: Back")
+            .block(Block::default().borders(Borders::ALL).title("Help"));
     f.render_widget(help, chunks[2]);
 }
 
-fn build_param_display(strategy: &StrategyType, editing: Option<ParamField>, buffer: &str) -> Vec<Line<'static>> {
-    let highlight_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+fn build_param_display(
+    strategy: &StrategyType,
+    editing: Option<ParamField>,
+    buffer: &str,
+) -> Vec<Line<'static>> {
+    let highlight_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
 
     match strategy {
         StrategyType::MaCrossover { fast, slow } => {
@@ -1051,8 +1230,12 @@ fn build_param_display(strategy: &StrategyType, editing: Option<ParamField>, buf
                     Span::raw("Fast Period: "),
                     if editing == Some(ParamField::FastPeriod) {
                         Span::styled(
-                            if buffer.is_empty() { format!("[{fast}_]") } else { format!("[{buffer}_]") },
-                            highlight_style
+                            if buffer.is_empty() {
+                                format!("[{fast}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
                         )
                     } else {
                         Span::raw(fast.to_string())
@@ -1062,8 +1245,12 @@ fn build_param_display(strategy: &StrategyType, editing: Option<ParamField>, buf
                     Span::raw("Slow Period: "),
                     if editing == Some(ParamField::SlowPeriod) {
                         Span::styled(
-                            if buffer.is_empty() { format!("[{slow}_]") } else { format!("[{buffer}_]") },
-                            highlight_style
+                            if buffer.is_empty() {
+                                format!("[{slow}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
                         )
                     } else {
                         Span::raw(slow.to_string())
@@ -1086,25 +1273,53 @@ fn build_param_display(strategy: &StrategyType, editing: Option<ParamField>, buf
                 Line::from(vec![
                     Span::raw("MA1: "),
                     if editing == Some(ParamField::Ma1Period) {
-                        Span::styled(if buffer.is_empty() { format!("[{ma1}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{ma1}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
                         Span::raw(ma1.to_string())
                     },
                     Span::raw("  MA2: "),
                     if editing == Some(ParamField::Ma2Period) {
-                        Span::styled(if buffer.is_empty() { format!("[{ma2}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{ma2}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
                         Span::raw(ma2.to_string())
                     },
                     Span::raw("  MA3: "),
                     if editing == Some(ParamField::Ma3Period) {
-                        Span::styled(if buffer.is_empty() { format!("[{ma3}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{ma3}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
                         Span::raw(ma3.to_string())
                     },
                     Span::raw("  MA4: "),
                     if editing == Some(ParamField::Ma4Period) {
-                        Span::styled(if buffer.is_empty() { format!("[{ma4}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{ma4}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
                         Span::raw(ma4.to_string())
                     },
@@ -1113,7 +1328,14 @@ fn build_param_display(strategy: &StrategyType, editing: Option<ParamField>, buf
                 Line::from(vec![
                     Span::raw("Trend Period: "),
                     if editing == Some(ParamField::TrendPeriod) {
-                        Span::styled(if buffer.is_empty() { format!("[{trend_period}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{trend_period}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
                         Span::raw(trend_period.to_string())
                     },
@@ -1121,23 +1343,50 @@ fn build_param_display(strategy: &StrategyType, editing: Option<ParamField>, buf
                 Line::from(vec![
                     Span::raw("Volume Factor: "),
                     if editing == Some(ParamField::VolumeFactor) {
-                        Span::styled(if buffer.is_empty() { format!("[{volume_factor}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{volume_factor}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
-                        Span::raw(format!("{volume_factor} ({:.2}x)", *volume_factor as f64 / 100.0))
+                        Span::raw(format!(
+                            "{volume_factor} ({:.2}x)",
+                            *volume_factor as f64 / 100.0
+                        ))
                     },
                 ]),
                 Line::from(vec![
                     Span::raw("Take Profit: "),
                     if editing == Some(ParamField::TakeProfit) {
-                        Span::styled(if buffer.is_empty() { format!("[{take_profit}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{take_profit}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
-                        Span::raw(format!("{take_profit} ({:.2}%)", *take_profit as f64 / 100.0))
+                        Span::raw(format!(
+                            "{take_profit} ({:.2}%)",
+                            *take_profit as f64 / 100.0
+                        ))
                     },
                 ]),
                 Line::from(vec![
                     Span::raw("Stop Loss: "),
                     if editing == Some(ParamField::StopLoss) {
-                        Span::styled(if buffer.is_empty() { format!("[{stop_loss}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{stop_loss}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
                         Span::raw(format!("{stop_loss} ({:.2}%)", *stop_loss as f64 / 100.0))
                     },
@@ -1145,7 +1394,14 @@ fn build_param_display(strategy: &StrategyType, editing: Option<ParamField>, buf
                 Line::from(vec![
                     Span::raw("Reversal Confirmation: "),
                     if editing == Some(ParamField::ReversalConfirmBars) {
-                        Span::styled(if buffer.is_empty() { format!("[{reversal_confirmation_bars}_]") } else { format!("[{buffer}_]") }, highlight_style)
+                        Span::styled(
+                            if buffer.is_empty() {
+                                format!("[{reversal_confirmation_bars}_]")
+                            } else {
+                                format!("[{buffer}_]")
+                            },
+                            highlight_style,
+                        )
                     } else {
                         Span::raw(format!("{reversal_confirmation_bars} bars"))
                     },
@@ -1166,7 +1422,11 @@ fn render_token_selection(f: &mut Frame, app: &App) {
         .split(f.area());
 
     let title = Paragraph::new("Select Token")
-        .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
     f.render_widget(title, chunks[0]);
@@ -1183,7 +1443,9 @@ fn render_token_selection(f: &mut Frame, app: &App) {
             .enumerate()
             .map(|(i, token)| {
                 let style = if i == app.selected_token_index {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -1192,7 +1454,11 @@ fn render_token_selection(f: &mut Frame, app: &App) {
             .collect();
 
         let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(format!("{} tokens available", app.available_tokens.len())))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("{} tokens available", app.available_tokens.len())),
+            )
             .highlight_style(Style::default().bg(Color::DarkGray));
 
         f.render_widget(list, chunks[1]);

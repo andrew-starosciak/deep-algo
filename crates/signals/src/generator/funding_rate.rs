@@ -86,11 +86,7 @@ impl FundingRateSignal {
             return None;
         }
 
-        let variance = self
-            .history
-            .iter()
-            .map(|x| (x - mean).powi(2))
-            .sum::<f64>()
+        let variance = self.history.iter().map(|x| (x - mean).powi(2)).sum::<f64>()
             / (self.history.len() - 1) as f64;
 
         Some(variance.sqrt())

@@ -18,19 +18,13 @@ async fn test_backtest_ma_crossover() {
     let execution_handler = SimulatedExecutionHandler::new(0.001, 5.0);
 
     let strategy = MaCrossoverStrategy::new("BTC".to_string(), 5, 15);
-    let strategies: Vec<Arc<Mutex<dyn algo_trade_core::Strategy>>> = vec![
-        Arc::new(Mutex::new(strategy))
-    ];
+    let strategies: Vec<Arc<Mutex<dyn algo_trade_core::Strategy>>> =
+        vec![Arc::new(Mutex::new(strategy))];
 
     let risk_manager: Arc<dyn algo_trade_core::RiskManager> =
         Arc::new(SimpleRiskManager::new(0.05, 0.20, 1));
 
-    let mut system = TradingSystem::new(
-        data_provider,
-        execution_handler,
-        strategies,
-        risk_manager,
-    );
+    let mut system = TradingSystem::new(data_provider, execution_handler, strategies, risk_manager);
 
     // Should run without errors
     system.run().await.expect("Backtest failed");

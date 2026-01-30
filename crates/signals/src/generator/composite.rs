@@ -99,18 +99,12 @@ impl CompositeSignal {
             / total_weight;
 
         // Calculate weighted average strength
-        let avg_strength: f64 = signals
-            .iter()
-            .map(|(w, s)| w * s.strength)
-            .sum::<f64>()
-            / total_weight;
+        let avg_strength: f64 =
+            signals.iter().map(|(w, s)| w * s.strength).sum::<f64>() / total_weight;
 
         // Calculate weighted average confidence
-        let avg_confidence: f64 = signals
-            .iter()
-            .map(|(w, s)| w * s.confidence)
-            .sum::<f64>()
-            / total_weight;
+        let avg_confidence: f64 =
+            signals.iter().map(|(w, s)| w * s.confidence).sum::<f64>() / total_weight;
 
         // Determine direction from score
         let direction = if direction_score > 0.1 {
@@ -187,7 +181,9 @@ impl CompositeSignal {
             .max_by(|(w1, s1), (w2, s2)| {
                 let score1 = w1 * s1.strength;
                 let score2 = w2 * s2.strength;
-                score1.partial_cmp(&score2).unwrap_or(std::cmp::Ordering::Equal)
+                score1
+                    .partial_cmp(&score2)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(_, s)| s.clone())
             .unwrap_or_else(SignalValue::neutral)
@@ -288,7 +284,12 @@ mod tests {
     async fn composite_weighted_average_combines() {
         let mut composite = CompositeSignal::weighted_average("test")
             .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.8, 2.0)))
-            .with_generator(Box::new(MockGenerator::new("g2", Direction::Down, 0.6, 1.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Down,
+                0.6,
+                1.0,
+            )));
 
         let ctx = SignalContext::new(Utc::now(), "BTCUSD");
         let result = composite.compute(&ctx).await.unwrap();
@@ -303,7 +304,12 @@ mod tests {
         let mut composite = CompositeSignal::voting("test")
             .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.5, 1.0)))
             .with_generator(Box::new(MockGenerator::new("g2", Direction::Up, 0.5, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g3", Direction::Down, 0.9, 1.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Down,
+                0.9,
+                1.0,
+            )));
 
         let ctx = SignalContext::new(Utc::now(), "BTCUSD");
         let result = composite.compute(&ctx).await.unwrap();
@@ -316,7 +322,12 @@ mod tests {
     async fn composite_strongest_wins() {
         let mut composite = CompositeSignal::new("test", CombinationMethod::Strongest)
             .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.3, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g2", Direction::Down, 0.9, 1.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Down,
+                0.9,
+                1.0,
+            )));
 
         let ctx = SignalContext::new(Utc::now(), "BTCUSD");
         let result = composite.compute(&ctx).await.unwrap();
@@ -330,7 +341,12 @@ mod tests {
     async fn composite_weighted_voting() {
         let mut composite = CompositeSignal::voting("test")
             .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.5, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g2", Direction::Down, 0.5, 3.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Down,
+                0.5,
+                3.0,
+            )));
 
         let ctx = SignalContext::new(Utc::now(), "BTCUSD");
         let result = composite.compute(&ctx).await.unwrap();
@@ -343,8 +359,18 @@ mod tests {
     async fn composite_neutral_signals_dont_vote() {
         let mut composite = CompositeSignal::voting("test")
             .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.5, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g2", Direction::Neutral, 0.5, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g3", Direction::Neutral, 0.5, 1.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Neutral,
+                0.5,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Neutral,
+                0.5,
+                1.0,
+            )));
 
         let ctx = SignalContext::new(Utc::now(), "BTCUSD");
         let result = composite.compute(&ctx).await.unwrap();
@@ -363,7 +389,12 @@ mod tests {
     fn composite_generator_count() {
         let composite = CompositeSignal::weighted_average("test")
             .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.5, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g2", Direction::Down, 0.5, 1.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Down,
+                0.5,
+                1.0,
+            )));
 
         assert_eq!(composite.generator_count(), 2);
     }
@@ -372,7 +403,12 @@ mod tests {
     async fn composite_balanced_signals_neutral() {
         let mut composite = CompositeSignal::weighted_average("test")
             .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.5, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g2", Direction::Down, 0.5, 1.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Down,
+                0.5,
+                1.0,
+            )));
 
         let ctx = SignalContext::new(Utc::now(), "BTCUSD");
         let result = composite.compute(&ctx).await.unwrap();
@@ -384,8 +420,18 @@ mod tests {
     #[tokio::test]
     async fn composite_all_neutral_returns_neutral() {
         let mut composite = CompositeSignal::voting("test")
-            .with_generator(Box::new(MockGenerator::new("g1", Direction::Neutral, 0.5, 1.0)))
-            .with_generator(Box::new(MockGenerator::new("g2", Direction::Neutral, 0.5, 1.0)));
+            .with_generator(Box::new(MockGenerator::new(
+                "g1",
+                Direction::Neutral,
+                0.5,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Neutral,
+                0.5,
+                1.0,
+            )));
 
         let ctx = SignalContext::new(Utc::now(), "BTCUSD");
         let result = composite.compute(&ctx).await.unwrap();

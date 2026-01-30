@@ -145,8 +145,8 @@ impl SignalGenerator for LiquidationCascadeSignal {
                 self.cascade_multiple
             };
 
-            let strength = ((ratio - self.cascade_multiple) / self.cascade_multiple)
-                .clamp(0.0, 1.0);
+            let strength =
+                ((ratio - self.cascade_multiple) / self.cascade_multiple).clamp(0.0, 1.0);
 
             // Without direction info, we return neutral direction but positive strength
             // This allows composite signals to use the strength as a volatility indicator
@@ -157,7 +157,11 @@ impl SignalGenerator for LiquidationCascadeSignal {
 
         // Create signal
         let liq_f64: f64 = liq_value.to_string().parse().unwrap_or(0.0);
-        let avg_f64: f64 = self.average_liquidation().to_string().parse().unwrap_or(0.0);
+        let avg_f64: f64 = self
+            .average_liquidation()
+            .to_string()
+            .parse()
+            .unwrap_or(0.0);
 
         let signal = SignalValue::new(direction, strength, 0.0)?
             .with_metadata("liquidation_usd", liq_f64)

@@ -1,8 +1,11 @@
 use clap::{Parser, Subcommand};
 
+mod commands;
 mod tui_backtest;
 mod tui_backtest_manager;
 mod tui_live_bot;
+
+use commands::CollectSignalsArgs;
 
 #[derive(Parser)]
 #[command(name = "algo-trade")]
@@ -101,6 +104,8 @@ enum Commands {
         #[arg(long)]
         log_file: Option<String>,
     },
+    /// Collect real-time signal data from multiple sources
+    CollectSignals(CollectSignalsArgs),
 }
 
 #[tokio::main]
@@ -109,7 +114,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize logging (disabled for TUI to prevent screen corruption, unless log_file is provided)
     match &cli.command {
-        Commands::LiveBotTui { log_file: Some(path) } | Commands::BacktestManagerTui { log_file: Some(path) } => {
+        Commands::LiveBotTui {
+            log_file: Some(path),
+        }
+        | Commands::BacktestManagerTui {
+            log_file: Some(path),
+        } => {
             // Log to file for TUI
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -123,7 +133,9 @@ async fn main() -> anyhow::Result<()> {
                 .with_writer(std::sync::Mutex::new(file))
                 .init();
         }
-        Commands::TuiBacktest { .. } | Commands::LiveBotTui { .. } | Commands::BacktestManagerTui { .. } => {
+        Commands::TuiBacktest { .. }
+        | Commands::LiveBotTui { .. }
+        | Commands::BacktestManagerTui { .. } => {
             // No logging for TUI (prevents screen corruption)
         }
         _ => {
@@ -147,10 +159,20 @@ async fn main() -> anyhow::Result<()> {
         Commands::Server { addr } => {
             run_server(&addr).await?;
         }
-        Commands::FetchData { symbol, interval, start, end, output } => {
+        Commands::FetchData {
+            symbol,
+            interval,
+            start,
+            end,
+            output,
+        } => {
             run_fetch_data(&symbol, &interval, &start, &end, &output).await?;
         }
-        Commands::TuiBacktest { start, end, interval } => {
+        Commands::TuiBacktest {
+            start,
+            end,
+            interval,
+        } => {
             run_tui_backtest(start.as_deref(), end.as_deref(), &interval).await?;
         }
         Commands::ScheduledBacktest { config } => {
@@ -168,20 +190,26 @@ async fn main() -> anyhow::Result<()> {
         Commands::BacktestManagerTui { log_file: _ } => {
             tui_backtest_manager::run().await?;
         }
+        Commands::CollectSignals(args) => {
+            commands::run_collect_signals(args).await?;
+        }
     }
 
     Ok(())
 }
 
 async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
-    tracing::info!("Starting trading system daemon with config: {}", config_path);
+    tracing::info!(
+        "Starting trading system daemon with config: {}",
+        config_path
+    );
 
     // Load config
     let config = algo_trade_core::ConfigLoader::load()?;
 
     // Initialize database for persistence
-    let db_path = std::env::var("BOT_DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://data/bots.db".to_string());
+    let db_path =
+        std::env::var("BOT_DATABASE_URL").unwrap_or_else(|_| "sqlite://data/bots.db".to_string());
 
     tracing::info!("Initializing bot database at: {}", db_path);
 
@@ -190,7 +218,10 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
         let path = std::path::Path::new(file_path);
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                tracing::info!("Creating directory for SQLite database: {}", parent.display());
+                tracing::info!(
+                    "Creating directory for SQLite database: {}",
+                    parent.display()
+                );
                 std::fs::create_dir_all(parent)?;
                 tracing::info!("Directory created successfully, checking permissions...");
 
@@ -210,14 +241,13 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
         }
     }
 
-    let database = std::sync::Arc::new(
-        algo_trade_bot_orchestrator::BotDatabase::new(&db_path).await?
-    );
+    let database =
+        std::sync::Arc::new(algo_trade_bot_orchestrator::BotDatabase::new(&db_path).await?);
 
     // Create bot registry with persistence
-    let registry = std::sync::Arc::new(
-        algo_trade_bot_orchestrator::BotRegistry::with_database(database)
-    );
+    let registry = std::sync::Arc::new(algo_trade_bot_orchestrator::BotRegistry::with_database(
+        database,
+    ));
 
     // Restore bots from database
     match registry.restore_from_db().await {
@@ -225,7 +255,11 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
             if restored.is_empty() {
                 tracing::info!("No bots to restore from database");
             } else {
-                tracing::info!("Restored {} bot(s) from database: {:?}", restored.len(), restored);
+                tracing::info!(
+                    "Restored {} bot(s) from database: {:?}",
+                    restored.len(),
+                    restored
+                );
             }
         }
         Err(e) => {
@@ -248,13 +282,11 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
 
     // Wait for shutdown signal (SIGINT or SIGTERM)
     let shutdown_signal = async {
-        let mut sigterm = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate()
-        ).expect("Failed to create SIGTERM handler");
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("Failed to create SIGTERM handler");
 
-        let mut sigint = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::interrupt()
-        ).expect("Failed to create SIGINT handler");
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+            .expect("Failed to create SIGINT handler");
 
         tokio::select! {
             _ = sigterm.recv() => {
@@ -290,7 +322,11 @@ async fn run_backtest(data_path: &str, strategy_name: &str) -> anyhow::Result<()
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    tracing::info!("Running backtest with data: {}, strategy: {}", data_path, strategy_name);
+    tracing::info!(
+        "Running backtest with data: {}, strategy: {}",
+        data_path,
+        strategy_name
+    );
 
     // Extract symbol from CSV first row
     let symbol = extract_symbol_from_csv(data_path)?;
@@ -323,12 +359,7 @@ async fn run_backtest(data_path: &str, strategy_name: &str) -> anyhow::Result<()
         Arc::new(SimpleRiskManager::new(0.05, 0.20, 1));
 
     // Create trading system
-    let mut system = TradingSystem::new(
-        data_provider,
-        execution_handler,
-        strategies,
-        risk_manager,
-    );
+    let mut system = TradingSystem::new(data_provider, execution_handler, strategies, risk_manager);
 
     // Run backtest and get metrics
     let metrics = system.run().await?;
@@ -342,8 +373,8 @@ async fn run_backtest(data_path: &str, strategy_name: &str) -> anyhow::Result<()
 fn extract_symbol_from_csv(path: &str) -> anyhow::Result<String> {
     use anyhow::Context;
 
-    let mut reader = csv::Reader::from_path(path)
-        .with_context(|| format!("Failed to open CSV file: {path}"))?;
+    let mut reader =
+        csv::Reader::from_path(path).with_context(|| format!("Failed to open CSV file: {path}"))?;
 
     let mut records = reader.records();
     if let Some(result) = records.next() {
@@ -375,17 +406,19 @@ async fn run_fetch_data(
     end_str: &str,
     output_path: &str,
 ) -> anyhow::Result<()> {
-    use algo_trade_hyperliquid::HyperliquidClient;
     use algo_trade_data::CsvStorage;
-    use chrono::{DateTime, Utc};
+    use algo_trade_hyperliquid::HyperliquidClient;
     use anyhow::Context;
+    use chrono::{DateTime, Utc};
 
     tracing::info!("Fetching OHLCV data for {} ({} interval)", symbol, interval);
 
     // Parse timestamps
-    let start: DateTime<Utc> = start_str.parse()
+    let start: DateTime<Utc> = start_str
+        .parse()
         .context("Invalid start time. Use ISO 8601 format (e.g., 2025-01-01T00:00:00Z)")?;
-    let end: DateTime<Utc> = end_str.parse()
+    let end: DateTime<Utc> = end_str
+        .parse()
         .context("Invalid end time. Use ISO 8601 format (e.g., 2025-02-01T00:00:00Z)")?;
 
     if start >= end {
@@ -402,17 +435,30 @@ async fn run_fetch_data(
     let records = client.fetch_candles(symbol, interval, start, end).await?;
 
     if records.is_empty() {
-        tracing::warn!("No candle data returned. Symbol may not exist or date range may be invalid.");
+        tracing::warn!(
+            "No candle data returned. Symbol may not exist or date range may be invalid."
+        );
         anyhow::bail!("No data fetched for {symbol} {interval}");
     }
 
-    tracing::info!("Fetched {} candles, writing to {}", records.len(), output_path);
+    tracing::info!(
+        "Fetched {} candles, writing to {}",
+        records.len(),
+        output_path
+    );
 
     // Write to CSV
     CsvStorage::write_ohlcv(output_path, &records)?;
 
-    tracing::info!("✅ Successfully wrote {} candles to {}", records.len(), output_path);
-    tracing::info!("You can now run: algo-trade backtest --data {} --strategy <strategy>", output_path);
+    tracing::info!(
+        "✅ Successfully wrote {} candles to {}",
+        records.len(),
+        output_path
+    );
+    tracing::info!(
+        "You can now run: algo-trade backtest --data {} --strategy <strategy>",
+        output_path
+    );
 
     Ok(())
 }
@@ -422,19 +468,21 @@ async fn run_tui_backtest(
     end_opt: Option<&str>,
     interval: &str,
 ) -> anyhow::Result<()> {
-    use chrono::{DateTime, Duration, Utc};
     use anyhow::Context;
+    use chrono::{DateTime, Duration, Utc};
 
     // Parse or default dates
     let end: DateTime<Utc> = if let Some(end_str) = end_opt {
-        end_str.parse()
+        end_str
+            .parse()
             .context("Invalid end time. Use ISO 8601 format (e.g., 2025-01-01T00:00:00Z)")?
     } else {
         Utc::now()
     };
 
     let start: DateTime<Utc> = if let Some(start_str) = start_opt {
-        start_str.parse()
+        start_str
+            .parse()
             .context("Invalid start time. Use ISO 8601 format (e.g., 2025-01-01T00:00:00Z)")?
     } else {
         end - Duration::days(3) // Default: 3 days before end
@@ -445,7 +493,11 @@ async fn run_tui_backtest(
     }
 
     tracing::info!("Starting TUI backtest wizard");
-    tracing::info!("Date range: {} to {}", start.format("%Y-%m-%d"), end.format("%Y-%m-%d"));
+    tracing::info!(
+        "Date range: {} to {}",
+        start.format("%Y-%m-%d"),
+        end.format("%Y-%m-%d")
+    );
     tracing::info!("Interval: {}", interval);
 
     // Run TUI application
@@ -470,7 +522,10 @@ async fn run_scheduled_backtest(_config_path: &str) -> anyhow::Result<()> {
     // Create and start scheduler
     let scheduler = BacktestScheduler::new(config.backtest_scheduler, db_client);
 
-    tracing::info!("Scheduler started. Running according to cron schedule: {}", cron_schedule);
+    tracing::info!(
+        "Scheduler started. Running according to cron schedule: {}",
+        cron_schedule
+    );
     tracing::info!("Press Ctrl+C to stop");
 
     // This will run forever according to the cron schedule
@@ -480,8 +535,8 @@ async fn run_scheduled_backtest(_config_path: &str) -> anyhow::Result<()> {
 }
 
 async fn run_token_selection(_config_path: &str, strategy_name: &str) -> anyhow::Result<()> {
-    use algo_trade_token_selector::TokenSelector;
     use algo_trade_data::DatabaseClient;
+    use algo_trade_token_selector::TokenSelector;
     use std::sync::Arc;
 
     tracing::info!("Running token selection for strategy: {}", strategy_name);
@@ -502,20 +557,29 @@ async fn run_token_selection(_config_path: &str, strategy_name: &str) -> anyhow:
     println!("\n{}", "=".repeat(100));
     println!("Token Selection Results - Strategy: {}", strategy_name);
     println!("{}", "=".repeat(100));
-    println!("{:<10} {:>12} {:>10} {:>12} {:>10} {:>15} {:>10}",
-             "Symbol", "Sharpe", "Win Rate", "Max DD", "Trades", "Total PnL", "Approved");
+    println!(
+        "{:<10} {:>12} {:>10} {:>12} {:>10} {:>15} {:>10}",
+        "Symbol", "Sharpe", "Win Rate", "Max DD", "Trades", "Total PnL", "Approved"
+    );
     println!("{}", "-".repeat(100));
 
     for result in &results {
         let approved_mark = if result.approved { "✓" } else { "✗" };
-        println!("{:<10} {:>12.2} {:>9.1}% {:>11.1}% {:>10} {:>15} {:>10}",
-                 result.symbol,
-                 result.sharpe_ratio,
-                 result.win_rate * 100.0,
-                 result.max_drawdown.to_string().parse::<f64>().unwrap_or(0.0) * 100.0,
-                 result.num_trades,
-                 result.total_pnl,
-                 approved_mark);
+        println!(
+            "{:<10} {:>12.2} {:>9.1}% {:>11.1}% {:>10} {:>15} {:>10}",
+            result.symbol,
+            result.sharpe_ratio,
+            result.win_rate * 100.0,
+            result
+                .max_drawdown
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+                * 100.0,
+            result.num_trades,
+            result.total_pnl,
+            approved_mark
+        );
     }
 
     println!("{}", "=".repeat(100));
@@ -523,9 +587,18 @@ async fn run_token_selection(_config_path: &str, strategy_name: &str) -> anyhow:
     let approved_count = results.iter().filter(|r| r.approved).count();
     println!("\nApproved: {}/{} tokens", approved_count, results.len());
     println!("\nCriteria:");
-    println!("  - Min Sharpe Ratio: {}", config.token_selector.min_sharpe_ratio);
-    println!("  - Min Win Rate: {}%", config.token_selector.min_win_rate * 100.0);
-    println!("  - Max Drawdown: {}%", config.token_selector.max_drawdown * 100.0);
+    println!(
+        "  - Min Sharpe Ratio: {}",
+        config.token_selector.min_sharpe_ratio
+    );
+    println!(
+        "  - Min Win Rate: {}%",
+        config.token_selector.min_win_rate * 100.0
+    );
+    println!(
+        "  - Max Drawdown: {}%",
+        config.token_selector.max_drawdown * 100.0
+    );
     println!("  - Min Trades: {}", config.token_selector.min_num_trades);
     println!();
 
@@ -534,9 +607,9 @@ async fn run_token_selection(_config_path: &str, strategy_name: &str) -> anyhow:
 
 async fn run_backtest_daemon(_config_path: &str, strategy_name: &str) -> anyhow::Result<()> {
     use algo_trade_backtest_scheduler::BacktestScheduler;
-    use algo_trade_token_selector::TokenSelector;
+    use algo_trade_bot_orchestrator::{BotConfig, BotDatabase, BotRegistry, ExecutionMode};
     use algo_trade_data::DatabaseClient;
-    use algo_trade_bot_orchestrator::{BotRegistry, BotDatabase, BotConfig, ExecutionMode};
+    use algo_trade_token_selector::TokenSelector;
     use std::sync::Arc;
     use tokio::time::{interval, Duration};
 
@@ -550,8 +623,8 @@ async fn run_backtest_daemon(_config_path: &str, strategy_name: &str) -> anyhow:
     let timescale_client = Arc::new(DatabaseClient::new(&config.database.url).await?);
 
     // Create SQLite database for bot persistence
-    let db_path = std::env::var("BOT_DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://data/bots.db".to_string());
+    let db_path =
+        std::env::var("BOT_DATABASE_URL").unwrap_or_else(|_| "sqlite://data/bots.db".to_string());
 
     if let Some(file_path) = db_path.strip_prefix("sqlite://") {
         let path = std::path::Path::new(file_path);
@@ -571,7 +644,11 @@ async fn run_backtest_daemon(_config_path: &str, strategy_name: &str) -> anyhow:
     match registry.restore_from_db().await {
         Ok(restored) => {
             if !restored.is_empty() {
-                tracing::info!("Restored {} bot(s) from database: {:?}", restored.len(), restored);
+                tracing::info!(
+                    "Restored {} bot(s) from database: {:?}",
+                    restored.len(),
+                    restored
+                );
             }
         }
         Err(e) => {
@@ -580,15 +657,12 @@ async fn run_backtest_daemon(_config_path: &str, strategy_name: &str) -> anyhow:
     }
 
     // Create token selector
-    let selector = TokenSelector::new(
-        config.token_selector.clone(),
-        timescale_client.clone()
-    );
+    let selector = TokenSelector::new(config.token_selector.clone(), timescale_client.clone());
 
     // Create base bot config template
     let base_config = BotConfig {
         bot_id: String::new(), // Will be overridden per bot
-        symbol: String::new(),  // Will be overridden per bot
+        symbol: String::new(), // Will be overridden per bot
         strategy: strategy_name.to_string(),
         enabled: true,
         interval: config.backtest_scheduler.backtest_window_days.to_string(),

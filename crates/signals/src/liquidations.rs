@@ -1,4 +1,6 @@
-use crate::common::{connect_websocket, format_time_eastern, format_usd, truncate_symbol, BINANCE_LIQUIDATION_WS};
+use crate::common::{
+    connect_websocket, format_time_eastern, format_usd, truncate_symbol, BINANCE_LIQUIDATION_WS,
+};
 use colored::Colorize;
 use futures_util::StreamExt;
 use serde::Deserialize;
@@ -142,7 +144,13 @@ impl LiquidationMonitor {
 
         if self.min_usd_size >= 100000.0 {
             // Big liquidations mode (blue/magenta)
-            let output = format!("{} {} {} {}", liquidation_type, symbol, time, format_usd(usd_size, 2));
+            let output = format!(
+                "{} {} {} {}",
+                liquidation_type,
+                symbol,
+                time,
+                format_usd(usd_size, 2)
+            );
             let colored_output = if side == "SELL" {
                 output.white().on_blue().bold()
             } else {
@@ -151,7 +159,13 @@ impl LiquidationMonitor {
             println!("{}\n", colored_output);
         } else {
             // All liquidations mode (green/red with stars for big ones)
-            let base_output = format!("{} {} {} {}", liquidation_type, symbol, time, format_usd(usd_size, 0));
+            let base_output = format!(
+                "{} {} {} {}",
+                liquidation_type,
+                symbol,
+                time,
+                format_usd(usd_size, 0)
+            );
 
             if usd_size > 250000.0 {
                 let output = format!("***{}", base_output);

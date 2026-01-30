@@ -38,21 +38,41 @@ where
             // Fetch/load data
             let csv_path = get_cache_path(token, interval, start, end);
             let data_ready = if Path::new(&csv_path).exists() {
-                progress_callback(completed, total, token, &config.name,
-                    Some(format!("Using cached data for {token}")));
+                progress_callback(
+                    completed,
+                    total,
+                    token,
+                    &config.name,
+                    Some(format!("Using cached data for {token}")),
+                );
                 true
             } else {
-                progress_callback(completed, total, token, &config.name,
-                    Some(format!("Fetching data for {token}...")));
+                progress_callback(
+                    completed,
+                    total,
+                    token,
+                    &config.name,
+                    Some(format!("Fetching data for {token}...")),
+                );
                 match fetch_and_cache_data(token, interval, start, end, &csv_path).await {
                     Ok(()) => {
-                        progress_callback(completed, total, token, &config.name,
-                            Some(format!("Data cached for {token}")));
+                        progress_callback(
+                            completed,
+                            total,
+                            token,
+                            &config.name,
+                            Some(format!("Data cached for {token}")),
+                        );
                         true
                     }
                     Err(e) => {
-                        progress_callback(completed, total, token, &config.name,
-                            Some(format!("✗ Failed to fetch data for {token}: {e}")));
+                        progress_callback(
+                            completed,
+                            total,
+                            token,
+                            &config.name,
+                            Some(format!("✗ Failed to fetch data for {token}: {e}")),
+                        );
                         false
                     }
                 }
@@ -64,8 +84,13 @@ where
                 continue;
             }
 
-            progress_callback(completed, total, token, &config.name,
-                Some(format!("Running backtest: {token} - {}", config.name)));
+            progress_callback(
+                completed,
+                total,
+                token,
+                &config.name,
+                Some(format!("Running backtest: {token} - {}", config.name)),
+            );
 
             match run_single_backtest(token, config, &csv_path).await {
                 Ok(metrics) => {
@@ -84,13 +109,25 @@ where
                         trades,
                         metrics: Some(metrics),
                     });
-                    progress_callback(completed, total, token, &config.name,
-                        Some(format!("✓ Completed: {token} - {} ({} trades)",
-                            config.name, num_trades)));
+                    progress_callback(
+                        completed,
+                        total,
+                        token,
+                        &config.name,
+                        Some(format!(
+                            "✓ Completed: {token} - {} ({} trades)",
+                            config.name, num_trades
+                        )),
+                    );
                 }
                 Err(e) => {
-                    progress_callback(completed, total, token, &config.name,
-                        Some(format!("✗ Failed: {token} - {}: {e}", config.name)));
+                    progress_callback(
+                        completed,
+                        total,
+                        token,
+                        &config.name,
+                        Some(format!("✗ Failed: {token} - {}: {e}", config.name)),
+                    );
                 }
             }
 
@@ -124,7 +161,9 @@ async fn fetch_and_cache_data(
         .unwrap_or_else(|_| "https://api.hyperliquid.xyz".to_string());
 
     let client = HyperliquidClient::new(api_url);
-    let records = client.fetch_candles(token, interval, start, end).await
+    let records = client
+        .fetch_candles(token, interval, start, end)
+        .await
         .with_context(|| format!("Failed to fetch candles for {token}"))?;
 
     if records.is_empty() {
@@ -155,7 +194,17 @@ async fn run_single_backtest(
             let strategy = MaCrossoverStrategy::new(token.to_string(), *fast, *slow);
             vec![Arc::new(Mutex::new(strategy))]
         }
-        StrategyType::QuadMa { ma1, ma2, ma3, ma4, trend_period, volume_factor, take_profit, stop_loss, reversal_confirmation_bars } => {
+        StrategyType::QuadMa {
+            ma1,
+            ma2,
+            ma3,
+            ma4,
+            trend_period,
+            volume_factor,
+            take_profit,
+            stop_loss,
+            reversal_confirmation_bars,
+        } => {
             // Precision loss is acceptable for strategy parameters (small integers to ratios)
             #[allow(clippy::cast_precision_loss)]
             let strategy = QuadMaStrategy::with_full_config(
@@ -165,11 +214,11 @@ async fn run_single_backtest(
                 *ma3,
                 *ma4,
                 *trend_period,
-                true,                                    // volume_filter_enabled: true (re-enabled)
-                *volume_factor as f64 / 100.0,           // 150 → 1.5
-                *take_profit as f64 / 10000.0,           // 200 → 0.02
-                *stop_loss as f64 / 10000.0,             // 100 → 0.01
-                *reversal_confirmation_bars,             // reversal confirmation bars
+                true,                          // volume_filter_enabled: true (re-enabled)
+                *volume_factor as f64 / 100.0, // 150 → 1.5
+                *take_profit as f64 / 10000.0, // 200 → 0.02
+                *stop_loss as f64 / 10000.0,   // 100 → 0.01
+                *reversal_confirmation_bars,   // reversal confirmation bars
             );
             vec![Arc::new(Mutex::new(strategy))]
         }
@@ -181,12 +230,7 @@ async fn run_single_backtest(
         Arc::new(SimpleRiskManager::new(0.05, 0.20, 1));
 
     // Create trading system
-    let mut system = TradingSystem::new(
-        data_provider,
-        execution_handler,
-        strategies,
-        risk_manager,
-    );
+    let mut system = TradingSystem::new(data_provider, execution_handler, strategies, risk_manager);
 
     // Run backtest
     system.run().await

@@ -43,9 +43,7 @@ pub fn format_usd(value: f64, decimals: usize) -> String {
 pub async fn connect_websocket(
     url: &str,
 ) -> Result<
-    tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let url = Url::parse(url)?;

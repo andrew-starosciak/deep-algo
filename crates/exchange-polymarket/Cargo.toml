@@ -1,0 +1,28 @@
+[package]
+name = "algo-trade-polymarket"
+version = "0.1.0"
+edition = "2021"
+description = "Polymarket CLOB integration for statistical trading engine"
+license = "MIT"
+readme = false
+
+[dependencies]
+algo-trade-core = { path = "../core" }
+algo-trade-data = { path = "../data" }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = "1.0"
+reqwest = { version = "0.12", features = ["json"] }
+governor = "0.6"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = "1.38"
+async-trait = "0.1"
+nonzero_ext = "0.3"
+urlencoding = "2.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+wiremock = "0.6"
+rust_decimal_macros = "1.38"

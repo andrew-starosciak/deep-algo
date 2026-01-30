@@ -3,6 +3,7 @@ members = [
     "crates/core",
     "crates/signals",
     "crates/exchange-hyperliquid",
+    "crates/exchange-polymarket",
     "crates/data",
     "crates/strategy",
     "crates/execution",

@@ -17,14 +17,18 @@ path = "src/main.rs"
 algo-trade-core = { path = "../core" }
 algo-trade-data = { path = "../data" }
 algo-trade-hyperliquid = { path = "../exchange-hyperliquid" }
+algo-trade-polymarket = { path = "../exchange-polymarket" }
+algo-trade-signals = { path = "../signals" }
 algo-trade-backtest = { path = "../backtest" }
 algo-trade-backtest-scheduler = { path = "../backtest-scheduler" }
 algo-trade-token-selector = { path = "../token-selector" }
 algo-trade-strategy = { path = "../strategy" }
 algo-trade-bot-orchestrator = { path = "../bot-orchestrator" }
 algo-trade-web-api = { path = "../web-api" }
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres"] }
+async-trait = "0.1"
 tokio = { workspace = true }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.5", features = ["derive", "env"] }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = { workspace = true }
