@@ -1,520 +1,351 @@
 ---
 name: coding-standards
-description: Universal coding standards, best practices, and patterns for TypeScript, JavaScript, React, and Node.js development.
+description: Rust coding standards for statistical trading systems. Financial precision, error handling, async patterns, and code organization.
 ---
 
-# Coding Standards & Best Practices
+# Coding Standards (Rust)
 
-Universal coding standards applicable across all projects.
+Standards for writing reliable, maintainable trading system code.
 
-## Code Quality Principles
+## When to Activate
 
-### 1. Readability First
-- Code is read more than written
-- Clear variable and function names
-- Self-documenting code preferred over comments
-- Consistent formatting
+- Writing any Rust code in this project
+- Reviewing code for quality
+- Refactoring existing code
+- Setting up new modules
 
-### 2. KISS (Keep It Simple, Stupid)
-- Simplest solution that works
-- Avoid over-engineering
-- No premature optimization
-- Easy to understand > clever code
+## Financial Precision (CRITICAL)
 
-### 3. DRY (Don't Repeat Yourself)
-- Extract common logic into functions
-- Create reusable components
-- Share utilities across modules
-- Avoid copy-paste programming
+**ALWAYS use `rust_decimal::Decimal` for money:**
 
-### 4. YAGNI (You Aren't Gonna Need It)
-- Don't build features before they're needed
-- Avoid speculative generality
-- Add complexity only when required
-- Start simple, refactor when needed
+```rust
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 
-## TypeScript/JavaScript Standards
+// CORRECT
+let price: Decimal = dec!(42750.50);
+let stake: Decimal = "100.00".parse()?;
+let fee = price * dec!(0.001);
 
-### Variable Naming
-
-```typescript
-// ✅ GOOD: Descriptive names
-const marketSearchQuery = 'election'
-const isUserAuthenticated = true
-const totalRevenue = 1000
-
-// ❌ BAD: Unclear names
-const q = 'election'
-const flag = true
-const x = 1000
+// WRONG - NEVER use floats for money
+let price: f64 = 42750.50;  // Precision loss!
 ```
 
-### Function Naming
+### When to Use Each Type
 
-```typescript
-// ✅ GOOD: Verb-noun pattern
-async function fetchMarketData(marketId: string) { }
-function calculateSimilarity(a: number[], b: number[]) { }
-function isValidEmail(email: string): boolean { }
+| Type | Use For |
+|------|---------|
+| `Decimal` | Prices, quantities, P&L, fees, any money |
+| `f64` | Signal strength (0.0-1.0), confidence scores, statistics |
+| `i64` | Counts, IDs, timestamps (millis) |
 
-// ❌ BAD: Unclear or noun-only
-async function market(id: string) { }
-function similarity(a, b) { }
-function email(e) { }
+## Error Handling
+
+### No Panics in Library Code
+
+```rust
+// WRONG
+let value = some_operation().unwrap();
+let value = some_operation().expect("should work");
+
+// CORRECT
+let value = some_operation()?;
+
+// CORRECT (when you must handle locally)
+let value = match some_operation() {
+    Ok(v) => v,
+    Err(e) => {
+        tracing::error!("Operation failed: {e}");
+        return Err(e.into());
+    }
+};
 ```
 
-### Immutability Pattern (CRITICAL)
+### Custom Error Types
 
-```typescript
-// ✅ ALWAYS use spread operator
-const updatedUser = {
-  ...user,
-  name: 'New Name'
+```rust
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum SignalError {
+    #[error("insufficient data: need {required}, have {actual}")]
+    InsufficientData { required: usize, actual: usize },
+
+    #[error("invalid threshold: {0}")]
+    InvalidThreshold(f64),
+
+    #[error("computation failed: {0}")]
+    ComputationFailed(#[from] std::io::Error),
+}
+```
+
+## Async Patterns
+
+### Actor Pattern for Long-Running Tasks
+
+```rust
+use tokio::sync::mpsc;
+
+pub struct SignalCollector {
+    rx: mpsc::Receiver<CollectorCommand>,
+    db: DatabaseClient,
 }
 
-const updatedArray = [...items, newItem]
-
-// ❌ NEVER mutate directly
-user.name = 'New Name'  // BAD
-items.push(newItem)     // BAD
-```
-
-### Error Handling
-
-```typescript
-// ✅ GOOD: Comprehensive error handling
-async function fetchData(url: string) {
-  try {
-    const response = await fetch(url)
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+impl SignalCollector {
+    pub fn spawn(db: DatabaseClient) -> CollectorHandle {
+        let (tx, rx) = mpsc::channel(100);
+        let collector = Self { rx, db };
+        tokio::spawn(collector.run());
+        CollectorHandle { tx }
     }
 
-    return await response.json()
-  } catch (error) {
-    console.error('Fetch failed:', error)
-    throw new Error('Failed to fetch data')
-  }
-}
-
-// ❌ BAD: No error handling
-async function fetchData(url) {
-  const response = await fetch(url)
-  return response.json()
-}
-```
-
-### Async/Await Best Practices
-
-```typescript
-// ✅ GOOD: Parallel execution when possible
-const [users, markets, stats] = await Promise.all([
-  fetchUsers(),
-  fetchMarkets(),
-  fetchStats()
-])
-
-// ❌ BAD: Sequential when unnecessary
-const users = await fetchUsers()
-const markets = await fetchMarkets()
-const stats = await fetchStats()
-```
-
-### Type Safety
-
-```typescript
-// ✅ GOOD: Proper types
-interface Market {
-  id: string
-  name: string
-  status: 'active' | 'resolved' | 'closed'
-  created_at: Date
-}
-
-function getMarket(id: string): Promise<Market> {
-  // Implementation
-}
-
-// ❌ BAD: Using 'any'
-function getMarket(id: any): Promise<any> {
-  // Implementation
-}
-```
-
-## React Best Practices
-
-### Component Structure
-
-```typescript
-// ✅ GOOD: Functional component with types
-interface ButtonProps {
-  children: React.ReactNode
-  onClick: () => void
-  disabled?: boolean
-  variant?: 'primary' | 'secondary'
-}
-
-export function Button({
-  children,
-  onClick,
-  disabled = false,
-  variant = 'primary'
-}: ButtonProps) {
-  return (
-    <button
-      onClick={onClick}
-      disabled={disabled}
-      className={`btn btn-${variant}`}
-    >
-      {children}
-    </button>
-  )
-}
-
-// ❌ BAD: No types, unclear structure
-export function Button(props) {
-  return <button onClick={props.onClick}>{props.children}</button>
-}
-```
-
-### Custom Hooks
-
-```typescript
-// ✅ GOOD: Reusable custom hook
-export function useDebounce<T>(value: T, delay: number): T {
-  const [debouncedValue, setDebouncedValue] = useState<T>(value)
-
-  useEffect(() => {
-    const handler = setTimeout(() => {
-      setDebouncedValue(value)
-    }, delay)
-
-    return () => clearTimeout(handler)
-  }, [value, delay])
-
-  return debouncedValue
-}
-
-// Usage
-const debouncedQuery = useDebounce(searchQuery, 500)
-```
-
-### State Management
-
-```typescript
-// ✅ GOOD: Proper state updates
-const [count, setCount] = useState(0)
-
-// Functional update for state based on previous state
-setCount(prev => prev + 1)
-
-// ❌ BAD: Direct state reference
-setCount(count + 1)  // Can be stale in async scenarios
-```
-
-### Conditional Rendering
-
-```typescript
-// ✅ GOOD: Clear conditional rendering
-{isLoading && <Spinner />}
-{error && <ErrorMessage error={error} />}
-{data && <DataDisplay data={data} />}
-
-// ❌ BAD: Ternary hell
-{isLoading ? <Spinner /> : error ? <ErrorMessage error={error} /> : data ? <DataDisplay data={data} /> : null}
-```
-
-## API Design Standards
-
-### REST API Conventions
-
-```
-GET    /api/markets              # List all markets
-GET    /api/markets/:id          # Get specific market
-POST   /api/markets              # Create new market
-PUT    /api/markets/:id          # Update market (full)
-PATCH  /api/markets/:id          # Update market (partial)
-DELETE /api/markets/:id          # Delete market
-
-# Query parameters for filtering
-GET /api/markets?status=active&limit=10&offset=0
-```
-
-### Response Format
-
-```typescript
-// ✅ GOOD: Consistent response structure
-interface ApiResponse<T> {
-  success: boolean
-  data?: T
-  error?: string
-  meta?: {
-    total: number
-    page: number
-    limit: number
-  }
-}
-
-// Success response
-return NextResponse.json({
-  success: true,
-  data: markets,
-  meta: { total: 100, page: 1, limit: 10 }
-})
-
-// Error response
-return NextResponse.json({
-  success: false,
-  error: 'Invalid request'
-}, { status: 400 })
-```
-
-### Input Validation
-
-```typescript
-import { z } from 'zod'
-
-// ✅ GOOD: Schema validation
-const CreateMarketSchema = z.object({
-  name: z.string().min(1).max(200),
-  description: z.string().min(1).max(2000),
-  endDate: z.string().datetime(),
-  categories: z.array(z.string()).min(1)
-})
-
-export async function POST(request: Request) {
-  const body = await request.json()
-
-  try {
-    const validated = CreateMarketSchema.parse(body)
-    // Proceed with validated data
-  } catch (error) {
-    if (error instanceof z.ZodError) {
-      return NextResponse.json({
-        success: false,
-        error: 'Validation failed',
-        details: error.errors
-      }, { status: 400 })
+    async fn run(mut self) {
+        while let Some(cmd) = self.rx.recv().await {
+            if let Err(e) = self.handle(cmd).await {
+                tracing::error!("Command failed: {e}");
+            }
+        }
     }
-  }
 }
 ```
 
-## File Organization
+### Graceful Shutdown
 
-### Project Structure
+```rust
+use tokio::signal;
 
-```
-src/
-├── app/                    # Next.js App Router
-│   ├── api/               # API routes
-│   ├── markets/           # Market pages
-│   └── (auth)/           # Auth pages (route groups)
-├── components/            # React components
-│   ├── ui/               # Generic UI components
-│   ├── forms/            # Form components
-│   └── layouts/          # Layout components
-├── hooks/                # Custom React hooks
-├── lib/                  # Utilities and configs
-│   ├── api/             # API clients
-│   ├── utils/           # Helper functions
-│   └── constants/       # Constants
-├── types/                # TypeScript types
-└── styles/              # Global styles
-```
-
-### File Naming
-
-```
-components/Button.tsx          # PascalCase for components
-hooks/useAuth.ts              # camelCase with 'use' prefix
-lib/formatDate.ts             # camelCase for utilities
-types/market.types.ts         # camelCase with .types suffix
-```
-
-## Comments & Documentation
-
-### When to Comment
-
-```typescript
-// ✅ GOOD: Explain WHY, not WHAT
-// Use exponential backoff to avoid overwhelming the API during outages
-const delay = Math.min(1000 * Math.pow(2, retryCount), 30000)
-
-// Deliberately using mutation here for performance with large arrays
-items.push(newItem)
-
-// ❌ BAD: Stating the obvious
-// Increment counter by 1
-count++
-
-// Set name to user's name
-name = user.name
-```
-
-### JSDoc for Public APIs
-
-```typescript
-/**
- * Searches markets using semantic similarity.
- *
- * @param query - Natural language search query
- * @param limit - Maximum number of results (default: 10)
- * @returns Array of markets sorted by similarity score
- * @throws {Error} If OpenAI API fails or Redis unavailable
- *
- * @example
- * ```typescript
- * const results = await searchMarkets('election', 5)
- * console.log(results[0].name) // "Trump vs Biden"
- * ```
- */
-export async function searchMarkets(
-  query: string,
-  limit: number = 10
-): Promise<Market[]> {
-  // Implementation
+pub async fn run_with_shutdown<F>(task: F) -> Result<()>
+where
+    F: Future<Output = Result<()>>,
+{
+    tokio::select! {
+        result = task => result,
+        _ = signal::ctrl_c() => {
+            tracing::info!("Shutdown signal received");
+            Ok(())
+        }
+    }
 }
 ```
 
-## Performance Best Practices
+## Code Organization
 
-### Memoization
+### File Size Guidelines
 
-```typescript
-import { useMemo, useCallback } from 'react'
+- **Target:** 200-400 lines
+- **Maximum:** 800 lines
+- **Split when:** >500 lines or multiple responsibilities
 
-// ✅ GOOD: Memoize expensive computations
-const sortedMarkets = useMemo(() => {
-  return markets.sort((a, b) => b.volume - a.volume)
-}, [markets])
+### Module Structure
 
-// ✅ GOOD: Memoize callbacks
-const handleSearch = useCallback((query: string) => {
-  setSearchQuery(query)
-}, [])
+```
+crates/signals/src/
+├── lib.rs              # Public API exports
+├── traits.rs           # SignalGenerator trait
+├── types.rs            # SignalValue, Direction, etc.
+├── orderbook/
+│   ├── mod.rs          # Module exports
+│   ├── imbalance.rs    # OrderBookImbalanceSignal
+│   └── wall.rs         # WallDetectionSignal
+├── funding/
+│   ├── mod.rs
+│   ├── reversal.rs     # FundingReversalSignal
+│   └── percentile.rs   # Percentile calculation
+└── composite.rs        # CompositeSignal
 ```
 
-### Lazy Loading
+### Public API Design
 
-```typescript
-import { lazy, Suspense } from 'react'
+```rust
+// lib.rs - Clean public exports
+pub mod traits;
+pub mod types;
 
-// ✅ GOOD: Lazy load heavy components
-const HeavyChart = lazy(() => import('./HeavyChart'))
+// Re-export commonly used items
+pub use traits::SignalGenerator;
+pub use types::{SignalValue, Direction, SignalContext};
 
-export function Dashboard() {
-  return (
-    <Suspense fallback={<Spinner />}>
-      <HeavyChart />
-    </Suspense>
-  )
+// Specific signals under feature-gated modules
+pub mod orderbook;
+pub mod funding;
+pub mod liquidation;
+pub mod composite;
+```
+
+## Documentation
+
+### Required for Public Items
+
+```rust
+/// Generates signals based on order book imbalance.
+///
+/// The signal compares bid and ask volumes to detect
+/// directional pressure in the market.
+///
+/// # Example
+///
+/// ```rust
+/// let signal = OrderBookImbalanceSignal::new(1.5);
+/// let result = signal.compute(&ctx).await?;
+/// ```
+///
+/// # Errors
+///
+/// Returns `SignalError::InsufficientData` if the order book
+/// has fewer than 5 price levels on either side.
+pub struct OrderBookImbalanceSignal {
+    threshold: Decimal,
 }
-```
-
-### Database Queries
-
-```typescript
-// ✅ GOOD: Select only needed columns
-const { data } = await supabase
-  .from('markets')
-  .select('id, name, status')
-  .limit(10)
-
-// ❌ BAD: Select everything
-const { data } = await supabase
-  .from('markets')
-  .select('*')
 ```
 
 ## Testing Standards
 
-### Test Structure (AAA Pattern)
+### Test Organization
 
-```typescript
-test('calculates similarity correctly', () => {
-  // Arrange
-  const vector1 = [1, 0, 0]
-  const vector2 = [0, 1, 0]
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-  // Act
-  const similarity = calculateCosineSimilarity(vector1, vector2)
+    // Group by behavior
+    mod when_bid_heavy {
+        use super::*;
 
-  // Assert
-  expect(similarity).toBe(0)
-})
-```
+        #[test]
+        fn signals_up() { /* ... */ }
 
-### Test Naming
-
-```typescript
-// ✅ GOOD: Descriptive test names
-test('returns empty array when no markets match query', () => { })
-test('throws error when OpenAI API key is missing', () => { })
-test('falls back to substring search when Redis unavailable', () => { })
-
-// ❌ BAD: Vague test names
-test('works', () => { })
-test('test search', () => { })
-```
-
-## Code Smell Detection
-
-Watch for these anti-patterns:
-
-### 1. Long Functions
-```typescript
-// ❌ BAD: Function > 50 lines
-function processMarketData() {
-  // 100 lines of code
-}
-
-// ✅ GOOD: Split into smaller functions
-function processMarketData() {
-  const validated = validateData()
-  const transformed = transformData(validated)
-  return saveData(transformed)
-}
-```
-
-### 2. Deep Nesting
-```typescript
-// ❌ BAD: 5+ levels of nesting
-if (user) {
-  if (user.isAdmin) {
-    if (market) {
-      if (market.isActive) {
-        if (hasPermission) {
-          // Do something
-        }
-      }
+        #[test]
+        fn strength_proportional_to_imbalance() { /* ... */ }
     }
-  }
+
+    mod when_ask_heavy {
+        use super::*;
+
+        #[test]
+        fn signals_down() { /* ... */ }
+    }
+
+    mod edge_cases {
+        use super::*;
+
+        #[test]
+        fn handles_zero_volume() { /* ... */ }
+
+        #[test]
+        fn handles_equal_volumes() { /* ... */ }
+    }
+}
+```
+
+## Naming Conventions
+
+| Item | Convention | Example |
+|------|------------|---------|
+| Structs | PascalCase | `OrderBookImbalanceSignal` |
+| Traits | PascalCase | `SignalGenerator` |
+| Functions | snake_case | `compute_imbalance` |
+| Constants | SCREAMING_SNAKE | `MAX_LOOKBACK_SECONDS` |
+| Modules | snake_case | `order_book` |
+| Type params | Single uppercase | `T`, `E` |
+
+## Imports
+
+### Organize by Category
+
+```rust
+// Standard library
+use std::collections::HashMap;
+use std::time::Duration;
+
+// External crates
+use rust_decimal::Decimal;
+use tokio::sync::mpsc;
+use tracing::{info, error};
+
+// Workspace crates
+use algo_trade_core::traits::SignalGenerator;
+use algo_trade_data::DatabaseClient;
+
+// Local modules
+use crate::types::{SignalValue, Direction};
+```
+
+## Pre-Commit Checklist
+
+Before every commit:
+
+```bash
+# Format
+cargo fmt
+
+# Lint
+cargo clippy -- -D warnings
+
+# Test
+cargo test
+
+# Check for unwrap/expect in library code
+rg "\.unwrap\(\)|\.expect\(" crates/*/src --type rust
+```
+
+## Anti-Patterns to Avoid
+
+### 1. Mutation Over Creation
+
+```rust
+// WRONG
+fn update_signal(signal: &mut Signal) {
+    signal.strength = 0.8;
 }
 
-// ✅ GOOD: Early returns
-if (!user) return
-if (!user.isAdmin) return
-if (!market) return
-if (!market.isActive) return
-if (!hasPermission) return
-
-// Do something
+// CORRECT
+fn with_strength(signal: Signal, strength: f64) -> Signal {
+    Signal { strength, ..signal }
+}
 ```
 
-### 3. Magic Numbers
-```typescript
-// ❌ BAD: Unexplained numbers
-if (retryCount > 3) { }
-setTimeout(callback, 500)
+### 2. Stringly-Typed APIs
 
-// ✅ GOOD: Named constants
-const MAX_RETRIES = 3
-const DEBOUNCE_DELAY_MS = 500
+```rust
+// WRONG
+fn get_signal(name: &str) -> Signal;
 
-if (retryCount > MAX_RETRIES) { }
-setTimeout(callback, DEBOUNCE_DELAY_MS)
+// CORRECT
+fn get_signal(signal_type: SignalType) -> Signal;
+
+enum SignalType {
+    OrderBookImbalance,
+    FundingRate,
+    Liquidation,
+}
 ```
 
-**Remember**: Code quality is not negotiable. Clear, maintainable code enables rapid development and confident refactoring.
+### 3. God Objects
+
+```rust
+// WRONG - Does too much
+struct TradingEngine {
+    signals: Vec<Signal>,
+    database: Database,
+    exchange: Exchange,
+    risk: RiskManager,
+    // ... 20 more fields
+}
+
+// CORRECT - Single responsibility
+struct SignalAggregator { /* signals only */ }
+struct DataCollector { /* data only */ }
+struct RiskManager { /* risk only */ }
+```
+
+### 4. Ignored Errors
+
+```rust
+// WRONG
+let _ = risky_operation();
+
+// CORRECT
+if let Err(e) = risky_operation() {
+    tracing::warn!("Operation failed (non-fatal): {e}");
+}
+```

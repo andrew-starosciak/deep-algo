@@ -1,587 +1,401 @@
 ---
 name: backend-patterns
-description: Backend architecture patterns, API design, database optimization, and server-side best practices for Node.js, Express, and Next.js API routes.
+description: Rust backend patterns for trading systems. Async services, WebSocket handling, API design, and data pipelines.
 ---
 
-# Backend Development Patterns
+# Backend Patterns (Rust)
 
-Backend architecture patterns and best practices for scalable server-side applications.
+Patterns for building robust trading system backends.
 
-## API Design Patterns
+## When to Activate
 
-### RESTful API Structure
+- Building data collection services
+- Implementing WebSocket connections
+- Designing REST APIs
+- Creating data pipelines
 
-```typescript
-// ✅ Resource-based URLs
-GET    /api/markets                 # List resources
-GET    /api/markets/:id             # Get single resource
-POST   /api/markets                 # Create resource
-PUT    /api/markets/:id             # Replace resource
-PATCH  /api/markets/:id             # Update resource
-DELETE /api/markets/:id             # Delete resource
+## WebSocket Patterns
 
-// ✅ Query parameters for filtering, sorting, pagination
-GET /api/markets?status=active&sort=volume&limit=20&offset=0
-```
+### Reconnecting WebSocket Client
 
-### Repository Pattern
+```rust
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+use futures::{StreamExt, SinkExt};
 
-```typescript
-// Abstract data access logic
-interface MarketRepository {
-  findAll(filters?: MarketFilters): Promise<Market[]>
-  findById(id: string): Promise<Market | null>
-  create(data: CreateMarketDto): Promise<Market>
-  update(id: string, data: UpdateMarketDto): Promise<Market>
-  delete(id: string): Promise<void>
+pub struct ReconnectingWebSocket {
+    url: String,
+    reconnect_delay: Duration,
+    max_retries: u32,
 }
 
-class SupabaseMarketRepository implements MarketRepository {
-  async findAll(filters?: MarketFilters): Promise<Market[]> {
-    let query = supabase.from('markets').select('*')
+impl ReconnectingWebSocket {
+    pub async fn connect_and_stream<F, Fut>(
+        &self,
+        mut handler: F,
+    ) -> Result<()>
+    where
+        F: FnMut(Message) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let mut retries = 0;
 
-    if (filters?.status) {
-      query = query.eq('status', filters.status)
+        loop {
+            match connect_async(&self.url).await {
+                Ok((ws_stream, _)) => {
+                    retries = 0;
+                    let (_, mut read) = ws_stream.split();
+
+                    while let Some(msg) = read.next().await {
+                        match msg {
+                            Ok(m) => {
+                                if let Err(e) = handler(m).await {
+                                    tracing::error!("Handler error: {e}");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("WebSocket error: {e}");
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Connection failed: {e}");
+                }
+            }
+
+            retries += 1;
+            if retries > self.max_retries {
+                return Err(anyhow::anyhow!("Max retries exceeded"));
+            }
+
+            let delay = self.reconnect_delay * retries;
+            tracing::info!("Reconnecting in {:?}", delay);
+            tokio::time::sleep(delay).await;
+        }
+    }
+}
+```
+
+### Multi-Stream Aggregator
+
+```rust
+use futures::stream::SelectAll;
+
+pub struct StreamAggregator {
+    streams: SelectAll<BoxStream<'static, MarketEvent>>,
+}
+
+impl StreamAggregator {
+    pub fn new() -> Self {
+        Self { streams: SelectAll::new() }
     }
 
-    if (filters?.limit) {
-      query = query.limit(filters.limit)
+    pub fn add_stream(&mut self, stream: BoxStream<'static, MarketEvent>) {
+        self.streams.push(stream);
     }
 
-    const { data, error } = await query
+    pub async fn next(&mut self) -> Option<MarketEvent> {
+        self.streams.next().await
+    }
+}
 
-    if (error) throw new Error(error.message)
-    return data
-  }
+// Usage:
+let mut aggregator = StreamAggregator::new();
+aggregator.add_stream(binance_stream);
+aggregator.add_stream(coinbase_stream);
 
-  // Other methods...
+while let Some(event) = aggregator.next().await {
+    process_event(event).await?;
 }
 ```
 
-### Service Layer Pattern
+## Data Collection Service
 
-```typescript
-// Business logic separated from data access
-class MarketService {
-  constructor(private marketRepo: MarketRepository) {}
+### Collector Architecture
 
-  async searchMarkets(query: string, limit: number = 10): Promise<Market[]> {
-    // Business logic
-    const embedding = await generateEmbedding(query)
-    const results = await this.vectorSearch(embedding, limit)
-
-    // Fetch full data
-    const markets = await this.marketRepo.findByIds(results.map(r => r.id))
-
-    // Sort by similarity
-    return markets.sort((a, b) => {
-      const scoreA = results.find(r => r.id === a.id)?.score || 0
-      const scoreB = results.find(r => r.id === b.id)?.score || 0
-      return scoreA - scoreB
-    })
-  }
-
-  private async vectorSearch(embedding: number[], limit: number) {
-    // Vector search implementation
-  }
+```rust
+pub struct DataCollector {
+    db: DatabaseClient,
+    buffer: Vec<OrderBookSnapshot>,
+    flush_interval: Duration,
+    buffer_size: usize,
 }
-```
 
-### Middleware Pattern
+impl DataCollector {
+    pub async fn run(&mut self, mut stream: impl Stream<Item = OrderBookSnapshot>) {
+        let mut flush_timer = tokio::time::interval(self.flush_interval);
 
-```typescript
-// Request/response processing pipeline
-export function withAuth(handler: NextApiHandler): NextApiHandler {
-  return async (req, res) => {
-    const token = req.headers.authorization?.replace('Bearer ', '')
-
-    if (!token) {
-      return res.status(401).json({ error: 'Unauthorized' })
+        loop {
+            tokio::select! {
+                Some(snapshot) = stream.next() => {
+                    self.buffer.push(snapshot);
+                    if self.buffer.len() >= self.buffer_size {
+                        self.flush().await;
+                    }
+                }
+                _ = flush_timer.tick() => {
+                    if !self.buffer.is_empty() {
+                        self.flush().await;
+                    }
+                }
+            }
+        }
     }
 
-    try {
-      const user = await verifyToken(token)
-      req.user = user
-      return handler(req, res)
-    } catch (error) {
-      return res.status(401).json({ error: 'Invalid token' })
+    async fn flush(&mut self) {
+        let snapshots = std::mem::take(&mut self.buffer);
+        if let Err(e) = self.db.insert_batch(&snapshots).await {
+            tracing::error!("Flush failed: {e}");
+            // Re-add failed items (with limit)
+            self.buffer.extend(snapshots.into_iter().take(self.buffer_size));
+        }
     }
-  }
+}
+```
+
+## REST API with Axum
+
+### Handler Pattern
+
+```rust
+use axum::{
+    extract::{State, Query},
+    response::Json,
+    http::StatusCode,
+};
+
+#[derive(Deserialize)]
+pub struct SignalQuery {
+    signal_name: Option<String>,
+    start: Option<DateTime<Utc>>,
+    end: Option<DateTime<Utc>>,
+    limit: Option<i64>,
 }
 
-// Usage
-export default withAuth(async (req, res) => {
-  // Handler has access to req.user
-})
-```
+pub async fn get_signals(
+    State(db): State<DatabaseClient>,
+    Query(query): Query<SignalQuery>,
+) -> Result<Json<Vec<SignalSnapshot>>, AppError> {
+    let signals = db.query_signals(
+        query.signal_name.as_deref(),
+        query.start,
+        query.end,
+        query.limit.unwrap_or(100),
+    ).await?;
 
-## Database Patterns
-
-### Query Optimization
-
-```typescript
-// ✅ GOOD: Select only needed columns
-const { data } = await supabase
-  .from('markets')
-  .select('id, name, status, volume')
-  .eq('status', 'active')
-  .order('volume', { ascending: false })
-  .limit(10)
-
-// ❌ BAD: Select everything
-const { data } = await supabase
-  .from('markets')
-  .select('*')
-```
-
-### N+1 Query Prevention
-
-```typescript
-// ❌ BAD: N+1 query problem
-const markets = await getMarkets()
-for (const market of markets) {
-  market.creator = await getUser(market.creator_id)  // N queries
+    Ok(Json(signals))
 }
 
-// ✅ GOOD: Batch fetch
-const markets = await getMarkets()
-const creatorIds = markets.map(m => m.creator_id)
-const creators = await getUsers(creatorIds)  // 1 query
-const creatorMap = new Map(creators.map(c => [c.id, c]))
+// Error handling
+pub struct AppError(anyhow::Error);
 
-markets.forEach(market => {
-  market.creator = creatorMap.get(market.creator_id)
-})
-```
-
-### Transaction Pattern
-
-```typescript
-async function createMarketWithPosition(
-  marketData: CreateMarketDto,
-  positionData: CreatePositionDto
-) {
-  // Use Supabase transaction
-  const { data, error } = await supabase.rpc('create_market_with_position', {
-    market_data: marketData,
-    position_data: positionData
-  })
-
-  if (error) throw new Error('Transaction failed')
-  return data
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": self.0.to_string() }))
+        ).into_response()
+    }
 }
 
-// SQL function in Supabase
-CREATE OR REPLACE FUNCTION create_market_with_position(
-  market_data jsonb,
-  position_data jsonb
-)
-RETURNS jsonb
-LANGUAGE plpgsql
-AS $$
-BEGIN
-  -- Start transaction automatically
-  INSERT INTO markets VALUES (market_data);
-  INSERT INTO positions VALUES (position_data);
-  RETURN jsonb_build_object('success', true);
-EXCEPTION
-  WHEN OTHERS THEN
-    -- Rollback happens automatically
-    RETURN jsonb_build_object('success', false, 'error', SQLERRM);
-END;
-$$;
+impl<E: Into<anyhow::Error>> From<E> for AppError {
+    fn from(e: E) -> Self {
+        Self(e.into())
+    }
+}
 ```
 
-## Caching Strategies
+### Router Setup
 
-### Redis Caching Layer
+```rust
+use axum::{Router, routing::get};
 
-```typescript
-class CachedMarketRepository implements MarketRepository {
-  constructor(
-    private baseRepo: MarketRepository,
-    private redis: RedisClient
-  ) {}
+pub fn create_router(state: AppState) -> Router {
+    Router::new()
+        .route("/health", get(health_check))
+        .route("/api/signals", get(get_signals))
+        .route("/api/signals/:name/latest", get(get_latest_signal))
+        .route("/api/backtest", post(run_backtest))
+        .route("/api/trades", get(get_trades))
+        .with_state(state)
+}
 
-  async findById(id: string): Promise<Market | null> {
-    // Check cache first
-    const cached = await this.redis.get(`market:${id}`)
+async fn health_check() -> &'static str {
+    "OK"
+}
+```
 
-    if (cached) {
-      return JSON.parse(cached)
+## Configuration
+
+### Environment-Based Config
+
+```rust
+use figment::{Figment, providers::{Env, Toml, Format}};
+
+#[derive(Deserialize)]
+pub struct Config {
+    pub database_url: String,
+    pub binance_api_key: String,
+    pub binance_secret_key: String,
+    pub collection: CollectionConfig,
+}
+
+#[derive(Deserialize)]
+pub struct CollectionConfig {
+    pub buffer_size: usize,
+    pub flush_interval_secs: u64,
+    pub symbols: Vec<String>,
+}
+
+impl Config {
+    pub fn load() -> Result<Self> {
+        Figment::new()
+            .merge(Toml::file("Config.toml"))
+            .merge(Env::prefixed("TRADING_"))
+            .extract()
+            .map_err(Into::into)
+    }
+}
+```
+
+## Graceful Shutdown
+
+```rust
+use tokio::sync::broadcast;
+
+pub struct ShutdownSignal {
+    tx: broadcast::Sender<()>,
+}
+
+impl ShutdownSignal {
+    pub fn new() -> (Self, ShutdownReceiver) {
+        let (tx, rx) = broadcast::channel(1);
+        (Self { tx }, ShutdownReceiver { rx })
     }
 
-    // Cache miss - fetch from database
-    const market = await this.baseRepo.findById(id)
-
-    if (market) {
-      // Cache for 5 minutes
-      await this.redis.setex(`market:${id}`, 300, JSON.stringify(market))
+    pub fn shutdown(&self) {
+        let _ = self.tx.send(());
     }
-
-    return market
-  }
-
-  async invalidateCache(id: string): Promise<void> {
-    await this.redis.del(`market:${id}`)
-  }
-}
-```
-
-### Cache-Aside Pattern
-
-```typescript
-async function getMarketWithCache(id: string): Promise<Market> {
-  const cacheKey = `market:${id}`
-
-  // Try cache
-  const cached = await redis.get(cacheKey)
-  if (cached) return JSON.parse(cached)
-
-  // Cache miss - fetch from DB
-  const market = await db.markets.findUnique({ where: { id } })
-
-  if (!market) throw new Error('Market not found')
-
-  // Update cache
-  await redis.setex(cacheKey, 300, JSON.stringify(market))
-
-  return market
-}
-```
-
-## Error Handling Patterns
-
-### Centralized Error Handler
-
-```typescript
-class ApiError extends Error {
-  constructor(
-    public statusCode: number,
-    public message: string,
-    public isOperational = true
-  ) {
-    super(message)
-    Object.setPrototypeOf(this, ApiError.prototype)
-  }
 }
 
-export function errorHandler(error: unknown, req: Request): Response {
-  if (error instanceof ApiError) {
-    return NextResponse.json({
-      success: false,
-      error: error.message
-    }, { status: error.statusCode })
-  }
-
-  if (error instanceof z.ZodError) {
-    return NextResponse.json({
-      success: false,
-      error: 'Validation failed',
-      details: error.errors
-    }, { status: 400 })
-  }
-
-  // Log unexpected errors
-  console.error('Unexpected error:', error)
-
-  return NextResponse.json({
-    success: false,
-    error: 'Internal server error'
-  }, { status: 500 })
+pub struct ShutdownReceiver {
+    rx: broadcast::Receiver<()>,
 }
 
-// Usage
-export async function GET(request: Request) {
-  try {
-    const data = await fetchData()
-    return NextResponse.json({ success: true, data })
-  } catch (error) {
-    return errorHandler(error, request)
-  }
-}
-```
-
-### Retry with Exponential Backoff
-
-```typescript
-async function fetchWithRetry<T>(
-  fn: () => Promise<T>,
-  maxRetries = 3
-): Promise<T> {
-  let lastError: Error
-
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await fn()
-    } catch (error) {
-      lastError = error as Error
-
-      if (i < maxRetries - 1) {
-        // Exponential backoff: 1s, 2s, 4s
-        const delay = Math.pow(2, i) * 1000
-        await new Promise(resolve => setTimeout(resolve, delay))
-      }
+impl ShutdownReceiver {
+    pub async fn wait(&mut self) {
+        let _ = self.rx.recv().await;
     }
-  }
-
-  throw lastError!
 }
 
-// Usage
-const data = await fetchWithRetry(() => fetchFromAPI())
-```
+// Usage in main:
+#[tokio::main]
+async fn main() -> Result<()> {
+    let (shutdown, mut shutdown_rx) = ShutdownSignal::new();
 
-## Authentication & Authorization
+    // Spawn signal handler
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        shutdown.shutdown();
+    });
 
-### JWT Token Validation
-
-```typescript
-import jwt from 'jsonwebtoken'
-
-interface JWTPayload {
-  userId: string
-  email: string
-  role: 'admin' | 'user'
-}
-
-export function verifyToken(token: string): JWTPayload {
-  try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET!) as JWTPayload
-    return payload
-  } catch (error) {
-    throw new ApiError(401, 'Invalid token')
-  }
-}
-
-export async function requireAuth(request: Request) {
-  const token = request.headers.get('authorization')?.replace('Bearer ', '')
-
-  if (!token) {
-    throw new ApiError(401, 'Missing authorization token')
-  }
-
-  return verifyToken(token)
-}
-
-// Usage in API route
-export async function GET(request: Request) {
-  const user = await requireAuth(request)
-
-  const data = await getDataForUser(user.userId)
-
-  return NextResponse.json({ success: true, data })
-}
-```
-
-### Role-Based Access Control
-
-```typescript
-type Permission = 'read' | 'write' | 'delete' | 'admin'
-
-interface User {
-  id: string
-  role: 'admin' | 'moderator' | 'user'
-}
-
-const rolePermissions: Record<User['role'], Permission[]> = {
-  admin: ['read', 'write', 'delete', 'admin'],
-  moderator: ['read', 'write', 'delete'],
-  user: ['read', 'write']
-}
-
-export function hasPermission(user: User, permission: Permission): boolean {
-  return rolePermissions[user.role].includes(permission)
-}
-
-export function requirePermission(permission: Permission) {
-  return (handler: (request: Request, user: User) => Promise<Response>) => {
-    return async (request: Request) => {
-      const user = await requireAuth(request)
-
-      if (!hasPermission(user, permission)) {
-        throw new ApiError(403, 'Insufficient permissions')
-      }
-
-      return handler(request, user)
+    // Run service until shutdown
+    tokio::select! {
+        result = run_service() => result,
+        _ = shutdown_rx.wait() => {
+            tracing::info!("Shutting down gracefully");
+            Ok(())
+        }
     }
-  }
+}
+```
+
+## Metrics and Monitoring
+
+```rust
+use metrics::{counter, gauge, histogram};
+
+pub fn record_signal_computation(signal_name: &str, duration: Duration, success: bool) {
+    let labels = [("signal", signal_name.to_string())];
+
+    histogram!("signal_computation_duration_seconds", &labels)
+        .record(duration.as_secs_f64());
+
+    if success {
+        counter!("signal_computations_total", &labels).increment(1);
+    } else {
+        counter!("signal_computation_errors_total", &labels).increment(1);
+    }
 }
 
-// Usage - HOF wraps the handler
-export const DELETE = requirePermission('delete')(
-  async (request: Request, user: User) => {
-    // Handler receives authenticated user with verified permission
-    return new Response('Deleted', { status: 200 })
-  }
-)
+pub fn record_active_connections(count: usize) {
+    gauge!("websocket_connections_active").set(count as f64);
+}
 ```
 
 ## Rate Limiting
 
-### Simple In-Memory Rate Limiter
+```rust
+use governor::{Quota, RateLimiter, state::InMemoryState, clock::DefaultClock};
+use nonzero_ext::nonzero;
 
-```typescript
-class RateLimiter {
-  private requests = new Map<string, number[]>()
-
-  async checkLimit(
-    identifier: string,
-    maxRequests: number,
-    windowMs: number
-  ): Promise<boolean> {
-    const now = Date.now()
-    const requests = this.requests.get(identifier) || []
-
-    // Remove old requests outside window
-    const recentRequests = requests.filter(time => now - time < windowMs)
-
-    if (recentRequests.length >= maxRequests) {
-      return false  // Rate limit exceeded
-    }
-
-    // Add current request
-    recentRequests.push(now)
-    this.requests.set(identifier, recentRequests)
-
-    return true
-  }
+pub struct RateLimitedClient<C> {
+    client: C,
+    limiter: RateLimiter<NotKeyed, InMemoryState, DefaultClock>,
 }
 
-const limiter = new RateLimiter()
+impl<C> RateLimitedClient<C> {
+    pub fn new(client: C, requests_per_second: u32) -> Self {
+        Self {
+            client,
+            limiter: RateLimiter::direct(
+                Quota::per_second(nonzero!(requests_per_second))
+            ),
+        }
+    }
 
-export async function GET(request: Request) {
-  const ip = request.headers.get('x-forwarded-for') || 'unknown'
-
-  const allowed = await limiter.checkLimit(ip, 100, 60000)  // 100 req/min
-
-  if (!allowed) {
-    return NextResponse.json({
-      error: 'Rate limit exceeded'
-    }, { status: 429 })
-  }
-
-  // Continue with request
+    pub async fn execute<F, T>(&self, f: F) -> T
+    where
+        F: FnOnce(&C) -> T,
+    {
+        self.limiter.until_ready().await;
+        f(&self.client)
+    }
 }
 ```
 
-## Background Jobs & Queues
+## Pipeline Pattern
 
-### Simple Queue Pattern
+```rust
+pub trait Stage: Send + Sync {
+    type Input;
+    type Output;
 
-```typescript
-class JobQueue<T> {
-  private queue: T[] = []
-  private processing = false
-
-  async add(job: T): Promise<void> {
-    this.queue.push(job)
-
-    if (!this.processing) {
-      this.process()
-    }
-  }
-
-  private async process(): Promise<void> {
-    this.processing = true
-
-    while (this.queue.length > 0) {
-      const job = this.queue.shift()!
-
-      try {
-        await this.execute(job)
-      } catch (error) {
-        console.error('Job failed:', error)
-      }
-    }
-
-    this.processing = false
-  }
-
-  private async execute(job: T): Promise<void> {
-    // Job execution logic
-  }
+    async fn process(&self, input: Self::Input) -> Result<Self::Output>;
 }
 
-// Usage for indexing markets
-interface IndexJob {
-  marketId: string
+pub struct Pipeline<A, B, C>
+where
+    A: Stage,
+    B: Stage<Input = A::Output>,
+    C: Stage<Input = B::Output>,
+{
+    stage_a: A,
+    stage_b: B,
+    stage_c: C,
 }
 
-const indexQueue = new JobQueue<IndexJob>()
-
-export async function POST(request: Request) {
-  const { marketId } = await request.json()
-
-  // Add to queue instead of blocking
-  await indexQueue.add({ marketId })
-
-  return NextResponse.json({ success: true, message: 'Job queued' })
+impl<A, B, C> Pipeline<A, B, C>
+where
+    A: Stage,
+    B: Stage<Input = A::Output>,
+    C: Stage<Input = B::Output>,
+{
+    pub async fn run(&self, input: A::Input) -> Result<C::Output> {
+        let a_out = self.stage_a.process(input).await?;
+        let b_out = self.stage_b.process(a_out).await?;
+        self.stage_c.process(b_out).await
+    }
 }
 ```
-
-## Logging & Monitoring
-
-### Structured Logging
-
-```typescript
-interface LogContext {
-  userId?: string
-  requestId?: string
-  method?: string
-  path?: string
-  [key: string]: unknown
-}
-
-class Logger {
-  log(level: 'info' | 'warn' | 'error', message: string, context?: LogContext) {
-    const entry = {
-      timestamp: new Date().toISOString(),
-      level,
-      message,
-      ...context
-    }
-
-    console.log(JSON.stringify(entry))
-  }
-
-  info(message: string, context?: LogContext) {
-    this.log('info', message, context)
-  }
-
-  warn(message: string, context?: LogContext) {
-    this.log('warn', message, context)
-  }
-
-  error(message: string, error: Error, context?: LogContext) {
-    this.log('error', message, {
-      ...context,
-      error: error.message,
-      stack: error.stack
-    })
-  }
-}
-
-const logger = new Logger()
-
-// Usage
-export async function GET(request: Request) {
-  const requestId = crypto.randomUUID()
-
-  logger.info('Fetching markets', {
-    requestId,
-    method: 'GET',
-    path: '/api/markets'
-  })
-
-  try {
-    const markets = await fetchMarkets()
-    return NextResponse.json({ success: true, data: markets })
-  } catch (error) {
-    logger.error('Failed to fetch markets', error as Error, { requestId })
-    return NextResponse.json({ error: 'Internal error' }, { status: 500 })
-  }
-}
-```
-
-**Remember**: Backend patterns enable scalable, maintainable server-side applications. Choose patterns that fit your complexity level.

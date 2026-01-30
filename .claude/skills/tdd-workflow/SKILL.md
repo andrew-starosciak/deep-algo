@@ -1,19 +1,19 @@
 ---
 name: tdd-workflow
-description: Use this skill when writing new features, fixing bugs, or refactoring code. Enforces test-driven development with 80%+ coverage including unit, integration, and E2E tests.
+description: Test-driven development for Rust. Write tests first, implement to pass, verify statistical correctness. Enforces 80%+ coverage.
 ---
 
-# Test-Driven Development Workflow
+# Test-Driven Development Workflow (Rust)
 
 This skill ensures all code development follows TDD principles with comprehensive test coverage.
 
 ## When to Activate
 
-- Writing new features or functionality
-- Fixing bugs or issues
-- Refactoring existing code
-- Adding API endpoints
-- Creating new components
+- Writing new signal generators
+- Implementing statistical calculations
+- Adding exchange integrations
+- Creating risk management logic
+- Fixing bugs in trading logic
 
 ## Core Principles
 
@@ -21,389 +21,338 @@ This skill ensures all code development follows TDD principles with comprehensiv
 ALWAYS write tests first, then implement code to make tests pass.
 
 ### 2. Coverage Requirements
-- Minimum 80% coverage (unit + integration + E2E)
+- Minimum 80% coverage
 - All edge cases covered
 - Error scenarios tested
-- Boundary conditions verified
+- Statistical correctness verified
 
-### 3. Test Types
+### 3. Test Categories
 
 #### Unit Tests
-- Individual functions and utilities
-- Component logic
-- Pure functions
-- Helpers and utilities
+- Individual signal computations
+- Statistical calculations (Wilson CI, Kelly)
+- Data transformations
 
 #### Integration Tests
-- API endpoints
 - Database operations
-- Service interactions
-- External API calls
+- WebSocket connections
+- API client behavior
 
-#### E2E Tests (Playwright)
-- Critical user flows
-- Complete workflows
-- Browser automation
-- UI interactions
+#### Property-Based Tests
+- Statistical invariants
+- Financial calculation bounds
 
 ## TDD Workflow Steps
 
-### Step 1: Write User Journeys
-```
-As a [role], I want to [action], so that [benefit]
-
-Example:
-As a user, I want to search for markets semantically,
-so that I can find relevant markets even without exact keywords.
-```
-
-### Step 2: Generate Test Cases
-For each user journey, create comprehensive test cases:
-
-```typescript
-describe('Semantic Search', () => {
-  it('returns relevant markets for query', async () => {
-    // Test implementation
-  })
-
-  it('handles empty query gracefully', async () => {
-    // Test edge case
-  })
-
-  it('falls back to substring search when Redis unavailable', async () => {
-    // Test fallback behavior
-  })
-
-  it('sorts results by similarity score', async () => {
-    // Test sorting logic
-  })
-})
+### Step 1: Define Behavior
+```rust
+// Signal should detect order book imbalance
+// When bid_volume > ask_volume * 1.5, signal Up
+// When ask_volume > bid_volume * 1.5, signal Down
+// Otherwise, signal Neutral
 ```
 
-### Step 3: Run Tests (They Should Fail)
-```bash
-npm test
-# Tests should fail - we haven't implemented yet
-```
+### Step 2: Write Failing Test
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-### Step 4: Implement Code
-Write minimal code to make tests pass:
+    #[test]
+    fn signal_up_when_bid_heavy() {
+        let ctx = SignalContext {
+            orderbook: OrderBook {
+                bid_volume: dec!(150),
+                ask_volume: dec!(100),
+            },
+            ..Default::default()
+        };
 
-```typescript
-// Implementation guided by tests
-export async function searchMarkets(query: string) {
-  // Implementation here
+        let mut signal = OrderBookImbalanceSignal::new(1.5);
+        let result = signal.compute_sync(&ctx).unwrap();
+
+        assert_eq!(result.direction, Direction::Up);
+    }
+
+    #[test]
+    fn signal_down_when_ask_heavy() {
+        let ctx = SignalContext {
+            orderbook: OrderBook {
+                bid_volume: dec!(100),
+                ask_volume: dec!(150),
+            },
+            ..Default::default()
+        };
+
+        let mut signal = OrderBookImbalanceSignal::new(1.5);
+        let result = signal.compute_sync(&ctx).unwrap();
+
+        assert_eq!(result.direction, Direction::Down);
+    }
+
+    #[test]
+    fn signal_neutral_when_balanced() {
+        let ctx = SignalContext {
+            orderbook: OrderBook {
+                bid_volume: dec!(100),
+                ask_volume: dec!(100),
+            },
+            ..Default::default()
+        };
+
+        let mut signal = OrderBookImbalanceSignal::new(1.5);
+        let result = signal.compute_sync(&ctx).unwrap();
+
+        assert_eq!(result.direction, Direction::Neutral);
+    }
 }
 ```
 
-### Step 5: Run Tests Again
+### Step 3: Run Tests (Should Fail)
 ```bash
-npm test
-# Tests should now pass
+cargo test -p algo-trade-signals
+# Tests fail - not implemented yet
 ```
 
-### Step 6: Refactor
-Improve code quality while keeping tests green:
-- Remove duplication
-- Improve naming
-- Optimize performance
-- Enhance readability
+### Step 4: Implement Minimal Code
+```rust
+pub struct OrderBookImbalanceSignal {
+    threshold: Decimal,
+}
+
+impl OrderBookImbalanceSignal {
+    pub fn new(threshold: f64) -> Self {
+        Self { threshold: Decimal::from_f64(threshold).unwrap() }
+    }
+
+    pub fn compute_sync(&mut self, ctx: &SignalContext) -> Result<SignalValue> {
+        let ratio = ctx.orderbook.bid_volume / ctx.orderbook.ask_volume;
+
+        let direction = if ratio > self.threshold {
+            Direction::Up
+        } else if ratio < Decimal::ONE / self.threshold {
+            Direction::Down
+        } else {
+            Direction::Neutral
+        };
+
+        Ok(SignalValue {
+            direction,
+            strength: (ratio - Decimal::ONE).abs().min(Decimal::ONE).to_f64().unwrap(),
+            confidence: 0.0,
+            metadata: HashMap::new(),
+        })
+    }
+}
+```
+
+### Step 5: Run Tests (Should Pass)
+```bash
+cargo test -p algo-trade-signals
+# All tests pass
+```
+
+### Step 6: Add Edge Cases
+```rust
+#[test]
+fn handles_zero_ask_volume() {
+    let ctx = SignalContext {
+        orderbook: OrderBook {
+            bid_volume: dec!(100),
+            ask_volume: Decimal::ZERO,
+        },
+        ..Default::default()
+    };
+
+    let mut signal = OrderBookImbalanceSignal::new(1.5);
+    let result = signal.compute_sync(&ctx);
+
+    // Should handle gracefully, not panic
+    assert!(result.is_err() || result.unwrap().direction == Direction::Up);
+}
+```
 
 ### Step 7: Verify Coverage
 ```bash
-npm run test:coverage
-# Verify 80%+ coverage achieved
+cargo tarpaulin -p algo-trade-signals --out Html
+# Open tarpaulin-report.html
 ```
 
-## Testing Patterns
+## Statistical Test Patterns
 
-### Unit Test Pattern (Jest/Vitest)
-```typescript
-import { render, screen, fireEvent } from '@testing-library/react'
-import { Button } from './Button'
+### Testing Confidence Intervals
+```rust
+#[test]
+fn wilson_ci_contains_true_proportion() {
+    // 550 wins out of 1000 trials (55% win rate)
+    let (lower, upper) = wilson_ci(550, 1000, 1.96);
 
-describe('Button Component', () => {
-  it('renders with correct text', () => {
-    render(<Button>Click me</Button>)
-    expect(screen.getByText('Click me')).toBeInTheDocument()
-  })
+    // CI should contain the true proportion
+    assert!(lower < 0.55);
+    assert!(upper > 0.55);
 
-  it('calls onClick when clicked', () => {
-    const handleClick = jest.fn()
-    render(<Button onClick={handleClick}>Click</Button>)
+    // CI should be reasonable width
+    assert!(upper - lower < 0.10);
+}
 
-    fireEvent.click(screen.getByRole('button'))
+#[test]
+fn wilson_ci_narrows_with_more_samples() {
+    let (lower1, upper1) = wilson_ci(55, 100, 1.96);
+    let (lower2, upper2) = wilson_ci(550, 1000, 1.96);
 
-    expect(handleClick).toHaveBeenCalledTimes(1)
-  })
+    let width1 = upper1 - lower1;
+    let width2 = upper2 - lower2;
 
-  it('is disabled when disabled prop is true', () => {
-    render(<Button disabled>Click</Button>)
-    expect(screen.getByRole('button')).toBeDisabled()
-  })
-})
-```
-
-### API Integration Test Pattern
-```typescript
-import { NextRequest } from 'next/server'
-import { GET } from './route'
-
-describe('GET /api/markets', () => {
-  it('returns markets successfully', async () => {
-    const request = new NextRequest('http://localhost/api/markets')
-    const response = await GET(request)
-    const data = await response.json()
-
-    expect(response.status).toBe(200)
-    expect(data.success).toBe(true)
-    expect(Array.isArray(data.data)).toBe(true)
-  })
-
-  it('validates query parameters', async () => {
-    const request = new NextRequest('http://localhost/api/markets?limit=invalid')
-    const response = await GET(request)
-
-    expect(response.status).toBe(400)
-  })
-
-  it('handles database errors gracefully', async () => {
-    // Mock database failure
-    const request = new NextRequest('http://localhost/api/markets')
-    // Test error handling
-  })
-})
-```
-
-### E2E Test Pattern (Playwright)
-```typescript
-import { test, expect } from '@playwright/test'
-
-test('user can search and filter markets', async ({ page }) => {
-  // Navigate to markets page
-  await page.goto('/')
-  await page.click('a[href="/markets"]')
-
-  // Verify page loaded
-  await expect(page.locator('h1')).toContainText('Markets')
-
-  // Search for markets
-  await page.fill('input[placeholder="Search markets"]', 'election')
-
-  // Wait for debounce and results
-  await page.waitForTimeout(600)
-
-  // Verify search results displayed
-  const results = page.locator('[data-testid="market-card"]')
-  await expect(results).toHaveCount(5, { timeout: 5000 })
-
-  // Verify results contain search term
-  const firstResult = results.first()
-  await expect(firstResult).toContainText('election', { ignoreCase: true })
-
-  // Filter by status
-  await page.click('button:has-text("Active")')
-
-  // Verify filtered results
-  await expect(results).toHaveCount(3)
-})
-
-test('user can create a new market', async ({ page }) => {
-  // Login first
-  await page.goto('/creator-dashboard')
-
-  // Fill market creation form
-  await page.fill('input[name="name"]', 'Test Market')
-  await page.fill('textarea[name="description"]', 'Test description')
-  await page.fill('input[name="endDate"]', '2025-12-31')
-
-  // Submit form
-  await page.click('button[type="submit"]')
-
-  // Verify success message
-  await expect(page.locator('text=Market created successfully')).toBeVisible()
-
-  // Verify redirect to market page
-  await expect(page).toHaveURL(/\/markets\/test-market/)
-})
-```
-
-## Test File Organization
-
-```
-src/
-├── components/
-│   ├── Button/
-│   │   ├── Button.tsx
-│   │   ├── Button.test.tsx          # Unit tests
-│   │   └── Button.stories.tsx       # Storybook
-│   └── MarketCard/
-│       ├── MarketCard.tsx
-│       └── MarketCard.test.tsx
-├── app/
-│   └── api/
-│       └── markets/
-│           ├── route.ts
-│           └── route.test.ts         # Integration tests
-└── e2e/
-    ├── markets.spec.ts               # E2E tests
-    ├── trading.spec.ts
-    └── auth.spec.ts
-```
-
-## Mocking External Services
-
-### Supabase Mock
-```typescript
-jest.mock('@/lib/supabase', () => ({
-  supabase: {
-    from: jest.fn(() => ({
-      select: jest.fn(() => ({
-        eq: jest.fn(() => Promise.resolve({
-          data: [{ id: 1, name: 'Test Market' }],
-          error: null
-        }))
-      }))
-    }))
-  }
-}))
-```
-
-### Redis Mock
-```typescript
-jest.mock('@/lib/redis', () => ({
-  searchMarketsByVector: jest.fn(() => Promise.resolve([
-    { slug: 'test-market', similarity_score: 0.95 }
-  ])),
-  checkRedisHealth: jest.fn(() => Promise.resolve({ connected: true }))
-}))
-```
-
-### OpenAI Mock
-```typescript
-jest.mock('@/lib/openai', () => ({
-  generateEmbedding: jest.fn(() => Promise.resolve(
-    new Array(1536).fill(0.1) // Mock 1536-dim embedding
-  ))
-}))
-```
-
-## Test Coverage Verification
-
-### Run Coverage Report
-```bash
-npm run test:coverage
-```
-
-### Coverage Thresholds
-```json
-{
-  "jest": {
-    "coverageThresholds": {
-      "global": {
-        "branches": 80,
-        "functions": 80,
-        "lines": 80,
-        "statements": 80
-      }
-    }
-  }
+    // More samples = narrower CI
+    assert!(width2 < width1);
 }
 ```
 
-## Common Testing Mistakes to Avoid
+### Testing Kelly Criterion
+```rust
+use proptest::prelude::*;
 
-### ❌ WRONG: Testing Implementation Details
-```typescript
-// Don't test internal state
-expect(component.state.count).toBe(5)
+proptest! {
+    #[test]
+    fn kelly_never_exceeds_one(p in 0.01..0.99f64, b in 0.01..10.0f64) {
+        let kelly = calculate_kelly(p, b);
+        prop_assert!(kelly <= 1.0);
+    }
+
+    #[test]
+    fn kelly_negative_when_no_edge(p in 0.01..0.49f64, b in 0.5..2.0f64) {
+        // When p < 1/(b+1), Kelly should be negative (no bet)
+        if p < 1.0 / (b + 1.0) {
+            let kelly = calculate_kelly(p, b);
+            prop_assert!(kelly < 0.0);
+        }
+    }
+
+    #[test]
+    fn kelly_increases_with_edge(b in 1.0..2.0f64) {
+        let k1 = calculate_kelly(0.55, b);
+        let k2 = calculate_kelly(0.60, b);
+        prop_assert!(k2 > k1);
+    }
+}
 ```
 
-### ✅ CORRECT: Test User-Visible Behavior
-```typescript
-// Test what users see
-expect(screen.getByText('Count: 5')).toBeInTheDocument()
+### Testing Financial Calculations
+```rust
+#[test]
+fn ev_calculation_matches_formula() {
+    let p = dec!(0.55);      // Win probability
+    let price = dec!(0.45);  // Cost per share
+
+    // EV = p * (1 - price) - (1-p) * price
+    let expected_ev = p * (Decimal::ONE - price) - (Decimal::ONE - p) * price;
+    let calculated_ev = calculate_ev(p, price);
+
+    assert_eq!(calculated_ev, expected_ev);
+}
+
+#[test]
+fn no_bet_when_negative_ev() {
+    let p = dec!(0.45);      // Below break-even
+    let price = dec!(0.50);
+
+    let ev = calculate_ev(p, price);
+    assert!(ev < Decimal::ZERO);
+
+    let bet = should_bet(p, price, dec!(0.02)); // 2% minimum edge
+    assert!(!bet);
+}
 ```
 
-### ❌ WRONG: Brittle Selectors
-```typescript
-// Breaks easily
-await page.click('.css-class-xyz')
+## Async Test Patterns
+
+```rust
+#[tokio::test]
+async fn signal_computes_async() {
+    let ctx = SignalContext::mock();
+    let mut signal = FundingRateSignal::new();
+
+    let result = signal.compute(&ctx).await;
+
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn handles_timeout() {
+    let slow_provider = SlowMockProvider::new(Duration::from_secs(10));
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        fetch_data(&slow_provider)
+    ).await;
+
+    assert!(result.is_err()); // Should timeout
+}
 ```
 
-### ✅ CORRECT: Semantic Selectors
-```typescript
-// Resilient to changes
-await page.click('button:has-text("Submit")')
-await page.click('[data-testid="submit-button"]')
+## Database Test Patterns
+
+```rust
+#[sqlx::test]
+async fn inserts_orderbook_snapshot(pool: PgPool) {
+    let snapshot = OrderBookSnapshot {
+        timestamp: Utc::now(),
+        symbol: "BTCUSDT".to_string(),
+        exchange: "binance".to_string(),
+        bid_volume: dec!(100),
+        ask_volume: dec!(100),
+        imbalance: dec!(0),
+    };
+
+    insert_snapshot(&pool, &snapshot).await.unwrap();
+
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM orderbook_snapshots")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(count.0, 1);
+}
 ```
 
-### ❌ WRONG: No Test Isolation
-```typescript
-// Tests depend on each other
-test('creates user', () => { /* ... */ })
-test('updates same user', () => { /* depends on previous test */ })
-```
+## Test Commands
 
-### ✅ CORRECT: Independent Tests
-```typescript
-// Each test sets up its own data
-test('creates user', () => {
-  const user = createTestUser()
-  // Test logic
-})
-
-test('updates user', () => {
-  const user = createTestUser()
-  // Update logic
-})
-```
-
-## Continuous Testing
-
-### Watch Mode During Development
 ```bash
-npm test -- --watch
-# Tests run automatically on file changes
+# Run all tests
+cargo test
+
+# Run specific crate
+cargo test -p algo-trade-signals
+
+# Run with output
+cargo test -- --nocapture
+
+# Run specific test
+cargo test wilson_ci_contains_true_proportion
+
+# Coverage report
+cargo tarpaulin --out Html
+
+# Property tests with more cases
+cargo test -- --test-threads=1
 ```
 
-### Pre-Commit Hook
-```bash
-# Runs before every commit
-npm test && npm run lint
+## Coverage Verification
+
+```toml
+# In Cargo.toml or .cargo/config.toml
+[target.'cfg(coverage)'.coverage]
+exclude = [
+    "tests/*",
+    "benches/*",
+]
 ```
-
-### CI/CD Integration
-```yaml
-# GitHub Actions
-- name: Run Tests
-  run: npm test -- --coverage
-- name: Upload Coverage
-  uses: codecov/codecov-action@v3
-```
-
-## Best Practices
-
-1. **Write Tests First** - Always TDD
-2. **One Assert Per Test** - Focus on single behavior
-3. **Descriptive Test Names** - Explain what's tested
-4. **Arrange-Act-Assert** - Clear test structure
-5. **Mock External Dependencies** - Isolate unit tests
-6. **Test Edge Cases** - Null, undefined, empty, large
-7. **Test Error Paths** - Not just happy paths
-8. **Keep Tests Fast** - Unit tests < 50ms each
-9. **Clean Up After Tests** - No side effects
-10. **Review Coverage Reports** - Identify gaps
 
 ## Success Metrics
 
-- 80%+ code coverage achieved
-- All tests passing (green)
-- No skipped or disabled tests
-- Fast test execution (< 30s for unit tests)
-- E2E tests cover critical user flows
-- Tests catch bugs before production
-
----
-
-**Remember**: Tests are not optional. They are the safety net that enables confident refactoring, rapid development, and production reliability.
+- 80%+ code coverage
+- All tests passing
+- Property tests cover edge cases
+- Statistical calculations verified
+- No `unwrap()` in library code
+- Async tests use proper timeouts
