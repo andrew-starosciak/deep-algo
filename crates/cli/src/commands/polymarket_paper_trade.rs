@@ -2,6 +2,20 @@
 //!
 //! Simulates trading on Polymarket BTC markets using signal-based decision making
 //! with Kelly criterion position sizing.
+//!
+//! ## Signal Modes
+//!
+//! - **Simulated**: Uses price-based heuristics (default for testing)
+//! - **Real**: Uses `LiquidationCascadeSignal` from database aggregates
+//!
+//! ## Real Signal Configuration
+//!
+//! When `--use-simulated-signals=false`, the system fetches liquidation aggregates
+//! from the database and computes signals using the configured mode:
+//!
+//! - **cascade**: Follow liquidation momentum
+//! - **exhaustion**: Bet on reversals after spikes
+//! - **combined**: Weight both factors
 
 #![allow(dead_code)]
 
@@ -22,9 +36,15 @@ use algo_trade_backtest::{
     create_entry_strategy, EntryStrategy, EntryStrategyConfig, EntryStrategyType, FeeModel,
     FeeTier, PolymarketFees,
 };
+use algo_trade_core::{
+    Direction, LiquidationAggregate, SignalContext, SignalGenerator, SignalValue,
+};
 use algo_trade_data::{
-    KellyCriterion, PaperTradeDirection, PaperTradeRecord, PaperTradeRepository,
-    PolymarketOddsRecord, PolymarketOddsRepository,
+    KellyCriterion, LiquidationAggregateRecord, LiquidationRepository, PaperTradeDirection,
+    PaperTradeRecord, PaperTradeRepository, PolymarketOddsRecord, PolymarketOddsRepository,
+};
+use algo_trade_signals::{
+    CascadeConfig, ExhaustionConfig, LiquidationCascadeSignal, LiquidationSignalMode,
 };
 
 /// Arguments for the polymarket-paper-trade command.
@@ -108,7 +128,245 @@ pub struct PolymarketPaperTradeArgs {
     /// Entry poll interval in seconds for monitoring entry conditions
     #[arg(long, default_value = "10")]
     pub entry_poll_secs: u64,
+
+    // =========================================================================
+    // Real Signal Arguments
+    // =========================================================================
+    /// Use simulated signals instead of real liquidation data
+    #[arg(long, default_value = "true")]
+    pub use_simulated_signals: bool,
+
+    /// Signal mode: cascade, exhaustion, or combined
+    #[arg(long, default_value = "cascade")]
+    pub signal_mode: String,
+
+    /// Minimum total volume in USD to consider a cascade
+    #[arg(long, default_value = "100000")]
+    pub min_volume_usd: f64,
+
+    /// Minimum imbalance ratio to trigger cascade signal (0.0 to 1.0)
+    #[arg(long, default_value = "0.6")]
+    pub imbalance_threshold: f64,
+
+    /// Liquidation aggregation window in minutes
+    #[arg(long, default_value = "5")]
+    pub liquidation_window_mins: i32,
+
+    /// Symbol for liquidation data (e.g., BTCUSDT)
+    #[arg(long, default_value = "BTCUSDT")]
+    pub liquidation_symbol: String,
+
+    /// Exchange for liquidation data (e.g., binance)
+    #[arg(long, default_value = "binance")]
+    pub liquidation_exchange: String,
 }
+
+// =============================================================================
+// Signal Configuration
+// =============================================================================
+
+/// Parses signal mode string to enum.
+///
+/// # Arguments
+/// * `s` - Signal mode string (cascade, exhaustion, combined)
+///
+/// # Returns
+/// The corresponding `LiquidationSignalMode`, defaulting to `Cascade` for invalid inputs.
+#[must_use]
+pub fn parse_signal_mode(s: &str) -> LiquidationSignalMode {
+    match s.to_lowercase().as_str() {
+        "cascade" => LiquidationSignalMode::Cascade,
+        "exhaustion" => LiquidationSignalMode::Exhaustion,
+        "combined" => LiquidationSignalMode::Combined,
+        _ => LiquidationSignalMode::Cascade,
+    }
+}
+
+/// Configuration for real signal generation.
+#[derive(Debug, Clone)]
+pub struct SignalConfig {
+    /// Whether to use simulated signals instead of real data.
+    pub use_simulated: bool,
+    /// Signal mode (cascade, exhaustion, combined).
+    pub signal_mode: LiquidationSignalMode,
+    /// Minimum volume in USD for cascade detection.
+    pub min_volume_usd: Decimal,
+    /// Imbalance threshold for cascade detection.
+    pub imbalance_threshold: f64,
+    /// Liquidation window size in minutes.
+    pub liquidation_window_mins: i32,
+    /// Symbol for liquidation data.
+    pub liquidation_symbol: String,
+    /// Exchange for liquidation data.
+    pub liquidation_exchange: String,
+}
+
+impl Default for SignalConfig {
+    fn default() -> Self {
+        Self {
+            use_simulated: true,
+            signal_mode: LiquidationSignalMode::Cascade,
+            min_volume_usd: dec!(100000),
+            imbalance_threshold: 0.6,
+            liquidation_window_mins: 5,
+            liquidation_symbol: "BTCUSDT".to_string(),
+            liquidation_exchange: "binance".to_string(),
+        }
+    }
+}
+
+impl SignalConfig {
+    /// Creates a SignalConfig from CLI arguments.
+    #[must_use]
+    pub fn from_args(args: &PolymarketPaperTradeArgs) -> Self {
+        Self {
+            use_simulated: args.use_simulated_signals,
+            signal_mode: parse_signal_mode(&args.signal_mode),
+            min_volume_usd: Decimal::try_from(args.min_volume_usd).unwrap_or(dec!(100000)),
+            imbalance_threshold: args.imbalance_threshold.clamp(0.0, 1.0),
+            liquidation_window_mins: args.liquidation_window_mins,
+            liquidation_symbol: args.liquidation_symbol.clone(),
+            liquidation_exchange: args.liquidation_exchange.clone(),
+        }
+    }
+
+    /// Creates a `CascadeConfig` from this signal config.
+    #[must_use]
+    pub fn to_cascade_config(&self) -> CascadeConfig {
+        CascadeConfig::new(self.min_volume_usd, self.imbalance_threshold)
+    }
+
+    /// Creates an `ExhaustionConfig` with default values.
+    #[must_use]
+    pub fn to_exhaustion_config(&self) -> ExhaustionConfig {
+        ExhaustionConfig::default()
+    }
+}
+
+/// Converts a `LiquidationAggregateRecord` from data layer to core `LiquidationAggregate`.
+#[must_use]
+pub fn convert_aggregate_record_to_core(
+    record: &LiquidationAggregateRecord,
+) -> LiquidationAggregate {
+    LiquidationAggregate {
+        timestamp: record.timestamp,
+        window_minutes: record.window_minutes,
+        long_volume_usd: record.long_volume,
+        short_volume_usd: record.short_volume,
+        net_delta_usd: record.net_delta,
+        count_long: record.count_long,
+        count_short: record.count_short,
+    }
+}
+
+/// Creates a `LiquidationCascadeSignal` configured according to `SignalConfig`.
+///
+/// # Arguments
+/// * `config` - Signal configuration from CLI args
+///
+/// # Returns
+/// A configured `LiquidationCascadeSignal` ready for computation.
+#[must_use]
+pub fn create_liquidation_signal(config: &SignalConfig) -> LiquidationCascadeSignal {
+    let cascade_config = config.to_cascade_config();
+
+    let mut signal = LiquidationCascadeSignal::default()
+        .with_mode(config.signal_mode)
+        .with_cascade_config(cascade_config)
+        .with_min_volume(config.min_volume_usd);
+
+    // Add exhaustion config for exhaustion and combined modes
+    if matches!(
+        config.signal_mode,
+        LiquidationSignalMode::Exhaustion | LiquidationSignalMode::Combined
+    ) {
+        signal = signal.with_exhaustion_config(config.to_exhaustion_config());
+    }
+
+    signal
+}
+
+/// Converts a `Direction` to a (signal_direction, is_directional) tuple.
+///
+/// # Returns
+/// - `signal_direction`: true for Up, false for Down, true for Neutral (default)
+/// - `is_directional`: true for Up/Down, false for Neutral
+#[must_use]
+pub fn direction_to_signal_bool(direction: Direction) -> (bool, bool) {
+    match direction {
+        Direction::Up => (true, true),
+        Direction::Down => (false, true),
+        Direction::Neutral => (true, false), // Default to true but mark as non-directional
+    }
+}
+
+/// Result of computing a real signal.
+#[derive(Debug, Clone)]
+pub struct SignalResult {
+    /// Whether the signal has a directional bias.
+    pub is_directional: bool,
+    /// The signal direction (true = Up/Yes, false = Down/No).
+    pub signal_direction: bool,
+    /// Signal strength (0.0 to 1.0).
+    pub strength: f64,
+    /// Total liquidation volume.
+    pub total_volume: f64,
+    /// Net delta (-1.0 to 1.0).
+    pub net_delta: f64,
+    /// Long liquidation volume.
+    pub long_volume: f64,
+    /// Short liquidation volume.
+    pub short_volume: f64,
+}
+
+impl SignalResult {
+    /// Creates a `SignalResult` from a `SignalValue`.
+    #[must_use]
+    pub fn from_signal_value(value: &SignalValue) -> Self {
+        let (signal_direction, is_directional) = direction_to_signal_bool(value.direction);
+
+        Self {
+            is_directional,
+            signal_direction,
+            strength: value.strength,
+            total_volume: *value.metadata.get("total_volume").unwrap_or(&0.0),
+            net_delta: *value.metadata.get("net_delta").unwrap_or(&0.0),
+            long_volume: *value.metadata.get("long_volume").unwrap_or(&0.0),
+            short_volume: *value.metadata.get("short_volume").unwrap_or(&0.0),
+        }
+    }
+}
+
+/// Formats a log message for a signal result.
+#[must_use]
+pub fn format_signal_log(result: &SignalResult, market_id: &str) -> String {
+    if result.is_directional {
+        let direction_str = if result.signal_direction {
+            "Up"
+        } else {
+            "Down"
+        };
+        format!(
+            "Signal for {}: direction={}, strength={:.2}, volume=${:.0}, delta={:.2}, long=${:.0}, short=${:.0}",
+            market_id,
+            direction_str,
+            result.strength,
+            result.total_volume,
+            result.net_delta,
+            result.long_volume,
+            result.short_volume
+        )
+    } else {
+        format!(
+            "No signal for {}: Neutral (volume=${:.0}, delta={:.2})",
+            market_id, result.total_volume, result.net_delta
+        )
+    }
+}
+
+// =============================================================================
+// Decision Engine Configuration
+// =============================================================================
 
 /// Configuration for the paper trading decision engine.
 #[derive(Debug, Clone)]
@@ -135,6 +393,10 @@ pub struct DecisionEngineConfig {
     pub entry_config: EntryStrategyConfig,
     /// Entry poll interval in seconds.
     pub entry_poll_secs: u64,
+
+    // Real signal configuration
+    /// Configuration for real signal generation.
+    pub signal_config: SignalConfig,
 }
 
 impl DecisionEngineConfig {
@@ -161,6 +423,9 @@ impl DecisionEngineConfig {
             cutoff_mins: args.window_minutes - 1, // Default cutoff 1 minute before window close
         };
 
+        // Parse signal configuration
+        let signal_config = SignalConfig::from_args(args);
+
         Self {
             signal_type: args.signal.clone(),
             min_signal_strength: args.min_signal_strength,
@@ -172,6 +437,7 @@ impl DecisionEngineConfig {
             cooldown: Duration::from_secs(args.cooldown_secs),
             entry_config,
             entry_poll_secs: args.entry_poll_secs,
+            signal_config,
         }
     }
 
@@ -694,19 +960,35 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
 
     // Create repositories
     let odds_repo = PolymarketOddsRepository::new(pool.clone());
-    let paper_repo = PaperTradeRepository::new(pool);
+    let paper_repo = PaperTradeRepository::new(pool.clone());
+    let liq_repo = LiquidationRepository::new(pool);
 
     // Create executor
     let config = DecisionEngineConfig::from_args(&args);
+    let signal_config = config.signal_config.clone();
     let initial_bankroll = Decimal::try_from(args.bankroll).unwrap_or(dec!(10000));
     let executor = Arc::new(Mutex::new(PaperTradeExecutor::new(
         config,
         initial_bankroll,
     )));
 
+    // Log signal mode
+    let signal_mode_str = if signal_config.use_simulated {
+        "simulated".to_string()
+    } else {
+        format!(
+            "real ({:?}) from {}/{} window={}m",
+            signal_config.signal_mode,
+            signal_config.liquidation_symbol,
+            signal_config.liquidation_exchange,
+            signal_config.liquidation_window_mins
+        )
+    };
+
     tracing::info!(
-        "Paper trading config: signal={}, min_strength={:.2}, kelly_fraction={:.2}, bankroll=${}",
+        "Paper trading config: signal={}, mode={}, min_strength={:.2}, kelly_fraction={:.2}, bankroll=${}",
         args.signal,
+        signal_mode_str,
         args.min_signal_strength,
         args.kelly_fraction,
         initial_bankroll
@@ -719,17 +1001,20 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     let poll_interval = Duration::from_secs(args.poll_interval_secs);
     let shutdown_clone = shutdown.clone();
     let executor_clone = executor.clone();
+    let signal_type = args.signal.clone();
 
     let trading_handle = tokio::spawn(async move {
-        run_trading_loop(
-            executor_clone,
+        let ctx = TradingLoopContext {
+            executor: executor_clone,
             odds_repo,
             paper_repo,
+            liq_repo,
             poll_interval,
-            shutdown_clone,
-            &args.signal,
-        )
-        .await
+            shutdown: shutdown_clone,
+            signal_type,
+            signal_config,
+        };
+        run_trading_loop(ctx).await
     });
 
     // Wait for duration or shutdown signal
@@ -765,16 +1050,38 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     Ok(())
 }
 
-/// Main trading loop that polls for opportunities and executes trades.
-async fn run_trading_loop(
+/// Context for the trading loop containing all required dependencies.
+struct TradingLoopContext {
     executor: Arc<Mutex<PaperTradeExecutor>>,
     odds_repo: PolymarketOddsRepository,
     paper_repo: PaperTradeRepository,
+    liq_repo: LiquidationRepository,
     poll_interval: Duration,
     shutdown: Arc<AtomicBool>,
-    signal_type: &str,
-) {
+    signal_type: String,
+    signal_config: SignalConfig,
+}
+
+/// Main trading loop that polls for opportunities and executes trades.
+async fn run_trading_loop(ctx: TradingLoopContext) {
+    let TradingLoopContext {
+        executor,
+        odds_repo,
+        paper_repo,
+        liq_repo,
+        poll_interval,
+        shutdown,
+        signal_type,
+        signal_config,
+    } = ctx;
     let mut interval = tokio::time::interval(poll_interval);
+
+    // Initialize liquidation signal if using real signals
+    let mut liq_signal = if !signal_config.use_simulated {
+        Some(create_liquidation_signal(&signal_config))
+    } else {
+        None
+    };
 
     loop {
         interval.tick().await;
@@ -800,19 +1107,62 @@ async fn run_trading_loop(
             continue;
         }
 
+        // Compute signal (real or simulated)
+        let (signal_strength, signal_direction) = if let Some(ref mut signal) = liq_signal {
+            // Use real liquidation signal
+            match compute_real_signal(&liq_repo, signal, &signal_config, now).await {
+                Ok(result) => {
+                    // Log signal computation
+                    if result.is_directional {
+                        tracing::debug!(
+                            direction = if result.signal_direction {
+                                "Up"
+                            } else {
+                                "Down"
+                            },
+                            strength = result.strength,
+                            volume = result.total_volume,
+                            delta = result.net_delta,
+                            "Real signal computed"
+                        );
+                    }
+                    (result.strength, result.signal_direction)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to compute real signal, falling back to simulated: {}",
+                        e
+                    );
+                    // Fallback to simulated for this iteration
+                    (0.0, true)
+                }
+            }
+        } else {
+            // Use simulated signal (computed per-market below)
+            (0.0, true) // Placeholder, will be computed per market
+        };
+
         // Evaluate each market
-        for market in markets {
-            // Simulate signal generation (in production, use actual signals)
-            let (signal_strength, signal_direction) = simulate_signal(signal_type, &market);
+        for market in &markets {
+            // Determine signal for this market
+            let (strength, direction) = if liq_signal.is_some() {
+                // Real signal already computed above (applies to all markets)
+                (signal_strength, signal_direction)
+            } else {
+                // Simulate signal per-market
+                simulate_signal(&signal_type, market)
+            };
 
             let mut exec = executor.lock().await;
-            if let Some(trade) = exec.execute(&market, signal_strength, signal_direction, now) {
+            if let Some(trade) = exec.execute(market, strength, direction, now) {
                 // Store the trade
                 match paper_repo.insert(&trade).await {
                     Ok(id) => {
                         tracing::info!(
                             trade_id = id,
                             market_id = %trade.market_id,
+                            signal_strength = strength,
+                            signal_direction = if direction { "yes" } else { "no" },
                             "Paper trade stored"
                         );
                     }
@@ -834,6 +1184,55 @@ async fn run_trading_loop(
             "Trading loop status"
         );
     }
+}
+
+/// Computes a real signal from the liquidation repository.
+///
+/// Fetches the latest liquidation aggregate and computes the signal using
+/// the configured `LiquidationCascadeSignal`.
+///
+/// # Arguments
+/// * `liq_repo` - Liquidation repository for fetching data
+/// * `signal` - The liquidation cascade signal generator
+/// * `config` - Signal configuration
+/// * `now` - Current timestamp
+///
+/// # Errors
+/// Returns an error if database query fails or signal computation fails.
+async fn compute_real_signal(
+    liq_repo: &LiquidationRepository,
+    signal: &mut LiquidationCascadeSignal,
+    config: &SignalConfig,
+    now: DateTime<Utc>,
+) -> Result<SignalResult> {
+    // Fetch latest aggregate
+    let aggregate_record = liq_repo
+        .get_latest_aggregate(
+            &config.liquidation_symbol,
+            &config.liquidation_exchange,
+            config.liquidation_window_mins,
+        )
+        .await?;
+
+    // Convert to core type and compute signal
+    let signal_value = if let Some(record) = aggregate_record {
+        let core_agg = convert_aggregate_record_to_core(&record);
+        let ctx = SignalContext::new(now, &config.liquidation_symbol)
+            .with_exchange(&config.liquidation_exchange)
+            .with_liquidation_aggregates(core_agg);
+
+        signal.compute(&ctx).await?
+    } else {
+        tracing::debug!(
+            "No liquidation aggregate found for {}/{} window={}m",
+            config.liquidation_symbol,
+            config.liquidation_exchange,
+            config.liquidation_window_mins
+        );
+        SignalValue::neutral()
+    };
+
+    Ok(SignalResult::from_signal_value(&signal_value))
 }
 
 /// Simulates signal generation for a market.
@@ -898,6 +1297,7 @@ mod tests {
             cooldown: Duration::from_secs(900),
             entry_config: EntryStrategyConfig::immediate(),
             entry_poll_secs: 10,
+            signal_config: SignalConfig::default(),
         }
     }
 
@@ -930,29 +1330,57 @@ mod tests {
     // DecisionEngineConfig Tests
     // =========================================================================
 
-    #[test]
-    fn test_decision_engine_config_from_args() {
-        let args = PolymarketPaperTradeArgs {
+    /// Creates default test args with all fields populated.
+    fn sample_args() -> PolymarketPaperTradeArgs {
+        PolymarketPaperTradeArgs {
             duration: "24h".to_string(),
             signal: "composite".to_string(),
-            min_signal_strength: 0.7,
-            stake: 200.0,
-            kelly_fraction: 0.5,
-            min_edge: 0.03,
-            bankroll: 20000.0,
-            max_bet_fraction: 0.1,
-            fee_tier: "2".to_string(),
-            poll_interval_secs: 120,
+            min_signal_strength: 0.6,
+            stake: 100.0,
+            kelly_fraction: 0.25,
+            min_edge: 0.02,
+            bankroll: 10000.0,
+            max_bet_fraction: 0.05,
+            fee_tier: "0".to_string(),
+            poll_interval_secs: 60,
             db_url: None,
-            cooldown_secs: 1800,
-            use_fixed_stake: true,
-            entry_strategy: "edge_threshold".to_string(),
-            entry_threshold: 0.05,
-            entry_offset_pct: 0.3,
-            entry_fallback_mins: 3,
+            cooldown_secs: 900,
+            use_fixed_stake: false,
+            entry_strategy: "immediate".to_string(),
+            entry_threshold: 0.03,
+            entry_offset_pct: 0.25,
+            entry_fallback_mins: 2,
             window_minutes: 15,
-            entry_poll_secs: 15,
-        };
+            entry_poll_secs: 10,
+            // Signal config defaults
+            use_simulated_signals: true,
+            signal_mode: "cascade".to_string(),
+            min_volume_usd: 100000.0,
+            imbalance_threshold: 0.6,
+            liquidation_window_mins: 5,
+            liquidation_symbol: "BTCUSDT".to_string(),
+            liquidation_exchange: "binance".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_decision_engine_config_from_args() {
+        let mut args = sample_args();
+        args.min_signal_strength = 0.7;
+        args.stake = 200.0;
+        args.kelly_fraction = 0.5;
+        args.min_edge = 0.03;
+        args.bankroll = 20000.0;
+        args.max_bet_fraction = 0.1;
+        args.fee_tier = "2".to_string();
+        args.poll_interval_secs = 120;
+        args.cooldown_secs = 1800;
+        args.use_fixed_stake = true;
+        args.entry_strategy = "edge_threshold".to_string();
+        args.entry_threshold = 0.05;
+        args.entry_offset_pct = 0.3;
+        args.entry_fallback_mins = 3;
+        args.entry_poll_secs = 15;
 
         let config = DecisionEngineConfig::from_args(&args);
 
@@ -1329,27 +1757,19 @@ mod tests {
 
     #[test]
     fn test_args_structure() {
-        let args = PolymarketPaperTradeArgs {
-            duration: "7d".to_string(),
-            signal: "imbalance".to_string(),
-            min_signal_strength: 0.7,
-            stake: 200.0,
-            kelly_fraction: 0.5,
-            min_edge: 0.05,
-            bankroll: 50000.0,
-            max_bet_fraction: 0.1,
-            fee_tier: "1".to_string(),
-            poll_interval_secs: 120,
-            db_url: Some("postgres://localhost/test".to_string()),
-            cooldown_secs: 1800,
-            use_fixed_stake: false,
-            entry_strategy: "immediate".to_string(),
-            entry_threshold: 0.03,
-            entry_offset_pct: 0.25,
-            entry_fallback_mins: 2,
-            window_minutes: 15,
-            entry_poll_secs: 10,
-        };
+        let mut args = sample_args();
+        args.duration = "7d".to_string();
+        args.signal = "imbalance".to_string();
+        args.min_signal_strength = 0.7;
+        args.stake = 200.0;
+        args.kelly_fraction = 0.5;
+        args.min_edge = 0.05;
+        args.bankroll = 50000.0;
+        args.max_bet_fraction = 0.1;
+        args.fee_tier = "1".to_string();
+        args.poll_interval_secs = 120;
+        args.db_url = Some("postgres://localhost/test".to_string());
+        args.cooldown_secs = 1800;
 
         assert_eq!(args.duration, "7d");
         assert_eq!(args.signal, "imbalance");
@@ -1366,27 +1786,7 @@ mod tests {
 
     #[test]
     fn test_entry_strategy_config_immediate() {
-        let args = PolymarketPaperTradeArgs {
-            duration: "24h".to_string(),
-            signal: "composite".to_string(),
-            min_signal_strength: 0.6,
-            stake: 100.0,
-            kelly_fraction: 0.25,
-            min_edge: 0.02,
-            bankroll: 10000.0,
-            max_bet_fraction: 0.05,
-            fee_tier: "0".to_string(),
-            poll_interval_secs: 60,
-            db_url: None,
-            cooldown_secs: 900,
-            use_fixed_stake: false,
-            entry_strategy: "immediate".to_string(),
-            entry_threshold: 0.03,
-            entry_offset_pct: 0.25,
-            entry_fallback_mins: 2,
-            window_minutes: 15,
-            entry_poll_secs: 10,
-        };
+        let args = sample_args(); // Uses immediate by default
 
         let config = DecisionEngineConfig::from_args(&args);
         assert_eq!(
@@ -1400,27 +1800,10 @@ mod tests {
 
     #[test]
     fn test_entry_strategy_config_fixed_time_with_fallback() {
-        let args = PolymarketPaperTradeArgs {
-            duration: "24h".to_string(),
-            signal: "composite".to_string(),
-            min_signal_strength: 0.6,
-            stake: 100.0,
-            kelly_fraction: 0.25,
-            min_edge: 0.02,
-            bankroll: 10000.0,
-            max_bet_fraction: 0.05,
-            fee_tier: "0".to_string(),
-            poll_interval_secs: 60,
-            db_url: None,
-            cooldown_secs: 900,
-            use_fixed_stake: false,
-            entry_strategy: "fixed_time".to_string(),
-            entry_threshold: 0.03,
-            entry_offset_pct: 0.5,
-            entry_fallback_mins: 3,
-            window_minutes: 15,
-            entry_poll_secs: 10,
-        };
+        let mut args = sample_args();
+        args.entry_strategy = "fixed_time".to_string();
+        args.entry_offset_pct = 0.5;
+        args.entry_fallback_mins = 3;
 
         let config = DecisionEngineConfig::from_args(&args);
         assert_eq!(
@@ -1436,27 +1819,10 @@ mod tests {
 
     #[test]
     fn test_entry_strategy_config_edge_threshold_without_fallback() {
-        let args = PolymarketPaperTradeArgs {
-            duration: "24h".to_string(),
-            signal: "composite".to_string(),
-            min_signal_strength: 0.6,
-            stake: 100.0,
-            kelly_fraction: 0.25,
-            min_edge: 0.02,
-            bankroll: 10000.0,
-            max_bet_fraction: 0.05,
-            fee_tier: "0".to_string(),
-            poll_interval_secs: 60,
-            db_url: None,
-            cooldown_secs: 900,
-            use_fixed_stake: false,
-            entry_strategy: "edge_threshold".to_string(),
-            entry_threshold: 0.05,
-            entry_offset_pct: 0.25,
-            entry_fallback_mins: 0, // Disable fallback
-            window_minutes: 15,
-            entry_poll_secs: 10,
-        };
+        let mut args = sample_args();
+        args.entry_strategy = "edge_threshold".to_string();
+        args.entry_threshold = 0.05;
+        args.entry_fallback_mins = 0; // Disable fallback
 
         let config = DecisionEngineConfig::from_args(&args);
         assert_eq!(
@@ -1588,5 +1954,530 @@ mod tests {
         assert!(summary.contains("Entry Strategy: immediate"));
         // But not the detailed stats
         assert!(!summary.contains("Primary entries"));
+    }
+
+    // =========================================================================
+    // Real Signal Wiring Tests (TDD)
+    // =========================================================================
+
+    mod real_signal_tests {
+        use super::*;
+        use algo_trade_core::{Direction, LiquidationAggregate};
+
+        // =====================================================================
+        // parse_signal_mode Tests
+        // =====================================================================
+
+        #[test]
+        fn test_parse_signal_mode_cascade() {
+            let mode = parse_signal_mode("cascade");
+            assert_eq!(mode, LiquidationSignalMode::Cascade);
+        }
+
+        #[test]
+        fn test_parse_signal_mode_exhaustion() {
+            let mode = parse_signal_mode("exhaustion");
+            assert_eq!(mode, LiquidationSignalMode::Exhaustion);
+        }
+
+        #[test]
+        fn test_parse_signal_mode_combined() {
+            let mode = parse_signal_mode("combined");
+            assert_eq!(mode, LiquidationSignalMode::Combined);
+        }
+
+        #[test]
+        fn test_parse_signal_mode_case_insensitive() {
+            assert_eq!(parse_signal_mode("CASCADE"), LiquidationSignalMode::Cascade);
+            assert_eq!(
+                parse_signal_mode("Exhaustion"),
+                LiquidationSignalMode::Exhaustion
+            );
+            assert_eq!(
+                parse_signal_mode("COMBINED"),
+                LiquidationSignalMode::Combined
+            );
+        }
+
+        #[test]
+        fn test_parse_signal_mode_invalid_defaults_to_cascade() {
+            let mode = parse_signal_mode("invalid");
+            assert_eq!(mode, LiquidationSignalMode::Cascade);
+        }
+
+        // =====================================================================
+        // SignalConfig Tests
+        // =====================================================================
+
+        #[test]
+        fn test_signal_config_default() {
+            let config = SignalConfig::default();
+
+            assert_eq!(config.signal_mode, LiquidationSignalMode::Cascade);
+            assert_eq!(config.min_volume_usd, dec!(100000));
+            assert!((config.imbalance_threshold - 0.6).abs() < f64::EPSILON);
+            assert_eq!(config.liquidation_window_mins, 5);
+            assert_eq!(config.liquidation_symbol, "BTCUSDT");
+            assert_eq!(config.liquidation_exchange, "binance");
+        }
+
+        #[test]
+        fn test_signal_config_from_args_custom_values() {
+            let args = PolymarketPaperTradeArgs {
+                duration: "24h".to_string(),
+                signal: "liquidation".to_string(),
+                min_signal_strength: 0.6,
+                stake: 100.0,
+                kelly_fraction: 0.25,
+                min_edge: 0.02,
+                bankroll: 10000.0,
+                max_bet_fraction: 0.05,
+                fee_tier: "0".to_string(),
+                poll_interval_secs: 60,
+                db_url: None,
+                cooldown_secs: 900,
+                use_fixed_stake: false,
+                entry_strategy: "immediate".to_string(),
+                entry_threshold: 0.03,
+                entry_offset_pct: 0.25,
+                entry_fallback_mins: 2,
+                window_minutes: 15,
+                entry_poll_secs: 10,
+                // New signal args
+                use_simulated_signals: false,
+                signal_mode: "exhaustion".to_string(),
+                min_volume_usd: 200000.0,
+                imbalance_threshold: 0.7,
+                liquidation_window_mins: 10,
+                liquidation_symbol: "ETHUSDT".to_string(),
+                liquidation_exchange: "bybit".to_string(),
+            };
+
+            let config = SignalConfig::from_args(&args);
+
+            assert!(!config.use_simulated);
+            assert_eq!(config.signal_mode, LiquidationSignalMode::Exhaustion);
+            assert_eq!(config.min_volume_usd, dec!(200000));
+            assert!((config.imbalance_threshold - 0.7).abs() < f64::EPSILON);
+            assert_eq!(config.liquidation_window_mins, 10);
+            assert_eq!(config.liquidation_symbol, "ETHUSDT");
+            assert_eq!(config.liquidation_exchange, "bybit");
+        }
+
+        #[test]
+        fn test_signal_config_simulated_mode() {
+            let args = PolymarketPaperTradeArgs {
+                duration: "24h".to_string(),
+                signal: "composite".to_string(),
+                min_signal_strength: 0.6,
+                stake: 100.0,
+                kelly_fraction: 0.25,
+                min_edge: 0.02,
+                bankroll: 10000.0,
+                max_bet_fraction: 0.05,
+                fee_tier: "0".to_string(),
+                poll_interval_secs: 60,
+                db_url: None,
+                cooldown_secs: 900,
+                use_fixed_stake: false,
+                entry_strategy: "immediate".to_string(),
+                entry_threshold: 0.03,
+                entry_offset_pct: 0.25,
+                entry_fallback_mins: 2,
+                window_minutes: 15,
+                entry_poll_secs: 10,
+                // Use simulated signals
+                use_simulated_signals: true,
+                signal_mode: "cascade".to_string(),
+                min_volume_usd: 100000.0,
+                imbalance_threshold: 0.6,
+                liquidation_window_mins: 5,
+                liquidation_symbol: "BTCUSDT".to_string(),
+                liquidation_exchange: "binance".to_string(),
+            };
+
+            let config = SignalConfig::from_args(&args);
+            assert!(config.use_simulated);
+        }
+
+        // =====================================================================
+        // convert_aggregate_record_to_core Tests
+        // =====================================================================
+
+        #[test]
+        fn test_convert_aggregate_record_to_core() {
+            use crate::commands::polymarket_paper_trade::convert_aggregate_record_to_core;
+            use algo_trade_data::LiquidationAggregateRecord;
+
+            let timestamp = sample_timestamp();
+            let record = LiquidationAggregateRecord {
+                timestamp,
+                symbol: "BTCUSDT".to_string(),
+                exchange: "binance".to_string(),
+                window_minutes: 5,
+                long_volume: dec!(100000),
+                short_volume: dec!(50000),
+                net_delta: dec!(50000),
+                count_long: 10,
+                count_short: 5,
+            };
+
+            let core_agg = convert_aggregate_record_to_core(&record);
+
+            assert_eq!(core_agg.timestamp, timestamp);
+            assert_eq!(core_agg.window_minutes, 5);
+            assert_eq!(core_agg.long_volume_usd, dec!(100000));
+            assert_eq!(core_agg.short_volume_usd, dec!(50000));
+            assert_eq!(core_agg.net_delta_usd, dec!(50000));
+            assert_eq!(core_agg.count_long, 10);
+            assert_eq!(core_agg.count_short, 5);
+        }
+
+        // =====================================================================
+        // direction_to_signal_bool Tests
+        // =====================================================================
+
+        #[test]
+        fn test_direction_to_signal_bool_up_is_true() {
+            let (direction, is_directional) = direction_to_signal_bool(Direction::Up);
+            assert!(direction);
+            assert!(is_directional);
+        }
+
+        #[test]
+        fn test_direction_to_signal_bool_down_is_false() {
+            let (direction, is_directional) = direction_to_signal_bool(Direction::Down);
+            assert!(!direction);
+            assert!(is_directional);
+        }
+
+        #[test]
+        fn test_direction_to_signal_bool_neutral() {
+            let (direction, is_directional) = direction_to_signal_bool(Direction::Neutral);
+            // For neutral, direction defaults to true but is_directional is false
+            assert!(direction);
+            assert!(!is_directional);
+        }
+
+        // =====================================================================
+        // SignalResult Tests
+        // =====================================================================
+
+        #[test]
+        fn test_signal_result_from_signal_value_strong_up() {
+            use algo_trade_core::SignalValue;
+
+            let signal_value = SignalValue::new(Direction::Up, 0.8, 0.9)
+                .unwrap()
+                .with_metadata("total_volume", 150000.0)
+                .with_metadata("net_delta", 0.65);
+
+            let result = SignalResult::from_signal_value(&signal_value);
+
+            assert!(result.is_directional);
+            assert!(result.signal_direction);
+            assert!((result.strength - 0.8).abs() < f64::EPSILON);
+            assert!((result.total_volume - 150000.0).abs() < 0.01);
+            assert!((result.net_delta - 0.65).abs() < 0.01);
+        }
+
+        #[test]
+        fn test_signal_result_from_signal_value_down() {
+            use algo_trade_core::SignalValue;
+
+            let signal_value = SignalValue::new(Direction::Down, 0.7, 0.8).unwrap();
+            let result = SignalResult::from_signal_value(&signal_value);
+
+            assert!(result.is_directional);
+            assert!(!result.signal_direction);
+            assert!((result.strength - 0.7).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn test_signal_result_from_signal_value_neutral() {
+            use algo_trade_core::SignalValue;
+
+            let signal_value = SignalValue::neutral();
+            let result = SignalResult::from_signal_value(&signal_value);
+
+            assert!(!result.is_directional);
+            assert!((result.strength - 0.0).abs() < f64::EPSILON);
+        }
+
+        #[test]
+        fn test_signal_result_default_metadata_values() {
+            use algo_trade_core::SignalValue;
+
+            // Signal value without metadata
+            let signal_value = SignalValue::new(Direction::Up, 0.5, 0.5).unwrap();
+            let result = SignalResult::from_signal_value(&signal_value);
+
+            assert!((result.total_volume - 0.0).abs() < 0.01);
+            assert!((result.net_delta - 0.0).abs() < 0.01);
+            assert!((result.long_volume - 0.0).abs() < 0.01);
+            assert!((result.short_volume - 0.0).abs() < 0.01);
+        }
+
+        // =====================================================================
+        // DecisionEngineConfig with SignalConfig Tests
+        // =====================================================================
+
+        #[test]
+        fn test_decision_engine_config_includes_signal_config() {
+            let args = PolymarketPaperTradeArgs {
+                duration: "24h".to_string(),
+                signal: "liquidation".to_string(),
+                min_signal_strength: 0.6,
+                stake: 100.0,
+                kelly_fraction: 0.25,
+                min_edge: 0.02,
+                bankroll: 10000.0,
+                max_bet_fraction: 0.05,
+                fee_tier: "0".to_string(),
+                poll_interval_secs: 60,
+                db_url: None,
+                cooldown_secs: 900,
+                use_fixed_stake: false,
+                entry_strategy: "immediate".to_string(),
+                entry_threshold: 0.03,
+                entry_offset_pct: 0.25,
+                entry_fallback_mins: 2,
+                window_minutes: 15,
+                entry_poll_secs: 10,
+                use_simulated_signals: false,
+                signal_mode: "cascade".to_string(),
+                min_volume_usd: 150000.0,
+                imbalance_threshold: 0.65,
+                liquidation_window_mins: 5,
+                liquidation_symbol: "BTCUSDT".to_string(),
+                liquidation_exchange: "binance".to_string(),
+            };
+
+            let config = DecisionEngineConfig::from_args(&args);
+
+            assert!(!config.signal_config.use_simulated);
+            assert_eq!(
+                config.signal_config.signal_mode,
+                LiquidationSignalMode::Cascade
+            );
+            assert_eq!(config.signal_config.min_volume_usd, dec!(150000));
+        }
+
+        // =====================================================================
+        // Log Signal Result Tests
+        // =====================================================================
+
+        #[test]
+        fn test_format_signal_log_directional() {
+            let result = SignalResult {
+                is_directional: true,
+                signal_direction: true,
+                strength: 0.75,
+                total_volume: 150000.0,
+                net_delta: 0.65,
+                long_volume: 100000.0,
+                short_volume: 50000.0,
+            };
+
+            let log = format_signal_log(&result, "btc-100k-market");
+
+            assert!(log.contains("btc-100k-market"));
+            assert!(log.contains("Up") || log.contains("up"));
+            assert!(log.contains("0.75") || log.contains("75"));
+            assert!(log.contains("150000"));
+        }
+
+        #[test]
+        fn test_format_signal_log_neutral() {
+            let result = SignalResult {
+                is_directional: false,
+                signal_direction: true,
+                strength: 0.0,
+                total_volume: 50000.0,
+                net_delta: 0.0,
+                long_volume: 25000.0,
+                short_volume: 25000.0,
+            };
+
+            let log = format_signal_log(&result, "test-market");
+
+            assert!(
+                log.contains("Neutral") || log.contains("neutral") || log.contains("No signal")
+            );
+        }
+
+        // =====================================================================
+        // create_liquidation_signal Tests
+        // =====================================================================
+
+        #[test]
+        fn test_create_liquidation_signal_cascade_mode() {
+            let config = SignalConfig {
+                use_simulated: false,
+                signal_mode: LiquidationSignalMode::Cascade,
+                min_volume_usd: dec!(100000),
+                imbalance_threshold: 0.6,
+                liquidation_window_mins: 5,
+                liquidation_symbol: "BTCUSDT".to_string(),
+                liquidation_exchange: "binance".to_string(),
+            };
+
+            let signal = create_liquidation_signal(&config);
+
+            assert_eq!(signal.name(), "liquidation_cascade");
+            assert_eq!(signal.signal_mode, LiquidationSignalMode::Cascade);
+            assert_eq!(signal.cascade_config.min_volume_usd, dec!(100000));
+            assert!((signal.cascade_config.imbalance_threshold - 0.6).abs() < 0.001);
+        }
+
+        #[test]
+        fn test_create_liquidation_signal_exhaustion_mode() {
+            let config = SignalConfig {
+                use_simulated: false,
+                signal_mode: LiquidationSignalMode::Exhaustion,
+                min_volume_usd: dec!(50000),
+                imbalance_threshold: 0.5,
+                liquidation_window_mins: 10,
+                liquidation_symbol: "ETHUSDT".to_string(),
+                liquidation_exchange: "bybit".to_string(),
+            };
+
+            let signal = create_liquidation_signal(&config);
+
+            assert_eq!(signal.signal_mode, LiquidationSignalMode::Exhaustion);
+            assert!(signal.exhaustion_config.is_some());
+        }
+
+        #[test]
+        fn test_create_liquidation_signal_combined_mode() {
+            let config = SignalConfig {
+                use_simulated: false,
+                signal_mode: LiquidationSignalMode::Combined,
+                min_volume_usd: dec!(75000),
+                imbalance_threshold: 0.55,
+                liquidation_window_mins: 5,
+                liquidation_symbol: "BTCUSDT".to_string(),
+                liquidation_exchange: "binance".to_string(),
+            };
+
+            let signal = create_liquidation_signal(&config);
+
+            assert_eq!(signal.signal_mode, LiquidationSignalMode::Combined);
+            assert!(signal.exhaustion_config.is_some());
+        }
+
+        // =====================================================================
+        // Async Signal Computation Tests
+        // =====================================================================
+
+        #[tokio::test]
+        async fn test_compute_signal_from_aggregate_bearish() {
+            use algo_trade_core::SignalContext;
+
+            let config = SignalConfig {
+                use_simulated: false,
+                signal_mode: LiquidationSignalMode::Cascade,
+                min_volume_usd: dec!(50000),
+                imbalance_threshold: 0.5,
+                liquidation_window_mins: 5,
+                liquidation_symbol: "BTCUSDT".to_string(),
+                liquidation_exchange: "binance".to_string(),
+            };
+
+            let mut signal = create_liquidation_signal(&config);
+
+            // Create aggregate with heavy long liquidations (bearish signal)
+            let agg = LiquidationAggregate {
+                timestamp: sample_timestamp(),
+                window_minutes: 5,
+                long_volume_usd: dec!(150000),
+                short_volume_usd: dec!(10000),
+                net_delta_usd: dec!(140000),
+                count_long: 20,
+                count_short: 2,
+            };
+
+            let ctx =
+                SignalContext::new(sample_timestamp(), "BTCUSDT").with_liquidation_aggregates(agg);
+
+            let result = signal.compute(&ctx).await.unwrap();
+
+            // Heavy long liquidations = bearish = Down direction
+            assert_eq!(result.direction, Direction::Down);
+            assert!(result.strength > 0.5);
+        }
+
+        #[tokio::test]
+        async fn test_compute_signal_from_aggregate_bullish() {
+            use algo_trade_core::SignalContext;
+
+            let config = SignalConfig {
+                use_simulated: false,
+                signal_mode: LiquidationSignalMode::Cascade,
+                min_volume_usd: dec!(50000),
+                imbalance_threshold: 0.5,
+                liquidation_window_mins: 5,
+                liquidation_symbol: "BTCUSDT".to_string(),
+                liquidation_exchange: "binance".to_string(),
+            };
+
+            let mut signal = create_liquidation_signal(&config);
+
+            // Create aggregate with heavy short liquidations (bullish signal)
+            let agg = LiquidationAggregate {
+                timestamp: sample_timestamp(),
+                window_minutes: 5,
+                long_volume_usd: dec!(10000),
+                short_volume_usd: dec!(150000),
+                net_delta_usd: dec!(-140000),
+                count_long: 2,
+                count_short: 20,
+            };
+
+            let ctx =
+                SignalContext::new(sample_timestamp(), "BTCUSDT").with_liquidation_aggregates(agg);
+
+            let result = signal.compute(&ctx).await.unwrap();
+
+            // Heavy short liquidations = bullish = Up direction
+            assert_eq!(result.direction, Direction::Up);
+            assert!(result.strength > 0.5);
+        }
+
+        #[tokio::test]
+        async fn test_compute_signal_from_aggregate_neutral_low_volume() {
+            use algo_trade_core::SignalContext;
+
+            let config = SignalConfig {
+                use_simulated: false,
+                signal_mode: LiquidationSignalMode::Cascade,
+                min_volume_usd: dec!(100000), // High threshold
+                imbalance_threshold: 0.5,
+                liquidation_window_mins: 5,
+                liquidation_symbol: "BTCUSDT".to_string(),
+                liquidation_exchange: "binance".to_string(),
+            };
+
+            let mut signal = create_liquidation_signal(&config);
+
+            // Create aggregate with low volume (below threshold)
+            let agg = LiquidationAggregate {
+                timestamp: sample_timestamp(),
+                window_minutes: 5,
+                long_volume_usd: dec!(40000),
+                short_volume_usd: dec!(10000),
+                net_delta_usd: dec!(30000),
+                count_long: 5,
+                count_short: 2,
+            };
+
+            let ctx =
+                SignalContext::new(sample_timestamp(), "BTCUSDT").with_liquidation_aggregates(agg);
+
+            let result = signal.compute(&ctx).await.unwrap();
+
+            // Low volume = neutral
+            assert_eq!(result.direction, Direction::Neutral);
+        }
     }
 }
