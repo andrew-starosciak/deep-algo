@@ -6,6 +6,7 @@
 pub mod bootstrap;
 pub mod edge;
 pub mod engine;
+pub mod entry_strategy;
 pub mod fees;
 pub mod metrics;
 pub mod monte_carlo;
@@ -23,6 +24,11 @@ pub use edge::{
     TimeOfDayEdge, VolatilityEdge,
 };
 pub use engine::{BacktestResults, BinaryBacktestConfig, BinaryBacktestEngine};
+pub use entry_strategy::{
+    EdgeThresholdEntry, EntryContext, EntryDecision, EntrySimulationResult, EntryStrategy,
+    EntryStrategySimulator, EntryStrategyStats, FixedTimeEntry, PricePath, PricePathConfig,
+    PricePathGenerator, PricePoint, SimulationParams,
+};
 pub use fees::{FeeModel, FeeTier, FlatFees, PolymarketFees, ZeroFees};
 pub use metrics::{calculate_break_even, BinaryMetrics};
 pub use monte_carlo::{
