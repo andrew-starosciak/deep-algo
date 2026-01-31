@@ -25,9 +25,10 @@ pub use edge::{
 };
 pub use engine::{BacktestResults, BinaryBacktestConfig, BinaryBacktestEngine};
 pub use entry_strategy::{
-    EdgeThresholdEntry, EntryContext, EntryDecision, EntrySimulationResult, EntryStrategy,
-    EntryStrategySimulator, EntryStrategyStats, FixedTimeEntry, PricePath, PricePathConfig,
-    PricePathGenerator, PricePoint, SimulationParams,
+    create_entry_strategy, EdgeThresholdEntry, EntryContext, EntryDecision, EntryResult,
+    EntrySimulationResult, EntryStrategy, EntryStrategyConfig, EntryStrategySimulator,
+    EntryStrategyStats, EntryStrategyType, FallbackEntry, FixedTimeEntry, ImmediateEntry,
+    PricePath, PricePathConfig, PricePathGenerator, PricePoint, SimulationParams,
 };
 pub use fees::{FeeModel, FeeTier, FlatFees, PolymarketFees, ZeroFees};
 pub use metrics::{calculate_break_even, BinaryMetrics};

@@ -18,7 +18,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::commands::collect_signals::parse_duration;
-use algo_trade_backtest::{FeeModel, FeeTier, PolymarketFees};
+use algo_trade_backtest::{
+    create_entry_strategy, EntryStrategy, EntryStrategyConfig, EntryStrategyType, FeeModel,
+    FeeTier, PolymarketFees,
+};
 use algo_trade_data::{
     KellyCriterion, PaperTradeDirection, PaperTradeRecord, PaperTradeRepository,
     PolymarketOddsRecord, PolymarketOddsRepository,
@@ -78,6 +81,33 @@ pub struct PolymarketPaperTradeArgs {
     /// Whether to use fixed stake instead of Kelly sizing
     #[arg(long, default_value = "false")]
     pub use_fixed_stake: bool,
+
+    // =========================================================================
+    // Entry Strategy Arguments
+    // =========================================================================
+    /// Entry strategy: immediate, fixed_time, or edge_threshold
+    #[arg(long, default_value = "immediate")]
+    pub entry_strategy: String,
+
+    /// Minimum edge threshold for edge_threshold strategy (0.0 to 1.0)
+    #[arg(long, default_value = "0.03")]
+    pub entry_threshold: f64,
+
+    /// Fixed entry offset as percentage of window (0.0 to 1.0) for fixed_time strategy
+    #[arg(long, default_value = "0.25")]
+    pub entry_offset_pct: f64,
+
+    /// Fallback entry time in minutes before window close (0 to disable)
+    #[arg(long, default_value = "2")]
+    pub entry_fallback_mins: i64,
+
+    /// Window duration in minutes
+    #[arg(long, default_value = "15")]
+    pub window_minutes: i64,
+
+    /// Entry poll interval in seconds for monitoring entry conditions
+    #[arg(long, default_value = "10")]
+    pub entry_poll_secs: u64,
 }
 
 /// Configuration for the paper trading decision engine.
@@ -99,6 +129,12 @@ pub struct DecisionEngineConfig {
     pub fixed_stake: Decimal,
     /// Cooldown between trades on same market.
     pub cooldown: Duration,
+
+    // Entry strategy configuration
+    /// Entry strategy configuration.
+    pub entry_config: EntryStrategyConfig,
+    /// Entry poll interval in seconds.
+    pub entry_poll_secs: u64,
 }
 
 impl DecisionEngineConfig {
@@ -112,6 +148,19 @@ impl DecisionEngineConfig {
             Decimal::try_from(args.min_edge).unwrap_or(dec!(0.02)),
         );
 
+        // Parse entry strategy configuration
+        let strategy_type =
+            EntryStrategyType::parse(&args.entry_strategy).unwrap_or(EntryStrategyType::Immediate);
+
+        let entry_config = EntryStrategyConfig {
+            strategy_type,
+            edge_threshold: Decimal::try_from(args.entry_threshold).unwrap_or(dec!(0.03)),
+            offset_pct: args.entry_offset_pct,
+            fallback_mins: args.entry_fallback_mins,
+            window_mins: args.window_minutes,
+            cutoff_mins: args.window_minutes - 1, // Default cutoff 1 minute before window close
+        };
+
         Self {
             signal_type: args.signal.clone(),
             min_signal_strength: args.min_signal_strength,
@@ -121,7 +170,15 @@ impl DecisionEngineConfig {
             use_fixed_stake: args.use_fixed_stake,
             fixed_stake: Decimal::try_from(args.stake).unwrap_or(dec!(100)),
             cooldown: Duration::from_secs(args.cooldown_secs),
+            entry_config,
+            entry_poll_secs: args.entry_poll_secs,
         }
+    }
+
+    /// Creates the entry strategy from this configuration.
+    #[must_use]
+    pub fn create_entry_strategy(&self) -> Box<dyn EntryStrategy> {
+        create_entry_strategy(&self.entry_config)
     }
 }
 
@@ -326,6 +383,73 @@ impl TradeDecision {
     }
 }
 
+/// Entry timing statistics for tracking entry strategy performance.
+#[derive(Debug, Clone, Default)]
+pub struct EntryTimingStats {
+    /// Number of trades that used the primary entry strategy.
+    pub primary_entries: u32,
+    /// Number of trades that used the fallback entry.
+    pub fallback_entries: u32,
+    /// Sum of entry offset seconds for calculating average.
+    pub total_entry_offset_secs: i64,
+    /// Sum of edge at entry for calculating average.
+    pub total_edge_at_entry: Decimal,
+    /// Number of entries with edge data (for average calculation).
+    pub entries_with_edge: u32,
+}
+
+impl EntryTimingStats {
+    /// Records an entry with timing information.
+    pub fn record_entry(&mut self, offset_secs: i64, edge: Decimal, used_fallback: bool) {
+        if used_fallback {
+            self.fallback_entries += 1;
+        } else {
+            self.primary_entries += 1;
+        }
+        self.total_entry_offset_secs += offset_secs;
+        self.total_edge_at_entry += edge;
+        self.entries_with_edge += 1;
+    }
+
+    /// Returns the total number of entries.
+    #[must_use]
+    pub fn total_entries(&self) -> u32 {
+        self.primary_entries + self.fallback_entries
+    }
+
+    /// Returns the fallback rate (0.0 to 1.0).
+    #[must_use]
+    pub fn fallback_rate(&self) -> f64 {
+        let total = self.total_entries();
+        if total == 0 {
+            0.0
+        } else {
+            self.fallback_entries as f64 / total as f64
+        }
+    }
+
+    /// Returns the average entry offset in seconds.
+    #[must_use]
+    pub fn avg_entry_offset_secs(&self) -> Option<f64> {
+        let total = self.total_entries();
+        if total == 0 {
+            None
+        } else {
+            Some(self.total_entry_offset_secs as f64 / total as f64)
+        }
+    }
+
+    /// Returns the average edge at entry.
+    #[must_use]
+    pub fn avg_edge_at_entry(&self) -> Option<Decimal> {
+        if self.entries_with_edge == 0 {
+            None
+        } else {
+            Some(self.total_edge_at_entry / Decimal::from(self.entries_with_edge))
+        }
+    }
+}
+
 /// Paper trading executor that manages trades and tracks positions.
 pub struct PaperTradeExecutor {
     engine: DecisionEngine,
@@ -334,6 +458,10 @@ pub struct PaperTradeExecutor {
     trades_count: u32,
     wins: u32,
     losses: u32,
+    /// Entry timing statistics.
+    entry_stats: EntryTimingStats,
+    /// Entry strategy name for reporting.
+    entry_strategy_name: String,
 }
 
 impl PaperTradeExecutor {
@@ -341,6 +469,7 @@ impl PaperTradeExecutor {
     #[must_use]
     pub fn new(config: DecisionEngineConfig, initial_bankroll: Decimal) -> Self {
         let fee_model = PolymarketFees::new(config.fee_tier);
+        let entry_strategy_name = config.entry_config.strategy_type.as_str().to_string();
         let engine = DecisionEngine::new(config, initial_bankroll);
         let session_id = Uuid::new_v4().to_string();
 
@@ -351,6 +480,8 @@ impl PaperTradeExecutor {
             trades_count: 0,
             wins: 0,
             losses: 0,
+            entry_stats: EntryTimingStats::default(),
+            entry_strategy_name,
         }
     }
 
@@ -370,6 +501,18 @@ impl PaperTradeExecutor {
     #[must_use]
     pub fn stats(&self) -> (u32, u32, u32) {
         (self.trades_count, self.wins, self.losses)
+    }
+
+    /// Returns entry timing statistics.
+    #[must_use]
+    pub fn entry_stats(&self) -> &EntryTimingStats {
+        &self.entry_stats
+    }
+
+    /// Records entry timing for a trade.
+    pub fn record_entry_timing(&mut self, offset_secs: i64, edge: Decimal, used_fallback: bool) {
+        self.entry_stats
+            .record_entry(offset_secs, edge, used_fallback);
     }
 
     /// Calculates fees for a trade.
@@ -471,19 +614,49 @@ impl PaperTradeExecutor {
             0.0
         };
 
+        // Entry timing summary
+        let entry_summary = if self.entry_stats.total_entries() > 0 {
+            let avg_offset = self.entry_stats.avg_entry_offset_secs().unwrap_or(0.0);
+            let avg_edge = self
+                .entry_stats
+                .avg_edge_at_entry()
+                .unwrap_or(Decimal::ZERO);
+            let fallback_rate = self.entry_stats.fallback_rate() * 100.0;
+
+            format!(
+                "\n\
+                 Entry Strategy Stats:\n\
+                 - Strategy: {}\n\
+                 - Primary entries: {}\n\
+                 - Fallback entries: {} ({:.1}%)\n\
+                 - Avg entry offset: {:.1}s\n\
+                 - Avg edge at entry: {:.4}",
+                self.entry_strategy_name,
+                self.entry_stats.primary_entries,
+                self.entry_stats.fallback_entries,
+                fallback_rate,
+                avg_offset,
+                avg_edge
+            )
+        } else {
+            format!("\nEntry Strategy: {}", self.entry_strategy_name)
+        };
+
         format!(
             "Paper Trading Session Summary:\n\
              - Session ID: {}\n\
              - Total trades: {}\n\
              - Wins: {} | Losses: {}\n\
              - Win rate: {:.1}%\n\
-             - Final bankroll: ${:.2}",
+             - Final bankroll: ${:.2}\
+             {}",
             self.session_id,
             self.trades_count,
             self.wins,
             self.losses,
             win_rate,
-            self.bankroll()
+            self.bankroll(),
+            entry_summary
         )
     }
 }
@@ -723,6 +896,8 @@ mod tests {
             use_fixed_stake: false,
             fixed_stake: dec!(100),
             cooldown: Duration::from_secs(900),
+            entry_config: EntryStrategyConfig::immediate(),
+            entry_poll_secs: 10,
         }
     }
 
@@ -771,6 +946,12 @@ mod tests {
             db_url: None,
             cooldown_secs: 1800,
             use_fixed_stake: true,
+            entry_strategy: "edge_threshold".to_string(),
+            entry_threshold: 0.05,
+            entry_offset_pct: 0.3,
+            entry_fallback_mins: 3,
+            window_minutes: 15,
+            entry_poll_secs: 15,
         };
 
         let config = DecisionEngineConfig::from_args(&args);
@@ -780,6 +961,12 @@ mod tests {
         assert_eq!(config.min_edge, dec!(0.03));
         assert_eq!(config.fee_tier, FeeTier::Tier2);
         assert!(config.use_fixed_stake);
+        assert_eq!(
+            config.entry_config.strategy_type,
+            EntryStrategyType::EdgeThreshold
+        );
+        assert_eq!(config.entry_config.edge_threshold, dec!(0.05));
+        assert_eq!(config.entry_poll_secs, 15);
         assert_eq!(config.fixed_stake, dec!(200));
         assert_eq!(config.cooldown, Duration::from_secs(1800));
     }
@@ -1156,11 +1343,250 @@ mod tests {
             db_url: Some("postgres://localhost/test".to_string()),
             cooldown_secs: 1800,
             use_fixed_stake: false,
+            entry_strategy: "immediate".to_string(),
+            entry_threshold: 0.03,
+            entry_offset_pct: 0.25,
+            entry_fallback_mins: 2,
+            window_minutes: 15,
+            entry_poll_secs: 10,
         };
 
         assert_eq!(args.duration, "7d");
         assert_eq!(args.signal, "imbalance");
         assert!((args.min_signal_strength - 0.7).abs() < f64::EPSILON);
         assert!(args.db_url.is_some());
+        assert_eq!(args.entry_strategy, "immediate");
+        assert_eq!(args.entry_fallback_mins, 2);
+        assert_eq!(args.window_minutes, 15);
+    }
+
+    // =========================================================================
+    // Entry Strategy CLI Tests
+    // =========================================================================
+
+    #[test]
+    fn test_entry_strategy_config_immediate() {
+        let args = PolymarketPaperTradeArgs {
+            duration: "24h".to_string(),
+            signal: "composite".to_string(),
+            min_signal_strength: 0.6,
+            stake: 100.0,
+            kelly_fraction: 0.25,
+            min_edge: 0.02,
+            bankroll: 10000.0,
+            max_bet_fraction: 0.05,
+            fee_tier: "0".to_string(),
+            poll_interval_secs: 60,
+            db_url: None,
+            cooldown_secs: 900,
+            use_fixed_stake: false,
+            entry_strategy: "immediate".to_string(),
+            entry_threshold: 0.03,
+            entry_offset_pct: 0.25,
+            entry_fallback_mins: 2,
+            window_minutes: 15,
+            entry_poll_secs: 10,
+        };
+
+        let config = DecisionEngineConfig::from_args(&args);
+        assert_eq!(
+            config.entry_config.strategy_type,
+            EntryStrategyType::Immediate
+        );
+
+        let strategy = config.create_entry_strategy();
+        assert_eq!(strategy.name(), "ImmediateEntry");
+    }
+
+    #[test]
+    fn test_entry_strategy_config_fixed_time_with_fallback() {
+        let args = PolymarketPaperTradeArgs {
+            duration: "24h".to_string(),
+            signal: "composite".to_string(),
+            min_signal_strength: 0.6,
+            stake: 100.0,
+            kelly_fraction: 0.25,
+            min_edge: 0.02,
+            bankroll: 10000.0,
+            max_bet_fraction: 0.05,
+            fee_tier: "0".to_string(),
+            poll_interval_secs: 60,
+            db_url: None,
+            cooldown_secs: 900,
+            use_fixed_stake: false,
+            entry_strategy: "fixed_time".to_string(),
+            entry_threshold: 0.03,
+            entry_offset_pct: 0.5,
+            entry_fallback_mins: 3,
+            window_minutes: 15,
+            entry_poll_secs: 10,
+        };
+
+        let config = DecisionEngineConfig::from_args(&args);
+        assert_eq!(
+            config.entry_config.strategy_type,
+            EntryStrategyType::FixedTime
+        );
+        assert!((config.entry_config.offset_pct - 0.5).abs() < f64::EPSILON);
+
+        let strategy = config.create_entry_strategy();
+        // Should be FallbackEntry wrapping FixedTimeEntry since fallback_mins > 0
+        assert_eq!(strategy.name(), "FallbackEntry");
+    }
+
+    #[test]
+    fn test_entry_strategy_config_edge_threshold_without_fallback() {
+        let args = PolymarketPaperTradeArgs {
+            duration: "24h".to_string(),
+            signal: "composite".to_string(),
+            min_signal_strength: 0.6,
+            stake: 100.0,
+            kelly_fraction: 0.25,
+            min_edge: 0.02,
+            bankroll: 10000.0,
+            max_bet_fraction: 0.05,
+            fee_tier: "0".to_string(),
+            poll_interval_secs: 60,
+            db_url: None,
+            cooldown_secs: 900,
+            use_fixed_stake: false,
+            entry_strategy: "edge_threshold".to_string(),
+            entry_threshold: 0.05,
+            entry_offset_pct: 0.25,
+            entry_fallback_mins: 0, // Disable fallback
+            window_minutes: 15,
+            entry_poll_secs: 10,
+        };
+
+        let config = DecisionEngineConfig::from_args(&args);
+        assert_eq!(
+            config.entry_config.strategy_type,
+            EntryStrategyType::EdgeThreshold
+        );
+        assert_eq!(config.entry_config.edge_threshold, dec!(0.05));
+        assert_eq!(config.entry_config.fallback_mins, 0);
+
+        let strategy = config.create_entry_strategy();
+        // Should be EdgeThresholdEntry directly (no fallback)
+        assert_eq!(strategy.name(), "EdgeThresholdEntry");
+    }
+
+    // =========================================================================
+    // Entry Timing Stats Tests
+    // =========================================================================
+
+    #[test]
+    fn test_entry_timing_stats_default() {
+        let stats = EntryTimingStats::default();
+
+        assert_eq!(stats.primary_entries, 0);
+        assert_eq!(stats.fallback_entries, 0);
+        assert_eq!(stats.total_entries(), 0);
+        assert!((stats.fallback_rate() - 0.0).abs() < f64::EPSILON);
+        assert!(stats.avg_entry_offset_secs().is_none());
+        assert!(stats.avg_edge_at_entry().is_none());
+    }
+
+    #[test]
+    fn test_entry_timing_stats_record_primary_entry() {
+        let mut stats = EntryTimingStats::default();
+
+        stats.record_entry(120, dec!(0.08), false); // 2 minutes, 8% edge, not fallback
+
+        assert_eq!(stats.primary_entries, 1);
+        assert_eq!(stats.fallback_entries, 0);
+        assert_eq!(stats.total_entries(), 1);
+        assert!((stats.fallback_rate() - 0.0).abs() < f64::EPSILON);
+        assert_eq!(stats.avg_entry_offset_secs(), Some(120.0));
+        assert_eq!(stats.avg_edge_at_entry(), Some(dec!(0.08)));
+    }
+
+    #[test]
+    fn test_entry_timing_stats_record_fallback_entry() {
+        let mut stats = EntryTimingStats::default();
+
+        stats.record_entry(720, dec!(0.02), true); // 12 minutes, 2% edge, fallback
+
+        assert_eq!(stats.primary_entries, 0);
+        assert_eq!(stats.fallback_entries, 1);
+        assert_eq!(stats.total_entries(), 1);
+        assert!((stats.fallback_rate() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_entry_timing_stats_multiple_entries() {
+        let mut stats = EntryTimingStats::default();
+
+        stats.record_entry(60, dec!(0.10), false); // Primary
+        stats.record_entry(120, dec!(0.08), false); // Primary
+        stats.record_entry(720, dec!(0.02), true); // Fallback
+
+        assert_eq!(stats.primary_entries, 2);
+        assert_eq!(stats.fallback_entries, 1);
+        assert_eq!(stats.total_entries(), 3);
+        assert!((stats.fallback_rate() - (1.0 / 3.0)).abs() < 0.01);
+
+        // Avg offset = (60 + 120 + 720) / 3 = 300
+        assert_eq!(stats.avg_entry_offset_secs(), Some(300.0));
+
+        // Avg edge = (0.10 + 0.08 + 0.02) / 3 = 0.0666...
+        let avg_edge = stats.avg_edge_at_entry().unwrap();
+        let expected_avg = (dec!(0.10) + dec!(0.08) + dec!(0.02)) / dec!(3);
+        assert_eq!(avg_edge, expected_avg);
+    }
+
+    #[test]
+    fn test_executor_entry_stats() {
+        let config = sample_config();
+        let executor = PaperTradeExecutor::new(config, dec!(10000));
+
+        let stats = executor.entry_stats();
+        assert_eq!(stats.total_entries(), 0);
+    }
+
+    #[test]
+    fn test_executor_record_entry_timing() {
+        let config = sample_config();
+        let mut executor = PaperTradeExecutor::new(config, dec!(10000));
+
+        executor.record_entry_timing(180, dec!(0.05), false);
+        executor.record_entry_timing(720, dec!(0.02), true);
+
+        let stats = executor.entry_stats();
+        assert_eq!(stats.primary_entries, 1);
+        assert_eq!(stats.fallback_entries, 1);
+        assert_eq!(stats.total_entries(), 2);
+    }
+
+    #[test]
+    fn test_executor_format_summary_includes_entry_stats() {
+        let config = sample_config();
+        let mut executor = PaperTradeExecutor::new(config, dec!(10000));
+
+        // Record some entry timing
+        executor.record_entry_timing(60, dec!(0.08), false);
+        executor.record_entry_timing(120, dec!(0.06), false);
+        executor.record_entry_timing(720, dec!(0.02), true);
+
+        let summary = executor.format_summary();
+
+        // Should contain entry strategy info
+        assert!(summary.contains("Entry Strategy Stats"));
+        assert!(summary.contains("Strategy: immediate"));
+        assert!(summary.contains("Primary entries: 2"));
+        assert!(summary.contains("Fallback entries: 1"));
+    }
+
+    #[test]
+    fn test_executor_format_summary_no_entry_stats() {
+        let config = sample_config();
+        let executor = PaperTradeExecutor::new(config, dec!(10000));
+
+        let summary = executor.format_summary();
+
+        // Should still contain entry strategy name
+        assert!(summary.contains("Entry Strategy: immediate"));
+        // But not the detailed stats
+        assert!(!summary.contains("Primary entries"));
     }
 }

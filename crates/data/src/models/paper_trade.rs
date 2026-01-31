@@ -114,6 +114,25 @@ pub struct PaperTradeRecord {
     pub settled_at: Option<DateTime<Utc>>,
     /// Session identifier for grouping trades.
     pub session_id: String,
+
+    // =========================================================================
+    // Entry Timing Fields
+    // =========================================================================
+    /// Entry strategy used: "immediate", "fixed_time", "edge_threshold".
+    #[sqlx(default)]
+    pub entry_strategy: String,
+    /// Timestamp when entry was triggered (may differ from timestamp if waiting for conditions).
+    #[sqlx(default)]
+    pub entry_triggered_at: Option<DateTime<Utc>>,
+    /// Seconds from window open when entry was triggered.
+    #[sqlx(default)]
+    pub entry_offset_secs: Option<i64>,
+    /// Edge (EV per dollar) at the time of entry.
+    #[sqlx(default)]
+    pub edge_at_entry: Option<Decimal>,
+    /// Whether the fallback entry was used (true if primary strategy conditions weren't met).
+    #[sqlx(default)]
+    pub used_fallback: bool,
 }
 
 impl PaperTradeRecord {
@@ -157,6 +176,12 @@ impl PaperTradeRecord {
             fees: None,
             settled_at: None,
             session_id,
+            // Entry timing fields default
+            entry_strategy: "immediate".to_string(),
+            entry_triggered_at: None,
+            entry_offset_secs: None,
+            edge_at_entry: None,
+            used_fallback: false,
         }
     }
 
@@ -180,6 +205,35 @@ impl PaperTradeRecord {
     #[must_use]
     pub fn with_signals(mut self, signals: JsonValue) -> Self {
         self.signals_snapshot = Some(signals);
+        self
+    }
+
+    /// Sets the entry strategy name.
+    #[must_use]
+    pub fn with_entry_strategy(mut self, strategy: String) -> Self {
+        self.entry_strategy = strategy;
+        self
+    }
+
+    /// Sets the entry timing information.
+    ///
+    /// # Arguments
+    /// * `triggered_at` - Timestamp when entry was triggered
+    /// * `offset_secs` - Seconds from window open when entry occurred
+    /// * `edge` - Edge (EV per dollar) at entry time
+    /// * `used_fallback` - Whether fallback strategy was used
+    #[must_use]
+    pub fn with_entry_timing(
+        mut self,
+        triggered_at: DateTime<Utc>,
+        offset_secs: i64,
+        edge: Decimal,
+        used_fallback: bool,
+    ) -> Self {
+        self.entry_triggered_at = Some(triggered_at);
+        self.entry_offset_secs = Some(offset_secs);
+        self.edge_at_entry = Some(edge);
+        self.used_fallback = used_fallback;
         self
     }
 
@@ -926,5 +980,80 @@ mod tests {
         let json = serde_json::to_string(&direction).unwrap();
         let deserialized: PaperTradeDirection = serde_json::from_str(&json).unwrap();
         assert_eq!(direction, deserialized);
+    }
+
+    // =========================================================================
+    // Entry Timing Fields Tests
+    // =========================================================================
+
+    #[test]
+    fn test_paper_trade_entry_strategy_field() {
+        let trade = sample_paper_trade();
+
+        // Default should be "immediate"
+        assert_eq!(trade.entry_strategy, "immediate");
+    }
+
+    #[test]
+    fn test_paper_trade_with_entry_strategy() {
+        let trade = sample_paper_trade().with_entry_strategy("edge_threshold".to_string());
+        assert_eq!(trade.entry_strategy, "edge_threshold");
+    }
+
+    #[test]
+    fn test_paper_trade_entry_timing_fields_default() {
+        let trade = sample_paper_trade();
+
+        // Entry timing fields should default to None
+        assert!(trade.entry_triggered_at.is_none());
+        assert!(trade.entry_offset_secs.is_none());
+        assert!(trade.edge_at_entry.is_none());
+        assert!(!trade.used_fallback);
+    }
+
+    #[test]
+    fn test_paper_trade_with_entry_timing() {
+        let triggered_at = sample_timestamp() + chrono::Duration::seconds(120);
+        let trade = sample_paper_trade().with_entry_timing(
+            triggered_at,
+            120,        // 2 minutes offset
+            dec!(0.08), // 8% edge
+            false,      // didn't use fallback
+        );
+
+        assert_eq!(trade.entry_triggered_at, Some(triggered_at));
+        assert_eq!(trade.entry_offset_secs, Some(120));
+        assert_eq!(trade.edge_at_entry, Some(dec!(0.08)));
+        assert!(!trade.used_fallback);
+    }
+
+    #[test]
+    fn test_paper_trade_with_entry_timing_fallback() {
+        let triggered_at = sample_timestamp() + chrono::Duration::minutes(12);
+        let trade = sample_paper_trade().with_entry_timing(
+            triggered_at,
+            720,        // 12 minutes offset
+            dec!(0.02), // Lower edge
+            true,       // used fallback
+        );
+
+        assert!(trade.used_fallback);
+        assert_eq!(trade.entry_offset_secs, Some(720));
+    }
+
+    #[test]
+    fn test_paper_trade_entry_timing_serialization() {
+        let triggered_at = sample_timestamp() + chrono::Duration::seconds(180);
+        let trade = sample_paper_trade().with_entry_timing(triggered_at, 180, dec!(0.05), true);
+
+        let json = serde_json::to_string(&trade).expect("serialization failed");
+        let deserialized: PaperTradeRecord =
+            serde_json::from_str(&json).expect("deserialization failed");
+
+        assert_eq!(deserialized.entry_strategy, "immediate");
+        assert_eq!(deserialized.entry_triggered_at, Some(triggered_at));
+        assert_eq!(deserialized.entry_offset_secs, Some(180));
+        assert_eq!(deserialized.edge_at_entry, Some(dec!(0.05)));
+        assert!(deserialized.used_fallback);
     }
 }

@@ -933,6 +933,357 @@ impl EntryStrategySimulator {
 }
 
 // ============================================================
+// Immediate Entry Strategy
+// ============================================================
+
+/// Enters immediately at the current time (no delay).
+///
+/// This is the simplest strategy - it always enters at whatever
+/// the current time offset is, making it suitable for "enter now" scenarios.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImmediateEntry {
+    /// Maximum time offset before giving up (cutoff).
+    pub cutoff: Duration,
+}
+
+impl ImmediateEntry {
+    /// Creates a new immediate entry strategy.
+    #[must_use]
+    pub fn new(cutoff: Duration) -> Self {
+        Self { cutoff }
+    }
+
+    /// Creates an immediate entry strategy with a 15-minute default cutoff.
+    #[must_use]
+    pub fn default_cutoff() -> Self {
+        Self::new(Duration::minutes(14))
+    }
+}
+
+impl EntryStrategy for ImmediateEntry {
+    fn evaluate(&self, ctx: &EntryContext) -> EntryDecision {
+        // Check if we've passed the cutoff
+        if ctx.current_offset >= self.cutoff {
+            return EntryDecision::no_entry("Past cutoff time");
+        }
+
+        // Always enter immediately at current offset
+        EntryDecision::enter(ctx.current_offset, ctx.direction)
+    }
+
+    fn name(&self) -> &str {
+        "ImmediateEntry"
+    }
+
+    fn description(&self) -> &str {
+        "Enters immediately at current time"
+    }
+}
+
+// ============================================================
+// Fallback Entry Strategy
+// ============================================================
+
+/// An entry strategy that wraps another strategy with a time-based fallback.
+///
+/// This strategy delegates to an inner strategy until a fallback time is reached.
+/// If the inner strategy hasn't triggered entry by the fallback time, this strategy
+/// will enter at the fallback time regardless of the inner strategy's decision.
+///
+/// This is useful for ensuring entry happens within a window even if optimal
+/// conditions aren't met (e.g., "try to get 5% edge, but enter by minute 12 anyway").
+#[derive(Debug, Clone)]
+pub struct FallbackEntry<S: EntryStrategy> {
+    /// The primary entry strategy to try first.
+    inner: S,
+    /// Time offset at which to fall back to immediate entry.
+    fallback_offset: Duration,
+    /// Whether fallback was used (tracked for reporting).
+    used_fallback: bool,
+}
+
+impl<S: EntryStrategy> FallbackEntry<S> {
+    /// Creates a new fallback entry strategy.
+    ///
+    /// # Arguments
+    /// * `inner` - The primary strategy to delegate to
+    /// * `fallback_offset` - The time offset at which to enter regardless of inner strategy
+    #[must_use]
+    pub fn new(inner: S, fallback_offset: Duration) -> Self {
+        Self {
+            inner,
+            fallback_offset,
+            used_fallback: false,
+        }
+    }
+
+    /// Returns whether the fallback was used in the last evaluation.
+    #[must_use]
+    pub fn used_fallback(&self) -> bool {
+        self.used_fallback
+    }
+
+    /// Returns a reference to the inner strategy.
+    #[must_use]
+    pub fn inner(&self) -> &S {
+        &self.inner
+    }
+}
+
+impl<S: EntryStrategy> EntryStrategy for FallbackEntry<S> {
+    fn evaluate(&self, ctx: &EntryContext) -> EntryDecision {
+        // First, try the inner strategy
+        let inner_decision = self.inner.evaluate(ctx);
+
+        // If inner strategy says enter, use that
+        if inner_decision.is_entry() {
+            return inner_decision;
+        }
+
+        // Check if we've reached or passed the fallback time
+        if ctx.current_offset >= self.fallback_offset {
+            // Fall back to immediate entry
+            return EntryDecision::enter(ctx.current_offset, ctx.direction);
+        }
+
+        // Not yet at fallback time, return inner strategy's no-entry decision
+        inner_decision
+    }
+
+    fn name(&self) -> &str {
+        "FallbackEntry"
+    }
+
+    fn description(&self) -> &str {
+        "Wraps another strategy with time-based fallback"
+    }
+}
+
+/// Result of an entry strategy evaluation with additional metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryResult {
+    /// The entry decision.
+    pub decision: EntryDecision,
+    /// Name of the strategy that was used.
+    pub strategy_name: String,
+    /// Whether a fallback strategy was triggered.
+    pub used_fallback: bool,
+    /// Edge at the time of entry (if entered).
+    pub edge_at_entry: Option<Decimal>,
+    /// Time offset from window open when entry occurred (if entered).
+    pub entry_offset_secs: Option<i64>,
+}
+
+impl EntryResult {
+    /// Creates a new entry result.
+    #[must_use]
+    pub fn new(
+        decision: EntryDecision,
+        strategy_name: String,
+        used_fallback: bool,
+        edge_at_entry: Option<Decimal>,
+    ) -> Self {
+        let entry_offset_secs = match &decision {
+            EntryDecision::Enter { offset, .. } => Some(offset.num_seconds()),
+            EntryDecision::NoEntry { .. } => None,
+        };
+
+        Self {
+            decision,
+            strategy_name,
+            used_fallback,
+            edge_at_entry,
+            entry_offset_secs,
+        }
+    }
+
+    /// Returns true if entry was made.
+    #[must_use]
+    pub fn did_enter(&self) -> bool {
+        self.decision.is_entry()
+    }
+}
+
+// ============================================================
+// Entry Strategy Factory
+// ============================================================
+
+/// Entry strategy type for configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EntryStrategyType {
+    /// Enter immediately at window open.
+    Immediate,
+    /// Enter at a fixed time offset.
+    FixedTime,
+    /// Enter when edge exceeds a threshold.
+    EdgeThreshold,
+}
+
+impl EntryStrategyType {
+    /// Parses an entry strategy type from a string.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "immediate" => Some(Self::Immediate),
+            "fixed" | "fixed_time" | "fixedtime" => Some(Self::FixedTime),
+            "edge" | "edge_threshold" | "edgethreshold" => Some(Self::EdgeThreshold),
+            _ => None,
+        }
+    }
+
+    /// Returns the string representation.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Immediate => "immediate",
+            Self::FixedTime => "fixed_time",
+            Self::EdgeThreshold => "edge_threshold",
+        }
+    }
+}
+
+/// Configuration for creating entry strategies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryStrategyConfig {
+    /// The type of entry strategy.
+    pub strategy_type: EntryStrategyType,
+    /// Minimum edge threshold (for EdgeThreshold strategy).
+    pub edge_threshold: Decimal,
+    /// Fixed time offset as percentage of window (for FixedTime strategy).
+    pub offset_pct: f64,
+    /// Fallback time in minutes (0 to disable fallback).
+    pub fallback_mins: i64,
+    /// Window duration in minutes.
+    pub window_mins: i64,
+    /// Cutoff time in minutes (when to stop trying to enter).
+    pub cutoff_mins: i64,
+}
+
+impl Default for EntryStrategyConfig {
+    fn default() -> Self {
+        Self {
+            strategy_type: EntryStrategyType::Immediate,
+            edge_threshold: dec!(0.03),
+            offset_pct: 0.25,
+            fallback_mins: 2,
+            window_mins: 15,
+            cutoff_mins: 14,
+        }
+    }
+}
+
+impl EntryStrategyConfig {
+    /// Creates an immediate entry configuration.
+    #[must_use]
+    pub fn immediate() -> Self {
+        Self {
+            strategy_type: EntryStrategyType::Immediate,
+            ..Self::default()
+        }
+    }
+
+    /// Creates a fixed-time entry configuration.
+    #[must_use]
+    pub fn fixed_time(offset_pct: f64) -> Self {
+        Self {
+            strategy_type: EntryStrategyType::FixedTime,
+            offset_pct,
+            ..Self::default()
+        }
+    }
+
+    /// Creates an edge-threshold entry configuration.
+    #[must_use]
+    pub fn edge_threshold(threshold: Decimal) -> Self {
+        Self {
+            strategy_type: EntryStrategyType::EdgeThreshold,
+            edge_threshold: threshold,
+            ..Self::default()
+        }
+    }
+
+    /// Sets the fallback time in minutes.
+    #[must_use]
+    pub fn with_fallback(mut self, mins: i64) -> Self {
+        self.fallback_mins = mins;
+        self
+    }
+
+    /// Disables fallback.
+    #[must_use]
+    pub fn without_fallback(mut self) -> Self {
+        self.fallback_mins = 0;
+        self
+    }
+
+    /// Sets the window duration in minutes.
+    #[must_use]
+    pub fn with_window(mut self, mins: i64) -> Self {
+        self.window_mins = mins;
+        self
+    }
+
+    /// Sets the cutoff time in minutes.
+    #[must_use]
+    pub fn with_cutoff(mut self, mins: i64) -> Self {
+        self.cutoff_mins = mins;
+        self
+    }
+
+    /// Returns the cutoff duration.
+    #[must_use]
+    pub fn cutoff_duration(&self) -> Duration {
+        Duration::minutes(self.cutoff_mins)
+    }
+
+    /// Returns the fallback duration (if enabled).
+    #[must_use]
+    pub fn fallback_duration(&self) -> Option<Duration> {
+        if self.fallback_mins > 0 {
+            Some(Duration::minutes(self.window_mins - self.fallback_mins))
+        } else {
+            None
+        }
+    }
+
+    /// Returns the fixed offset duration.
+    #[must_use]
+    pub fn offset_duration(&self) -> Duration {
+        let offset_mins = (self.window_mins as f64 * self.offset_pct) as i64;
+        Duration::minutes(offset_mins)
+    }
+}
+
+/// Creates an entry strategy from configuration.
+///
+/// Returns a boxed trait object that can be used for entry decisions.
+#[must_use]
+pub fn create_entry_strategy(config: &EntryStrategyConfig) -> Box<dyn EntryStrategy> {
+    let cutoff = config.cutoff_duration();
+
+    match config.strategy_type {
+        EntryStrategyType::Immediate => Box::new(ImmediateEntry::new(cutoff)),
+        EntryStrategyType::FixedTime => {
+            let offset = config.offset_duration();
+            if let Some(fallback) = config.fallback_duration() {
+                let inner = FixedTimeEntry::new(offset, cutoff);
+                Box::new(FallbackEntry::new(inner, fallback))
+            } else {
+                Box::new(FixedTimeEntry::new(offset, cutoff))
+            }
+        }
+        EntryStrategyType::EdgeThreshold => {
+            if let Some(fallback) = config.fallback_duration() {
+                let inner = EdgeThresholdEntry::new(config.edge_threshold, cutoff);
+                Box::new(FallbackEntry::new(inner, fallback))
+            } else {
+                Box::new(EdgeThresholdEntry::new(config.edge_threshold, cutoff))
+            }
+        }
+    }
+}
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -1628,5 +1979,418 @@ mod tests {
             stats[1].avg_edge_at_entry.is_none()
                 || stats[1].avg_edge_at_entry.unwrap() >= dec!(0.08)
         );
+    }
+
+    // ============================================================
+    // ImmediateEntry Tests
+    // ============================================================
+
+    #[test]
+    fn immediate_entry_enters_at_any_offset() {
+        let strategy = ImmediateEntry::new(Duration::minutes(14));
+
+        // At offset 0 (window open)
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::zero(),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = strategy.evaluate(&ctx);
+        assert!(decision.is_entry());
+
+        // At offset 7 minutes
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(7),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = strategy.evaluate(&ctx);
+        assert!(decision.is_entry());
+    }
+
+    #[test]
+    fn immediate_entry_respects_cutoff() {
+        let strategy = ImmediateEntry::new(Duration::minutes(10));
+
+        // Past cutoff
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(12),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = strategy.evaluate(&ctx);
+        assert!(!decision.is_entry());
+        if let EntryDecision::NoEntry { reason } = decision {
+            assert!(reason.contains("cutoff"));
+        }
+    }
+
+    #[test]
+    fn immediate_entry_default_cutoff() {
+        let strategy = ImmediateEntry::default_cutoff();
+        assert_eq!(strategy.cutoff, Duration::minutes(14));
+    }
+
+    #[test]
+    fn immediate_entry_name_is_correct() {
+        let strategy = ImmediateEntry::default_cutoff();
+        assert_eq!(strategy.name(), "ImmediateEntry");
+    }
+
+    // ============================================================
+    // FallbackEntry Tests
+    // ============================================================
+
+    #[test]
+    fn fallback_entry_delegates_to_inner_when_inner_enters() {
+        // Inner strategy enters at minute 5
+        let inner = FixedTimeEntry::new(Duration::minutes(5), Duration::minutes(14));
+        let fallback = FallbackEntry::new(inner, Duration::minutes(12));
+
+        // At minute 5, inner should trigger
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(5),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = fallback.evaluate(&ctx);
+        assert!(decision.is_entry());
+    }
+
+    #[test]
+    fn fallback_entry_falls_back_at_fallback_time() {
+        // Inner strategy enters at minute 5, but we're at minute 2 (not yet)
+        let inner = FixedTimeEntry::new(Duration::minutes(5), Duration::minutes(14));
+        let fallback = FallbackEntry::new(inner, Duration::minutes(3)); // Fallback at minute 3
+
+        // At minute 2, inner doesn't trigger yet
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(2),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = fallback.evaluate(&ctx);
+        assert!(!decision.is_entry());
+
+        // At minute 3 (fallback time), should enter via fallback
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(3),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = fallback.evaluate(&ctx);
+        assert!(decision.is_entry());
+    }
+
+    #[test]
+    fn fallback_entry_with_edge_threshold_inner() {
+        // Inner strategy requires 10% edge which won't be met
+        let inner = EdgeThresholdEntry::new(dec!(0.10), Duration::minutes(14));
+        let fallback = FallbackEntry::new(inner, Duration::minutes(12));
+
+        // Edge is only 5%, so inner won't trigger
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(5),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = fallback.evaluate(&ctx);
+        assert!(!decision.is_entry());
+
+        // At fallback time, should enter anyway
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(12),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        let decision = fallback.evaluate(&ctx);
+        assert!(decision.is_entry());
+    }
+
+    #[test]
+    fn fallback_entry_inner_accessor() {
+        let inner = FixedTimeEntry::new(Duration::minutes(5), Duration::minutes(14));
+        let fallback = FallbackEntry::new(inner, Duration::minutes(12));
+
+        assert_eq!(fallback.inner().entry_offset, Duration::minutes(5));
+    }
+
+    #[test]
+    fn fallback_entry_name_is_correct() {
+        let inner = FixedTimeEntry::at_open();
+        let fallback = FallbackEntry::new(inner, Duration::minutes(12));
+        assert_eq!(fallback.name(), "FallbackEntry");
+    }
+
+    // ============================================================
+    // EntryResult Tests
+    // ============================================================
+
+    #[test]
+    fn entry_result_new_with_entry() {
+        let decision = EntryDecision::enter(Duration::minutes(5), BetDirection::Yes);
+        let result = EntryResult::new(
+            decision,
+            "TestStrategy".to_string(),
+            false,
+            Some(dec!(0.08)),
+        );
+
+        assert!(result.did_enter());
+        assert_eq!(result.strategy_name, "TestStrategy");
+        assert!(!result.used_fallback);
+        assert_eq!(result.edge_at_entry, Some(dec!(0.08)));
+        assert_eq!(result.entry_offset_secs, Some(300)); // 5 minutes = 300 seconds
+    }
+
+    #[test]
+    fn entry_result_new_with_no_entry() {
+        let decision = EntryDecision::no_entry("Edge too low");
+        let result = EntryResult::new(decision, "TestStrategy".to_string(), false, None);
+
+        assert!(!result.did_enter());
+        assert!(result.entry_offset_secs.is_none());
+        assert!(result.edge_at_entry.is_none());
+    }
+
+    #[test]
+    fn entry_result_tracks_fallback_usage() {
+        let decision = EntryDecision::enter(Duration::minutes(12), BetDirection::No);
+        let result = EntryResult::new(
+            decision,
+            "FallbackEntry".to_string(),
+            true,
+            Some(dec!(0.02)),
+        );
+
+        assert!(result.did_enter());
+        assert!(result.used_fallback);
+    }
+
+    // ============================================================
+    // EntryStrategyType Tests
+    // ============================================================
+
+    #[test]
+    fn entry_strategy_type_parse() {
+        assert_eq!(
+            EntryStrategyType::parse("immediate"),
+            Some(EntryStrategyType::Immediate)
+        );
+        assert_eq!(
+            EntryStrategyType::parse("IMMEDIATE"),
+            Some(EntryStrategyType::Immediate)
+        );
+        assert_eq!(
+            EntryStrategyType::parse("fixed_time"),
+            Some(EntryStrategyType::FixedTime)
+        );
+        assert_eq!(
+            EntryStrategyType::parse("fixed"),
+            Some(EntryStrategyType::FixedTime)
+        );
+        assert_eq!(
+            EntryStrategyType::parse("edge_threshold"),
+            Some(EntryStrategyType::EdgeThreshold)
+        );
+        assert_eq!(
+            EntryStrategyType::parse("edge"),
+            Some(EntryStrategyType::EdgeThreshold)
+        );
+        assert_eq!(EntryStrategyType::parse("invalid"), None);
+    }
+
+    #[test]
+    fn entry_strategy_type_as_str() {
+        assert_eq!(EntryStrategyType::Immediate.as_str(), "immediate");
+        assert_eq!(EntryStrategyType::FixedTime.as_str(), "fixed_time");
+        assert_eq!(EntryStrategyType::EdgeThreshold.as_str(), "edge_threshold");
+    }
+
+    // ============================================================
+    // EntryStrategyConfig Tests
+    // ============================================================
+
+    #[test]
+    fn entry_strategy_config_default() {
+        let config = EntryStrategyConfig::default();
+
+        assert_eq!(config.strategy_type, EntryStrategyType::Immediate);
+        assert_eq!(config.edge_threshold, dec!(0.03));
+        assert!((config.offset_pct - 0.25).abs() < f64::EPSILON);
+        assert_eq!(config.fallback_mins, 2);
+        assert_eq!(config.window_mins, 15);
+        assert_eq!(config.cutoff_mins, 14);
+    }
+
+    #[test]
+    fn entry_strategy_config_immediate() {
+        let config = EntryStrategyConfig::immediate();
+        assert_eq!(config.strategy_type, EntryStrategyType::Immediate);
+    }
+
+    #[test]
+    fn entry_strategy_config_fixed_time() {
+        let config = EntryStrategyConfig::fixed_time(0.5);
+
+        assert_eq!(config.strategy_type, EntryStrategyType::FixedTime);
+        assert!((config.offset_pct - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn entry_strategy_config_edge_threshold() {
+        let config = EntryStrategyConfig::edge_threshold(dec!(0.05));
+
+        assert_eq!(config.strategy_type, EntryStrategyType::EdgeThreshold);
+        assert_eq!(config.edge_threshold, dec!(0.05));
+    }
+
+    #[test]
+    fn entry_strategy_config_with_fallback() {
+        let config = EntryStrategyConfig::immediate().with_fallback(3);
+        assert_eq!(config.fallback_mins, 3);
+    }
+
+    #[test]
+    fn entry_strategy_config_without_fallback() {
+        let config = EntryStrategyConfig::immediate().without_fallback();
+        assert_eq!(config.fallback_mins, 0);
+    }
+
+    #[test]
+    fn entry_strategy_config_cutoff_duration() {
+        let config = EntryStrategyConfig::default();
+        assert_eq!(config.cutoff_duration(), Duration::minutes(14));
+    }
+
+    #[test]
+    fn entry_strategy_config_fallback_duration() {
+        let config = EntryStrategyConfig::default(); // fallback_mins = 2, window = 15
+                                                     // Fallback duration = window - fallback_mins = 15 - 2 = 13 minutes
+        assert_eq!(config.fallback_duration(), Some(Duration::minutes(13)));
+    }
+
+    #[test]
+    fn entry_strategy_config_fallback_duration_disabled() {
+        let config = EntryStrategyConfig::immediate().without_fallback();
+        assert_eq!(config.fallback_duration(), None);
+    }
+
+    #[test]
+    fn entry_strategy_config_offset_duration() {
+        let config = EntryStrategyConfig::fixed_time(0.25).with_window(16);
+        // 25% of 16 minutes = 4 minutes
+        assert_eq!(config.offset_duration(), Duration::minutes(4));
+    }
+
+    // ============================================================
+    // Factory Function Tests
+    // ============================================================
+
+    #[test]
+    fn create_entry_strategy_immediate() {
+        let config = EntryStrategyConfig::immediate();
+        let strategy = create_entry_strategy(&config);
+
+        assert_eq!(strategy.name(), "ImmediateEntry");
+
+        // Verify it enters immediately
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::zero(),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        assert!(strategy.evaluate(&ctx).is_entry());
+    }
+
+    #[test]
+    fn create_entry_strategy_fixed_time_with_fallback() {
+        let config = EntryStrategyConfig::fixed_time(0.5).with_fallback(2);
+        let strategy = create_entry_strategy(&config);
+
+        // Should be a FallbackEntry wrapping FixedTimeEntry
+        assert_eq!(strategy.name(), "FallbackEntry");
+    }
+
+    #[test]
+    fn create_entry_strategy_fixed_time_without_fallback() {
+        let config = EntryStrategyConfig::fixed_time(0.5).without_fallback();
+        let strategy = create_entry_strategy(&config);
+
+        assert_eq!(strategy.name(), "FixedTimeEntry");
+    }
+
+    #[test]
+    fn create_entry_strategy_edge_threshold_with_fallback() {
+        let config = EntryStrategyConfig::edge_threshold(dec!(0.05)).with_fallback(3);
+        let strategy = create_entry_strategy(&config);
+
+        assert_eq!(strategy.name(), "FallbackEntry");
+    }
+
+    #[test]
+    fn create_entry_strategy_edge_threshold_without_fallback() {
+        let config = EntryStrategyConfig::edge_threshold(dec!(0.05)).without_fallback();
+        let strategy = create_entry_strategy(&config);
+
+        assert_eq!(strategy.name(), "EdgeThresholdEntry");
+    }
+
+    #[test]
+    fn create_entry_strategy_edge_threshold_with_fallback_behavior() {
+        // Create edge threshold strategy that requires high edge
+        let config = EntryStrategyConfig::edge_threshold(dec!(0.20))
+            .with_fallback(3)
+            .with_window(15);
+        let strategy = create_entry_strategy(&config);
+
+        // Low edge, before fallback time - should not enter
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55), // Only 5% edge
+            Duration::minutes(5),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        assert!(!strategy.evaluate(&ctx).is_entry());
+
+        // Low edge, at fallback time (15 - 3 = 12 minutes) - should enter via fallback
+        let ctx = EntryContext::new(
+            dec!(0.50),
+            dec!(0.55),
+            Duration::minutes(12),
+            Duration::minutes(15),
+            BetDirection::Yes,
+            dec!(0.0),
+        );
+        assert!(strategy.evaluate(&ctx).is_entry());
     }
 }
