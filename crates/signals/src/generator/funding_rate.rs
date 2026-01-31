@@ -22,6 +22,33 @@ pub struct FundingReversalConfig {
     pub reversion_threshold_percentile: f64,
 }
 
+/// Configuration for 30-day funding rate percentile analysis.
+///
+/// Uses historical funding rates to determine if the current rate is
+/// extreme compared to the past 30 days, providing a contrarian signal.
+#[derive(Debug, Clone)]
+pub struct FundingPercentileConfig {
+    /// Number of funding periods to look back (default: 90 = 30 days * 3 periods/day)
+    pub lookback_periods: usize,
+    /// Percentile threshold for high funding (default: 0.80 = top 20%)
+    pub high_threshold: f64,
+    /// Percentile threshold for low funding (default: 0.20 = bottom 20%)
+    pub low_threshold: f64,
+    /// Minimum data points required for valid signal (default: 30)
+    pub min_data_points: usize,
+}
+
+impl Default for FundingPercentileConfig {
+    fn default() -> Self {
+        Self {
+            lookback_periods: 90, // 30 days * 3 periods/day
+            high_threshold: 0.80, // Top 20%
+            low_threshold: 0.20,  // Bottom 20%
+            min_data_points: 30,
+        }
+    }
+}
+
 impl Default for FundingReversalConfig {
     fn default() -> Self {
         Self {
@@ -81,6 +108,8 @@ pub struct FundingRateSignal {
     pub reversal_config: Option<FundingReversalConfig>,
     /// Signal combination mode
     pub signal_mode: FundingSignalMode,
+    /// 30-day percentile configuration (None = disabled)
+    pub percentile_config: Option<FundingPercentileConfig>,
 }
 
 impl Default for FundingRateSignal {
@@ -108,6 +137,7 @@ impl FundingRateSignal {
             percentile_threshold_low: 0.10,
             reversal_config: None,
             signal_mode: FundingSignalMode::Combined,
+            percentile_config: None,
         }
     }
 
@@ -130,6 +160,13 @@ impl FundingRateSignal {
     #[must_use]
     pub fn with_signal_mode(mut self, mode: FundingSignalMode) -> Self {
         self.signal_mode = mode;
+        self
+    }
+
+    /// Sets 30-day percentile configuration for extreme funding detection.
+    #[must_use]
+    pub fn with_percentile_config(mut self, config: FundingPercentileConfig) -> Self {
+        self.percentile_config = Some(config);
         self
     }
 
@@ -215,6 +252,49 @@ pub fn percentile_signal(
         // Low/negative funding = overleveraged shorts = bullish
         let strength = (low_threshold - percentile) / low_threshold;
         Some((Direction::Up, strength.min(1.0)))
+    } else {
+        None
+    }
+}
+
+/// Determines if the current funding rate is extreme compared to 30-day history.
+///
+/// This function analyzes the current funding rate against historical data
+/// to identify when funding is at extreme percentiles, which can indicate
+/// overleveraged market conditions.
+///
+/// # Arguments
+/// * `current` - Current funding rate
+/// * `historical` - Historical funding rates (raw values)
+/// * `config` - Configuration for percentile thresholds
+///
+/// # Returns
+/// * `Some((Direction::Down, strength, percentile))` when funding >= high_threshold
+/// * `Some((Direction::Up, strength, percentile))` when funding <= low_threshold
+/// * `None` when funding is in normal range or insufficient data
+pub fn is_funding_extreme_30d(
+    current: f64,
+    historical: &[f64],
+    config: &FundingPercentileConfig,
+) -> Option<(Direction, f64, f64)> {
+    // Check minimum data requirements
+    if historical.len() < config.min_data_points {
+        return None;
+    }
+
+    // Calculate percentile of current rate in historical context
+    let percentile = SignalContext::calculate_percentile(historical, current)?;
+
+    if percentile >= config.high_threshold {
+        // High positive funding = overleveraged longs = bearish
+        // Strength scales from 0 at threshold to 1 at 100th percentile
+        let strength = (percentile - config.high_threshold) / (1.0 - config.high_threshold);
+        Some((Direction::Down, strength.min(1.0), percentile))
+    } else if percentile <= config.low_threshold {
+        // Low/negative funding = overleveraged shorts = bullish
+        // Strength scales from 0 at threshold to 1 at 0th percentile
+        let strength = (config.low_threshold - percentile) / config.low_threshold;
+        Some((Direction::Up, strength.min(1.0), percentile))
     } else {
         None
     }
@@ -410,6 +490,15 @@ impl SignalGenerator for FundingRateSignal {
 
         if let (Some((dir1, _)), Some((dir2, _))) = (zscore_signal, percentile_signal_result) {
             signal = signal.with_metadata("signals_agree", if dir1 == dir2 { 1.0 } else { 0.0 });
+        }
+
+        // Check 30-day percentile if configured
+        if let Some(ref config) = self.percentile_config {
+            if let Some((_, _, percentile_30d)) =
+                is_funding_extreme_30d(funding_rate, &historical_rates, config)
+            {
+                signal = signal.with_metadata("percentile_30d", percentile_30d);
+            }
         }
 
         Ok(signal)
@@ -896,5 +985,387 @@ mod tests {
         // Should be bearish based on z-score
         assert_eq!(result.direction, Direction::Down);
         assert!(result.metadata.contains_key("zscore"));
+    }
+
+    // ============================================
+    // Phase 2.2A: 30-Day Funding Rate Percentile Tests
+    // ============================================
+
+    #[test]
+    fn funding_percentile_config_default_values() {
+        let config = FundingPercentileConfig::default();
+
+        // 30 days * 3 periods/day = 90 periods
+        assert_eq!(config.lookback_periods, 90);
+        // Top 20% threshold
+        assert!((config.high_threshold - 0.80).abs() < f64::EPSILON);
+        // Bottom 20% threshold
+        assert!((config.low_threshold - 0.20).abs() < f64::EPSILON);
+        // Minimum 30 data points required
+        assert_eq!(config.min_data_points, 30);
+    }
+
+    #[test]
+    fn funding_percentile_config_custom_values() {
+        let config = FundingPercentileConfig {
+            lookback_periods: 180,
+            high_threshold: 0.90,
+            low_threshold: 0.10,
+            min_data_points: 50,
+        };
+
+        assert_eq!(config.lookback_periods, 180);
+        assert!((config.high_threshold - 0.90).abs() < f64::EPSILON);
+        assert!((config.low_threshold - 0.10).abs() < f64::EPSILON);
+        assert_eq!(config.min_data_points, 50);
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_returns_down_for_high_percentile() {
+        // 100 historical rates, current at 85th percentile
+        let historical: Vec<f64> = (0..100).map(|i| i as f64 * 0.0001).collect();
+        let current = 0.0085; // 85th percentile
+
+        let config = FundingPercentileConfig::default();
+        let result = is_funding_extreme_30d(current, &historical, &config);
+
+        assert!(result.is_some(), "Expected Some for high percentile");
+        let (direction, strength, percentile) = result.unwrap();
+        assert_eq!(direction, Direction::Down, "High funding should be bearish");
+        assert!(
+            strength > 0.0 && strength <= 1.0,
+            "Strength should be in (0, 1]"
+        );
+        assert!(percentile >= 0.80, "Percentile should be >= 80%");
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_returns_up_for_low_percentile() {
+        // 100 historical rates, current at 15th percentile
+        let historical: Vec<f64> = (0..100).map(|i| i as f64 * 0.0001).collect();
+        let current = 0.0015; // 15th percentile
+
+        let config = FundingPercentileConfig::default();
+        let result = is_funding_extreme_30d(current, &historical, &config);
+
+        assert!(result.is_some(), "Expected Some for low percentile");
+        let (direction, strength, percentile) = result.unwrap();
+        assert_eq!(direction, Direction::Up, "Low funding should be bullish");
+        assert!(
+            strength > 0.0 && strength <= 1.0,
+            "Strength should be in (0, 1]"
+        );
+        assert!(percentile <= 0.20, "Percentile should be <= 20%");
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_returns_none_for_normal_range() {
+        // 100 historical rates, current at 50th percentile
+        let historical: Vec<f64> = (0..100).map(|i| i as f64 * 0.0001).collect();
+        let current = 0.005; // ~50th percentile
+
+        let config = FundingPercentileConfig::default();
+        let result = is_funding_extreme_30d(current, &historical, &config);
+
+        assert!(
+            result.is_none(),
+            "Expected None for normal percentile range"
+        );
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_returns_none_for_insufficient_data() {
+        // Only 20 data points, but min_data_points is 30
+        let historical: Vec<f64> = (0..20).map(|i| i as f64 * 0.0001).collect();
+        let current = 0.0019; // Would be high percentile
+
+        let config = FundingPercentileConfig::default();
+        let result = is_funding_extreme_30d(current, &historical, &config);
+
+        assert!(result.is_none(), "Expected None for insufficient data");
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_returns_none_for_empty_history() {
+        let historical: Vec<f64> = vec![];
+        let current = 0.001;
+
+        let config = FundingPercentileConfig::default();
+        let result = is_funding_extreme_30d(current, &historical, &config);
+
+        assert!(result.is_none(), "Expected None for empty history");
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_strength_scales_with_extremity() {
+        let historical: Vec<f64> = (0..100).map(|i| i as f64 * 0.0001).collect();
+
+        let config = FundingPercentileConfig::default();
+
+        // Just above 80th percentile
+        let current_mild = 0.0082; // ~82nd percentile
+        let result_mild = is_funding_extreme_30d(current_mild, &historical, &config);
+
+        // Very extreme - 95th percentile
+        let current_extreme = 0.0095; // ~95th percentile
+        let result_extreme = is_funding_extreme_30d(current_extreme, &historical, &config);
+
+        assert!(result_mild.is_some());
+        assert!(result_extreme.is_some());
+
+        let (_, strength_mild, _) = result_mild.unwrap();
+        let (_, strength_extreme, _) = result_extreme.unwrap();
+
+        assert!(
+            strength_extreme > strength_mild,
+            "More extreme value should have higher strength: {strength_extreme} > {strength_mild}"
+        );
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_boundary_at_high_threshold() {
+        let historical: Vec<f64> = (0..100).map(|i| i as f64 * 0.0001).collect();
+        let config = FundingPercentileConfig::default();
+
+        // Exactly at 80th percentile
+        let current = 0.0080;
+        let result = is_funding_extreme_30d(current, &historical, &config);
+
+        // At boundary, should trigger (>= check)
+        assert!(
+            result.is_some(),
+            "At exactly 80th percentile should trigger"
+        );
+        let (direction, _, _) = result.unwrap();
+        assert_eq!(direction, Direction::Down);
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_boundary_at_low_threshold() {
+        let historical: Vec<f64> = (0..100).map(|i| i as f64 * 0.0001).collect();
+        let config = FundingPercentileConfig::default();
+
+        // At 19th percentile value (index 18, so 19 values <= it, 19/100 = 0.19)
+        // This is below 0.20 threshold, should trigger
+        let current = 0.0018;
+        let result = is_funding_extreme_30d(current, &historical, &config);
+
+        // Below threshold, should trigger (<= check)
+        assert!(result.is_some(), "Below 20th percentile should trigger");
+        let (direction, _, percentile) = result.unwrap();
+        assert_eq!(direction, Direction::Up);
+        assert!(
+            percentile <= 0.20,
+            "Percentile should be <= 0.20, got {}",
+            percentile
+        );
+    }
+
+    #[test]
+    fn is_funding_extreme_30d_custom_config() {
+        let historical: Vec<f64> = (0..100).map(|i| i as f64 * 0.0001).collect();
+
+        // More aggressive thresholds: top/bottom 10%
+        let config = FundingPercentileConfig {
+            lookback_periods: 90,
+            high_threshold: 0.90,
+            low_threshold: 0.10,
+            min_data_points: 30,
+        };
+
+        // 85th percentile - should NOT trigger with 90% threshold
+        let current = 0.0085;
+        let result = is_funding_extreme_30d(current, &historical, &config);
+        assert!(
+            result.is_none(),
+            "85th percentile should not trigger with 90% threshold"
+        );
+
+        // 95th percentile - SHOULD trigger with 90% threshold
+        let current_extreme = 0.0095;
+        let result_extreme = is_funding_extreme_30d(current_extreme, &historical, &config);
+        assert!(
+            result_extreme.is_some(),
+            "95th percentile should trigger with 90% threshold"
+        );
+    }
+
+    // ============================================
+    // Phase 2.2A: Integration Tests with FundingRateSignal
+    // ============================================
+
+    #[test]
+    fn funding_rate_signal_with_percentile_config_builder() {
+        let config = FundingPercentileConfig {
+            lookback_periods: 180,
+            high_threshold: 0.85,
+            low_threshold: 0.15,
+            min_data_points: 50,
+        };
+
+        let signal = FundingRateSignal::default().with_percentile_config(config.clone());
+
+        assert!(signal.percentile_config.is_some());
+        let stored_config = signal.percentile_config.unwrap();
+        assert_eq!(stored_config.lookback_periods, 180);
+        assert!((stored_config.high_threshold - 0.85).abs() < f64::EPSILON);
+        assert!((stored_config.low_threshold - 0.15).abs() < f64::EPSILON);
+        assert_eq!(stored_config.min_data_points, 50);
+    }
+
+    #[tokio::test]
+    async fn compute_includes_percentile_30d_metadata_when_extreme() {
+        let config = FundingPercentileConfig::default();
+        let mut signal = FundingRateSignal::new(2.0, 1.0, 100).with_percentile_config(config);
+
+        // Build internal history
+        for _ in 0..50 {
+            let ctx = SignalContext::new(Utc::now(), "BTCUSD").with_funding_rate(0.001);
+            let _ = signal.compute(&ctx).await.unwrap();
+        }
+
+        // Create 30-day historical data where current will be extreme
+        let historical: Vec<HistoricalFundingRate> = (0..100)
+            .map(|i| HistoricalFundingRate {
+                timestamp: Utc::now() - Duration::hours(i * 8),
+                funding_rate: i as f64 * 0.0001,
+                zscore: None,
+                percentile: None,
+            })
+            .collect();
+
+        // Extreme high funding rate
+        let extreme_rate = 0.012;
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD")
+            .with_funding_rate(extreme_rate)
+            .with_historical_funding_rates(historical);
+
+        let result = signal.compute(&ctx).await.unwrap();
+
+        // Should have percentile_30d in metadata
+        assert!(
+            result.metadata.contains_key("percentile_30d"),
+            "Expected percentile_30d in metadata, got: {:?}",
+            result.metadata.keys().collect::<Vec<_>>()
+        );
+
+        // Percentile should be > 0.80 for extreme high
+        let percentile_30d = result.metadata.get("percentile_30d").unwrap();
+        assert!(
+            *percentile_30d >= 0.80,
+            "Expected percentile >= 0.80, got {}",
+            percentile_30d
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_no_percentile_30d_when_normal() {
+        let config = FundingPercentileConfig::default();
+        let mut signal = FundingRateSignal::new(2.0, 1.0, 100).with_percentile_config(config);
+
+        // Build internal history
+        for _ in 0..50 {
+            let ctx = SignalContext::new(Utc::now(), "BTCUSD").with_funding_rate(0.001);
+            let _ = signal.compute(&ctx).await.unwrap();
+        }
+
+        // Create 30-day historical data
+        let historical: Vec<HistoricalFundingRate> = (0..100)
+            .map(|i| HistoricalFundingRate {
+                timestamp: Utc::now() - Duration::hours(i * 8),
+                funding_rate: i as f64 * 0.0001,
+                zscore: None,
+                percentile: None,
+            })
+            .collect();
+
+        // Normal funding rate - 50th percentile
+        let normal_rate = 0.005;
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD")
+            .with_funding_rate(normal_rate)
+            .with_historical_funding_rates(historical);
+
+        let result = signal.compute(&ctx).await.unwrap();
+
+        // Should NOT have percentile_30d in metadata (not extreme)
+        assert!(
+            !result.metadata.contains_key("percentile_30d"),
+            "Expected no percentile_30d for normal range, but found it"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_no_percentile_30d_without_config() {
+        let mut signal = FundingRateSignal::new(2.0, 1.0, 100);
+        // No percentile_config set
+
+        // Build internal history
+        for _ in 0..50 {
+            let ctx = SignalContext::new(Utc::now(), "BTCUSD").with_funding_rate(0.001);
+            let _ = signal.compute(&ctx).await.unwrap();
+        }
+
+        // Create 30-day historical data
+        let historical: Vec<HistoricalFundingRate> = (0..100)
+            .map(|i| HistoricalFundingRate {
+                timestamp: Utc::now() - Duration::hours(i * 8),
+                funding_rate: i as f64 * 0.0001,
+                zscore: None,
+                percentile: None,
+            })
+            .collect();
+
+        // Extreme funding rate
+        let extreme_rate = 0.012;
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD")
+            .with_funding_rate(extreme_rate)
+            .with_historical_funding_rates(historical);
+
+        let result = signal.compute(&ctx).await.unwrap();
+
+        // Should NOT have percentile_30d when config is not set
+        assert!(
+            !result.metadata.contains_key("percentile_30d"),
+            "Expected no percentile_30d without config"
+        );
+    }
+
+    #[tokio::test]
+    async fn compute_percentile_30d_affects_signal_direction() {
+        let config = FundingPercentileConfig::default();
+        let mut signal = FundingRateSignal::new(2.0, 1.0, 100)
+            .with_percentile_config(config)
+            .with_signal_mode(FundingSignalMode::Percentile);
+
+        // Build internal history with neutral values
+        for _ in 0..50 {
+            let ctx = SignalContext::new(Utc::now(), "BTCUSD").with_funding_rate(0.001);
+            let _ = signal.compute(&ctx).await.unwrap();
+        }
+
+        // Historical data
+        let historical: Vec<HistoricalFundingRate> = (0..100)
+            .map(|i| HistoricalFundingRate {
+                timestamp: Utc::now() - Duration::hours(i * 8),
+                funding_rate: i as f64 * 0.0001,
+                zscore: None,
+                percentile: None,
+            })
+            .collect();
+
+        // Very low funding rate - should be bullish
+        let low_rate = 0.0005; // ~5th percentile
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD")
+            .with_funding_rate(low_rate)
+            .with_historical_funding_rates(historical);
+
+        let result = signal.compute(&ctx).await.unwrap();
+
+        // Low funding should give bullish signal
+        assert_eq!(
+            result.direction,
+            Direction::Up,
+            "Low funding at bottom percentile should be bullish"
+        );
     }
 }

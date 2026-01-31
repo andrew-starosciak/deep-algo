@@ -21,8 +21,8 @@ pub use metrics_formatter::MetricsFormatter;
 pub use position::{Position, PositionTracker};
 pub use position_sizing::{calculate_position_size, calculate_required_margin};
 pub use signal::{
-    Direction, HistoricalFundingRate, LiquidationAggregate, NewsEvent, OrderBookSnapshot,
-    PriceLevel, SignalContext, SignalGenerator, SignalValue,
+    Direction, HistoricalFundingRate, LiquidationAggregate, NewsEvent, OhlcvCandle,
+    OrderBookSnapshot, PriceLevel, SignalContext, SignalGenerator, SignalValue,
 };
 pub use traits::{DataProvider, ExecutionHandler, RiskManager, Strategy};
 pub use validation::{binomial_test, information_coefficient, wilson_ci, SignalValidation};

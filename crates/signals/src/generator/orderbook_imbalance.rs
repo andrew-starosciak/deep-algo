@@ -18,6 +18,41 @@ pub enum Side {
     Ask,
 }
 
+/// Wall semantics representing floor (support) or ceiling (resistance).
+///
+/// - **Floor**: Bid wall acting as support - bullish (prevents price from falling)
+/// - **Ceiling**: Ask wall acting as resistance - bearish (prevents price from rising)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WallSemantics {
+    /// Bid wall = floor (support) - bullish
+    Floor,
+    /// Ask wall = ceiling (resistance) - bearish
+    Ceiling,
+}
+
+impl WallSemantics {
+    /// Returns the directional bias of this wall semantics.
+    ///
+    /// - Floor (bid wall) returns +1.0 (bullish)
+    /// - Ceiling (ask wall) returns -1.0 (bearish)
+    #[must_use]
+    pub fn direction_bias(&self) -> f64 {
+        match self {
+            WallSemantics::Floor => 1.0,
+            WallSemantics::Ceiling => -1.0,
+        }
+    }
+}
+
+impl From<Side> for WallSemantics {
+    fn from(side: Side) -> Self {
+        match side {
+            Side::Bid => WallSemantics::Floor,
+            Side::Ask => WallSemantics::Ceiling,
+        }
+    }
+}
+
 /// Configuration for wall detection.
 #[derive(Debug, Clone)]
 pub struct WallDetectionConfig {
@@ -42,12 +77,52 @@ impl Default for WallDetectionConfig {
 pub struct Wall {
     /// Side of the wall (bid or ask)
     pub side: Side,
+    /// Semantics of the wall (floor/support or ceiling/resistance)
+    pub semantics: WallSemantics,
     /// Price level of the wall
     pub price: Decimal,
     /// Size of the wall in BTC
     pub size: Decimal,
     /// Distance from mid-price in basis points
     pub distance_bps: u32,
+}
+
+/// Wall bias analysis result.
+///
+/// Represents the aggregated bias from detected walls, where floors (bid walls)
+/// contribute positive bias and ceilings (ask walls) contribute negative bias.
+#[derive(Debug, Clone)]
+pub struct WallBias {
+    /// Aggregate bias from -1.0 (ceiling dominant) to +1.0 (floor dominant)
+    pub bias: f64,
+    /// Total weighted strength of floor walls
+    pub floor_strength: f64,
+    /// Total weighted strength of ceiling walls
+    pub ceiling_strength: f64,
+    /// The wall with the highest weighted score
+    pub dominant_wall: Option<Wall>,
+    /// Number of floor (bid) walls
+    pub floor_count: usize,
+    /// Number of ceiling (ask) walls
+    pub ceiling_count: usize,
+}
+
+impl WallBias {
+    /// Returns the direction indicated by the wall bias.
+    ///
+    /// - Positive bias -> Up (floor dominant)
+    /// - Negative bias -> Down (ceiling dominant)
+    /// - Zero/near-zero -> Neutral
+    #[must_use]
+    pub fn direction(&self) -> Direction {
+        if self.bias > 0.01 {
+            Direction::Up
+        } else if self.bias < -0.01 {
+            Direction::Down
+        } else {
+            Direction::Neutral
+        }
+    }
 }
 
 /// Signal generator based on order book bid/ask imbalance.
@@ -264,6 +339,7 @@ pub fn detect_walls(
             if distance_bps <= config.proximity_bps {
                 walls.push(Wall {
                     side: Side::Bid,
+                    semantics: WallSemantics::Floor,
                     price: *price,
                     size: *qty,
                     distance_bps,
@@ -287,6 +363,7 @@ pub fn detect_walls(
             if distance_bps <= config.proximity_bps {
                 walls.push(Wall {
                     side: Side::Ask,
+                    semantics: WallSemantics::Ceiling,
                     price: *price,
                     size: *qty,
                     distance_bps,
@@ -298,6 +375,85 @@ pub fn detect_walls(
     // Sort by size descending
     walls.sort_by(|a, b| b.size.cmp(&a.size));
     walls
+}
+
+/// Calculates the aggregate bias from detected walls.
+///
+/// Walls are weighted by both size and proximity to the mid-price.
+/// Proximity weight: `1 / (1 + distance_bps / 100)`
+/// Total weight: `size * proximity_weight`
+///
+/// The bias is calculated as: `(floor_strength - ceiling_strength) / total_strength`
+///
+/// # Arguments
+/// * `walls` - Detected walls with semantics
+/// * `_mid_price` - Current mid price (reserved for future use)
+///
+/// # Returns
+/// `WallBias` containing aggregate bias, individual strengths, and dominant wall.
+#[allow(unused_variables)]
+pub fn calculate_wall_bias(walls: &[Wall], _mid_price: Decimal) -> WallBias {
+    if walls.is_empty() {
+        return WallBias {
+            bias: 0.0,
+            floor_strength: 0.0,
+            ceiling_strength: 0.0,
+            dominant_wall: None,
+            floor_count: 0,
+            ceiling_count: 0,
+        };
+    }
+
+    let mut floor_strength = 0.0;
+    let mut ceiling_strength = 0.0;
+    let mut floor_count = 0;
+    let mut ceiling_count = 0;
+    let mut max_weighted_score = 0.0;
+    let mut dominant_wall: Option<Wall> = None;
+
+    for wall in walls {
+        // Calculate proximity weight: closer walls have more influence
+        // 1 / (1 + distance_bps / 100) gives weight from ~1.0 (0 bps) to ~0.5 (100 bps)
+        let proximity_weight = 1.0 / (1.0 + (wall.distance_bps as f64) / 100.0);
+
+        // Total weight is size * proximity
+        let size_f64: f64 = wall.size.to_string().parse().unwrap_or(0.0);
+        let weighted_score = size_f64 * proximity_weight;
+
+        // Track dominant wall
+        if weighted_score > max_weighted_score {
+            max_weighted_score = weighted_score;
+            dominant_wall = Some(wall.clone());
+        }
+
+        // Accumulate based on semantics
+        match wall.semantics {
+            WallSemantics::Floor => {
+                floor_strength += weighted_score;
+                floor_count += 1;
+            }
+            WallSemantics::Ceiling => {
+                ceiling_strength += weighted_score;
+                ceiling_count += 1;
+            }
+        }
+    }
+
+    let total_strength = floor_strength + ceiling_strength;
+    let bias = if total_strength > f64::EPSILON {
+        (floor_strength - ceiling_strength) / total_strength
+    } else {
+        0.0
+    };
+
+    WallBias {
+        bias,
+        floor_strength,
+        ceiling_strength,
+        dominant_wall,
+        floor_count,
+        ceiling_count,
+    }
 }
 
 /// Calculates z-score of current imbalance vs historical values.
@@ -421,6 +577,16 @@ impl SignalGenerator for OrderBookImbalanceSignal {
         signal = signal
             .with_metadata("bid_wall_count", bid_wall_count as f64)
             .with_metadata("ask_wall_count", ask_wall_count as f64);
+
+        // Calculate wall bias if walls were detected
+        if !walls.is_empty() {
+            let mid_price = orderbook.mid_price().unwrap_or(Decimal::ZERO);
+            let wall_bias = calculate_wall_bias(&walls, mid_price);
+            signal = signal
+                .with_metadata("wall_bias", wall_bias.bias)
+                .with_metadata("floor_strength", wall_bias.floor_strength)
+                .with_metadata("ceiling_strength", wall_bias.ceiling_strength);
+        }
 
         Ok(signal)
     }
@@ -965,4 +1131,7 @@ mod tests {
 
         assert_eq!(*result.metadata.get("wall_count").unwrap() as i32, 0);
     }
+
+    // Note: Phase 2.2D Wall Semantics tests are pending implementation of
+    // WallSemantics enum and calculate_wall_bias function.
 }

@@ -39,6 +39,14 @@ impl SignalRegistry {
         self.generators.insert(name, generator);
     }
 
+    /// Registers a signal generator with a custom name.
+    ///
+    /// This allows registering the same generator type with different names,
+    /// useful for testing variants of the same signal with different configurations.
+    pub fn register_with_name(&mut self, generator: Box<dyn SignalGenerator>, name: &str) {
+        self.generators.insert(name.to_string(), generator);
+    }
+
     /// Returns a reference to a signal generator by name.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<&dyn SignalGenerator> {

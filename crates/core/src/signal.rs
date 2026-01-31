@@ -161,6 +161,55 @@ pub struct NewsEvent {
     pub currencies: Option<Vec<String>>,
 }
 
+/// OHLCV candle data for momentum/price analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OhlcvCandle {
+    /// Timestamp of the candle
+    pub timestamp: DateTime<Utc>,
+    /// Opening price
+    pub open: Decimal,
+    /// Highest price
+    pub high: Decimal,
+    /// Lowest price
+    pub low: Decimal,
+    /// Closing price
+    pub close: Decimal,
+    /// Volume
+    pub volume: Decimal,
+}
+
+impl OhlcvCandle {
+    /// Returns the candle range (high - low).
+    #[must_use]
+    pub fn range(&self) -> Decimal {
+        self.high - self.low
+    }
+
+    /// Returns the candle body (|close - open|).
+    #[must_use]
+    pub fn body(&self) -> Decimal {
+        (self.close - self.open).abs()
+    }
+
+    /// Returns the price change (close - open).
+    #[must_use]
+    pub fn change(&self) -> Decimal {
+        self.close - self.open
+    }
+
+    /// Returns true if the candle is bullish (close > open).
+    #[must_use]
+    pub fn is_bullish(&self) -> bool {
+        self.close > self.open
+    }
+
+    /// Returns true if the candle is bearish (close < open).
+    #[must_use]
+    pub fn is_bearish(&self) -> bool {
+        self.close < self.open
+    }
+}
+
 impl NewsEvent {
     /// Returns true if this news mentions a specific currency.
     #[must_use]
@@ -197,6 +246,8 @@ pub struct SignalContext {
     pub liquidation_aggregates: Option<LiquidationAggregate>,
     /// Recent news events
     pub news_events: Option<Vec<NewsEvent>>,
+    /// Historical OHLCV candles for momentum analysis (most recent last)
+    pub historical_ohlcv: Option<Vec<OhlcvCandle>>,
 }
 
 impl SignalContext {
@@ -215,6 +266,7 @@ impl SignalContext {
             historical_funding_rates: None,
             liquidation_aggregates: None,
             news_events: None,
+            historical_ohlcv: None,
         }
     }
 
@@ -278,6 +330,13 @@ impl SignalContext {
     #[must_use]
     pub fn with_news_events(mut self, events: Vec<NewsEvent>) -> Self {
         self.news_events = Some(events);
+        self
+    }
+
+    /// Sets historical OHLCV candles for momentum analysis.
+    #[must_use]
+    pub fn with_historical_ohlcv(mut self, candles: Vec<OhlcvCandle>) -> Self {
+        self.historical_ohlcv = Some(candles);
         self
     }
 

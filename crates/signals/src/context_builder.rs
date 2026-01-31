@@ -7,12 +7,12 @@
 use std::time::Duration;
 
 use algo_trade_core::{
-    HistoricalFundingRate, LiquidationAggregate, NewsEvent, OrderBookSnapshot, PriceLevel,
-    SignalContext,
+    HistoricalFundingRate, LiquidationAggregate, NewsEvent, OhlcvCandle, OrderBookSnapshot,
+    PriceLevel, SignalContext,
 };
 use algo_trade_data::{
-    FundingRateRepository, LiquidationRepository, NewsEventRepository, OrderBookRepository,
-    Repositories,
+    FundingRateRepository, LiquidationRepository, NewsEventRepository, OhlcvRepository,
+    OrderBookRepository, Repositories,
 };
 use anyhow::Result;
 use chrono::{DateTime, Utc};
@@ -33,6 +33,7 @@ pub struct SignalContextBuilder {
     liquidation_window_minutes: i32,
     news_lookback_duration: Duration,
     max_orderbook_levels: usize,
+    ohlcv_lookback_candles: usize,
 }
 
 impl SignalContextBuilder {
@@ -53,6 +54,7 @@ impl SignalContextBuilder {
             liquidation_window_minutes: 5,
             news_lookback_duration: Duration::from_secs(60 * 60), // 1 hour
             max_orderbook_levels: 20,
+            ohlcv_lookback_candles: 20, // 20 candles for momentum analysis
         }
     }
 
@@ -88,6 +90,13 @@ impl SignalContextBuilder {
     #[must_use]
     pub fn with_max_orderbook_levels(mut self, levels: usize) -> Self {
         self.max_orderbook_levels = levels;
+        self
+    }
+
+    /// Sets the number of OHLCV candles to include for momentum analysis.
+    #[must_use]
+    pub fn with_ohlcv_lookback(mut self, candles: usize) -> Self {
+        self.ohlcv_lookback_candles = candles;
         self
     }
 
@@ -150,6 +159,12 @@ impl SignalContextBuilder {
         let news = self.query_news_events(&repos.news, timestamp).await?;
         if !news.is_empty() {
             ctx = ctx.with_news_events(news);
+        }
+
+        // Query historical OHLCV for momentum analysis
+        let ohlcv = self.query_historical_ohlcv(&repos.ohlcv, timestamp).await?;
+        if !ohlcv.is_empty() {
+            ctx = ctx.with_historical_ohlcv(ohlcv);
         }
 
         Ok(ctx)
@@ -354,6 +369,39 @@ impl SignalContextBuilder {
             .collect();
 
         Ok(news)
+    }
+
+    /// Queries historical OHLCV candles for momentum analysis.
+    async fn query_historical_ohlcv(
+        &self,
+        repo: &OhlcvRepository,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Vec<OhlcvCandle>> {
+        // Look back enough time to get the requested number of candles
+        // Assuming 1-minute candles, look back ohlcv_lookback_candles minutes
+        let start = timestamp - chrono::Duration::minutes(self.ohlcv_lookback_candles as i64 * 2);
+        let end = timestamp;
+
+        let records = repo
+            .query_by_time_range(&self.symbol, &self.exchange, start, end)
+            .await?;
+
+        // Filter to only include data strictly before timestamp and convert to OhlcvCandle
+        let candles: Vec<OhlcvCandle> = records
+            .into_iter()
+            .filter(|r| r.timestamp < timestamp)
+            .map(|r| OhlcvCandle {
+                timestamp: r.timestamp,
+                open: r.open,
+                high: r.high,
+                low: r.low,
+                close: r.close,
+                volume: r.volume,
+            })
+            .take(self.ohlcv_lookback_candles)
+            .collect();
+
+        Ok(candles)
     }
 }
 

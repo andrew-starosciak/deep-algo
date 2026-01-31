@@ -20,6 +20,11 @@ pub enum CombinationMethod {
     Strongest,
     /// Bayesian combination using log-odds
     Bayesian,
+    /// Require at least N signals to agree on direction
+    RequireN {
+        /// Minimum number of signals that must agree
+        min_agree: usize,
+    },
 }
 
 /// Correlation matrix for tracking signal correlations.
@@ -345,10 +350,29 @@ impl CompositeSignal {
         Self::new(name, CombinationMethod::Bayesian)
     }
 
+    /// Creates a new CompositeSignal using RequireN combination.
+    ///
+    /// Only produces a directional signal when at least `min_agree` signals
+    /// agree on the same direction. Neutral signals do not count toward agreement.
+    #[must_use]
+    pub fn require_n(name: impl Into<String>, min_agree: usize) -> Self {
+        Self::new(name, CombinationMethod::RequireN { min_agree })
+    }
+
     /// Builder method to use Bayesian combination.
     #[must_use]
     pub fn with_bayesian(mut self) -> Self {
         self.method = CombinationMethod::Bayesian;
+        self
+    }
+
+    /// Builder method to require N signals to agree.
+    ///
+    /// Only produces a directional signal when at least `min_agree` signals
+    /// agree on the same direction. Neutral signals do not count toward agreement.
+    #[must_use]
+    pub fn require_agreement(mut self, min_agree: usize) -> Self {
+        self.method = CombinationMethod::RequireN { min_agree };
         self
     }
 
@@ -499,6 +523,69 @@ impl CompositeSignal {
             .unwrap_or_else(SignalValue::neutral)
     }
 
+    /// Combines signals using RequireN confirmation.
+    ///
+    /// Only returns a directional signal when at least `min_agree` signals
+    /// agree on the same direction. Neutral signals are ignored.
+    /// When both Up and Down reach `min_agree`, Up wins (tie-breaker).
+    fn combine_require_n(&self, signals: &[(f64, SignalValue)], min_agree: usize) -> SignalValue {
+        if signals.is_empty() {
+            return SignalValue::neutral();
+        }
+
+        // Collect Up and Down signals separately
+        let up_signals: Vec<&(f64, SignalValue)> = signals
+            .iter()
+            .filter(|(_, s)| s.direction == Direction::Up)
+            .collect();
+
+        let down_signals: Vec<&(f64, SignalValue)> = signals
+            .iter()
+            .filter(|(_, s)| s.direction == Direction::Down)
+            .collect();
+
+        let up_count = up_signals.len();
+        let down_count = down_signals.len();
+
+        // Check if either direction reaches min_agree
+        let up_qualifies = up_count >= min_agree;
+        let down_qualifies = down_count >= min_agree;
+
+        // Determine winning direction (Up wins ties)
+        let (direction, agreeing_signals): (Direction, Vec<&(f64, SignalValue)>) =
+            if up_qualifies && down_qualifies {
+                // Tie goes to Up
+                (Direction::Up, up_signals)
+            } else if up_qualifies {
+                (Direction::Up, up_signals)
+            } else if down_qualifies {
+                (Direction::Down, down_signals)
+            } else {
+                // Neither qualifies
+                return SignalValue::neutral();
+            };
+
+        // Calculate average strength and confidence of agreeing signals
+        let count = agreeing_signals.len() as f64;
+        let avg_strength = agreeing_signals
+            .iter()
+            .map(|(_, s)| s.strength)
+            .sum::<f64>()
+            / count;
+        let avg_confidence = agreeing_signals
+            .iter()
+            .map(|(_, s)| s.confidence)
+            .sum::<f64>()
+            / count;
+
+        SignalValue::new(
+            direction,
+            avg_strength.clamp(0.0, 1.0),
+            avg_confidence.clamp(0.0, 1.0),
+        )
+        .unwrap_or_else(|_| SignalValue::neutral())
+    }
+
     /// Applies multicollinearity adjustment to weights if enabled.
     fn apply_multicollinearity_adjustment(
         &self,
@@ -553,6 +640,9 @@ impl SignalGenerator for CompositeSignal {
             CombinationMethod::Voting => self.combine_voting(&signals),
             CombinationMethod::Strongest => self.combine_strongest(&signals),
             CombinationMethod::Bayesian => combine_bayesian(&signals),
+            CombinationMethod::RequireN { min_agree } => {
+                self.combine_require_n(&signals, min_agree)
+            }
         };
 
         Ok(combined)
@@ -1243,5 +1333,246 @@ mod tests {
 
         assert!(composite.adjust_multicollinearity);
         assert!((composite.correlation_threshold - 0.8).abs() < f64::EPSILON);
+    }
+
+    // ============================================
+    // Phase 2.2E: RequireN Confirmation Tests
+    // ============================================
+
+    #[test]
+    fn require_n_variant_exists() {
+        // Test that the RequireN variant exists and can be constructed
+        let method = CombinationMethod::RequireN { min_agree: 2 };
+        match method {
+            CombinationMethod::RequireN { min_agree } => {
+                assert_eq!(min_agree, 2);
+            }
+            _ => panic!("Expected RequireN variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_n_returns_neutral_when_insufficient_agreement() {
+        // Only 1 Up signal, but require 2 to agree
+        let mut composite = CompositeSignal::require_n("test", 2)
+            .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.8, 1.0)))
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Down,
+                0.6,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Neutral,
+                0.5,
+                1.0,
+            )));
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        // Only 1 Up, 1 Down - neither reaches min_agree=2
+        assert_eq!(result.direction, Direction::Neutral);
+    }
+
+    #[tokio::test]
+    async fn require_n_returns_direction_when_enough_agree() {
+        // 2 Up signals, require 2 to agree
+        let mut composite = CompositeSignal::require_n("test", 2)
+            .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.8, 1.0)))
+            .with_generator(Box::new(MockGenerator::new("g2", Direction::Up, 0.7, 1.0)))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Down,
+                0.6,
+                1.0,
+            )));
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        // 2 Up signals meet the threshold
+        assert_eq!(result.direction, Direction::Up);
+    }
+
+    #[tokio::test]
+    async fn require_n_requires_all_with_max_value() {
+        // Require all 3 signals to agree
+        let mut composite = CompositeSignal::require_n("test", 3)
+            .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.8, 1.0)))
+            .with_generator(Box::new(MockGenerator::new("g2", Direction::Up, 0.7, 1.0)))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Down,
+                0.6,
+                1.0,
+            )));
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        // Only 2 Up, need 3 - return Neutral
+        assert_eq!(result.direction, Direction::Neutral);
+
+        // Now test with all 3 agreeing
+        let mut composite_all = CompositeSignal::require_n("test", 3)
+            .with_generator(Box::new(MockGenerator::new(
+                "g1",
+                Direction::Down,
+                0.8,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Down,
+                0.7,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Down,
+                0.6,
+                1.0,
+            )));
+
+        let result_all = composite_all.compute(&ctx).await.unwrap();
+        assert_eq!(result_all.direction, Direction::Down);
+    }
+
+    #[tokio::test]
+    async fn require_n_neutral_signals_dont_count() {
+        // 2 Neutral signals should not count toward agreement
+        let mut composite = CompositeSignal::require_n("test", 2)
+            .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.8, 1.0)))
+            .with_generator(Box::new(MockGenerator::new(
+                "g2",
+                Direction::Neutral,
+                0.5,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Neutral,
+                0.5,
+                1.0,
+            )));
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        // Only 1 Up, 2 Neutral (which don't count) - not enough agreement
+        assert_eq!(result.direction, Direction::Neutral);
+    }
+
+    #[tokio::test]
+    async fn require_n_averages_strength_of_agreeing_signals() {
+        // Strength should be average of agreeing signals only
+        let mut composite = CompositeSignal::require_n("test", 2)
+            .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.8, 1.0)))
+            .with_generator(Box::new(MockGenerator::new("g2", Direction::Up, 0.6, 1.0)))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Down,
+                0.9,
+                1.0,
+            )));
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        assert_eq!(result.direction, Direction::Up);
+        // Average of 0.8 and 0.6 = 0.7
+        assert!(
+            (result.strength - 0.7).abs() < 0.01,
+            "strength was {}",
+            result.strength
+        );
+    }
+
+    #[tokio::test]
+    async fn require_n_averages_confidence_of_agreeing_signals() {
+        // Confidence should be average of agreeing signals only
+        let mut composite = CompositeSignal::require_n("test", 2)
+            .with_generator(Box::new(MockGenerator::with_confidence(
+                "g1",
+                Direction::Down,
+                0.5,
+                0.9,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::with_confidence(
+                "g2",
+                Direction::Down,
+                0.5,
+                0.7,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::with_confidence(
+                "g3",
+                Direction::Up,
+                0.5,
+                0.5,
+                1.0,
+            )));
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        assert_eq!(result.direction, Direction::Down);
+        // Average of 0.9 and 0.7 = 0.8
+        assert!(
+            (result.confidence - 0.8).abs() < 0.01,
+            "confidence was {}",
+            result.confidence
+        );
+    }
+
+    #[test]
+    fn require_agreement_builder_sets_method() {
+        let composite = CompositeSignal::weighted_average("test").require_agreement(3);
+
+        match composite.method {
+            CombinationMethod::RequireN { min_agree } => {
+                assert_eq!(min_agree, 3);
+            }
+            _ => panic!("Expected RequireN method"),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_n_empty_signals_returns_neutral() {
+        let mut composite = CompositeSignal::require_n("test", 2);
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        assert_eq!(result.direction, Direction::Neutral);
+    }
+
+    #[tokio::test]
+    async fn require_n_tie_goes_to_up() {
+        // When both Up and Down reach min_agree, Up wins
+        let mut composite = CompositeSignal::require_n("test", 2)
+            .with_generator(Box::new(MockGenerator::new("g1", Direction::Up, 0.8, 1.0)))
+            .with_generator(Box::new(MockGenerator::new("g2", Direction::Up, 0.7, 1.0)))
+            .with_generator(Box::new(MockGenerator::new(
+                "g3",
+                Direction::Down,
+                0.8,
+                1.0,
+            )))
+            .with_generator(Box::new(MockGenerator::new(
+                "g4",
+                Direction::Down,
+                0.7,
+                1.0,
+            )));
+
+        let ctx = SignalContext::new(Utc::now(), "BTCUSD");
+        let result = composite.compute(&ctx).await.unwrap();
+
+        // Both have 2 votes, tie goes to Up
+        assert_eq!(result.direction, Direction::Up);
     }
 }

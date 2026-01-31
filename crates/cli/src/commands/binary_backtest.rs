@@ -1,17 +1,42 @@
 //! Binary backtest CLI command.
 //!
 //! Runs backtests for binary outcome prediction markets using
-//! historical signal data and price movements.
+//! historical signal data and price movements. Includes Phase 3
+//! statistical validation: bootstrap CI, Monte Carlo, walk-forward,
+//! regime analysis, and edge analysis.
 
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Duration, Utc};
 use clap::Args;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
 
 use algo_trade_backtest::binary::{
-    BacktestResults, BinaryBacktestConfig, BinaryBacktestEngine, BinaryMetrics, FeeTier,
-    PointInTimeProvider, PolymarketFees,
+    BacktestResults,
+    BinaryBacktestConfig,
+    BinaryBacktestEngine,
+    BinaryMetrics,
+    // Phase 3 modules
+    BootstrapConfig,
+    BootstrapMetrics,
+    BootstrapResampler,
+    EdgeAnalysis,
+    EdgeAnalyzer,
+    EdgeAnalyzerConfig,
+    EdgeSummary,
+    FeeTier,
+    MonteCarloConfig,
+    MonteCarloResults,
+    MonteCarloSimulator,
+    PointInTimeProvider,
+    PolymarketFees,
+    RegimeAnalyzer,
+    RegimeMetrics,
+    SettlementResult,
+    TimePeriod,
+    TrendRegime,
+    VolatilityRegime,
 };
 use algo_trade_core::signal::{Direction, SignalValue};
 use algo_trade_data::{SignalSnapshotRecord, SignalSnapshotRepository};
@@ -62,6 +87,43 @@ pub struct BinaryBacktestArgs {
     /// Output format: text, json (default: text)
     #[arg(long, default_value = "text")]
     pub format: String,
+
+    // ========== Phase 3 Analysis Flags ==========
+    /// Enable all Phase 3 statistical analyses
+    #[arg(long, default_value = "false")]
+    pub full_analysis: bool,
+
+    /// Enable bootstrap confidence intervals
+    #[arg(long)]
+    pub bootstrap: bool,
+
+    /// Enable Monte Carlo simulation
+    #[arg(long)]
+    pub monte_carlo: bool,
+
+    /// Enable regime analysis (volatility/trend/time-of-day)
+    #[arg(long)]
+    pub regimes: bool,
+
+    /// Enable edge analysis (conditional edge, decay detection)
+    #[arg(long)]
+    pub edge: bool,
+
+    /// Bootstrap iterations (default: 10000)
+    #[arg(long, default_value = "10000")]
+    pub bootstrap_iterations: usize,
+
+    /// Monte Carlo simulations (default: 10000)
+    #[arg(long, default_value = "10000")]
+    pub mc_simulations: usize,
+
+    /// Monte Carlo bet horizon (default: 100)
+    #[arg(long, default_value = "100")]
+    pub mc_bets: usize,
+
+    /// Initial bankroll for Monte Carlo (default: 10000)
+    #[arg(long, default_value = "10000")]
+    pub mc_bankroll: f64,
 }
 
 /// Output format for backtest reports.
@@ -99,6 +161,592 @@ fn parse_fee_tier(s: &str) -> Result<FeeTier> {
         )),
     }
 }
+
+// ============================================================================
+// Phase 3 Results Structures
+// ============================================================================
+
+/// Phase 3 statistical analysis results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Phase3Results {
+    /// Bootstrap confidence intervals (if enabled).
+    pub bootstrap: Option<BootstrapMetrics>,
+    /// Monte Carlo simulation results (if enabled).
+    pub monte_carlo: Option<MonteCarloResults>,
+    /// Regime analysis results (if enabled).
+    pub regimes: Option<RegimeMetrics>,
+    /// Edge analysis results (if enabled).
+    pub edge: Option<EdgeAnalysis>,
+    /// Edge summary with Go/No-Go decision.
+    pub edge_summary: Option<EdgeSummary>,
+}
+
+/// Complete backtest results with Phase 3 analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnhancedBacktestResults {
+    /// Basic backtest results.
+    pub backtest: BacktestResults,
+    /// Phase 3 statistical analyses (if enabled).
+    pub phase3: Option<Phase3Results>,
+}
+
+/// Go/No-Go decision with detailed criteria breakdown.
+#[derive(Debug)]
+struct GoNoGoDecision {
+    decision: &'static str,
+    passed_criteria: Vec<String>,
+    failed_criteria: Vec<String>,
+    recommendation: &'static str,
+}
+
+// ============================================================================
+// Phase 3 Analysis Functions
+// ============================================================================
+
+/// Runs bootstrap confidence interval analysis on settlements.
+fn run_bootstrap_analysis(settlements: &[SettlementResult], iterations: usize) -> BootstrapMetrics {
+    let config = BootstrapConfig::new(iterations, 0.95).with_seed(42);
+    let resampler = BootstrapResampler::new(config);
+    resampler.bootstrap_all_metrics(settlements)
+}
+
+/// Runs Monte Carlo simulation using settlement data.
+fn run_monte_carlo_analysis(
+    settlements: &[SettlementResult],
+    n_simulations: usize,
+    n_bets: usize,
+    initial_bankroll: Decimal,
+) -> MonteCarloResults {
+    let config = MonteCarloConfig::new(n_simulations, n_bets, initial_bankroll).with_seed(42);
+    let simulator = MonteCarloSimulator::new(config);
+    simulator.simulate_from_settlements(settlements)
+}
+
+/// Runs regime analysis on settlements.
+fn run_regime_analysis(settlements: &[SettlementResult]) -> RegimeMetrics {
+    // Use absolute price return as volatility proxy
+    let volatilities: Vec<f64> = settlements
+        .iter()
+        .map(|s| {
+            s.price_return
+                .abs()
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        })
+        .collect();
+
+    let analyzer = RegimeAnalyzer::default();
+    analyzer.analyze(settlements, &volatilities)
+}
+
+/// Runs comprehensive edge analysis on settlements.
+fn run_edge_analysis(settlements: &[SettlementResult]) -> (EdgeAnalysis, EdgeSummary) {
+    let volatilities: Vec<f64> = settlements
+        .iter()
+        .map(|s| {
+            s.price_return
+                .abs()
+                .to_string()
+                .parse::<f64>()
+                .unwrap_or(0.0)
+        })
+        .collect();
+
+    let config = EdgeAnalyzerConfig::default();
+    let analyzer = EdgeAnalyzer::with_config(config);
+    let analysis = analyzer.analyze(settlements, &volatilities);
+    let summary = analyzer.summarize(&analysis);
+    (analysis, summary)
+}
+
+/// Runs all enabled Phase 3 analyses.
+fn run_phase3_analyses(
+    settlements: &[SettlementResult],
+    args: &BinaryBacktestArgs,
+) -> Phase3Results {
+    let run_all = args.full_analysis;
+
+    let bootstrap = if run_all || args.bootstrap {
+        tracing::info!(
+            "Running bootstrap analysis ({} iterations)...",
+            args.bootstrap_iterations
+        );
+        Some(run_bootstrap_analysis(
+            settlements,
+            args.bootstrap_iterations,
+        ))
+    } else {
+        None
+    };
+
+    let monte_carlo = if run_all || args.monte_carlo {
+        tracing::info!(
+            "Running Monte Carlo simulation ({} simulations, {} bets)...",
+            args.mc_simulations,
+            args.mc_bets
+        );
+        let bankroll = Decimal::try_from(args.mc_bankroll).unwrap_or_else(|_| dec!(10000));
+        Some(run_monte_carlo_analysis(
+            settlements,
+            args.mc_simulations,
+            args.mc_bets,
+            bankroll,
+        ))
+    } else {
+        None
+    };
+
+    let regimes = if run_all || args.regimes {
+        tracing::info!("Running regime analysis...");
+        Some(run_regime_analysis(settlements))
+    } else {
+        None
+    };
+
+    let (edge, edge_summary) = if run_all || args.edge {
+        tracing::info!("Running edge analysis...");
+        let (analysis, summary) = run_edge_analysis(settlements);
+        (Some(analysis), Some(summary))
+    } else {
+        (None, None)
+    };
+
+    Phase3Results {
+        bootstrap,
+        monte_carlo,
+        regimes,
+        edge,
+        edge_summary,
+    }
+}
+
+// ============================================================================
+// Phase 3 Report Formatters
+// ============================================================================
+
+/// Formats bootstrap analysis results for text output.
+fn format_bootstrap_section(metrics: &BootstrapMetrics) -> String {
+    let mut output = String::new();
+
+    output.push_str("\nBOOTSTRAP CONFIDENCE INTERVALS (95%)\n");
+    output.push_str("---------------------------------------------------------------\n");
+
+    output.push_str(&format!(
+        "Win Rate:       {:.1}% [{:.1}%, {:.1}%]\n",
+        metrics.win_rate.point_estimate * 100.0,
+        metrics.win_rate.ci_lower * 100.0,
+        metrics.win_rate.ci_upper * 100.0
+    ));
+    output.push_str(&format!(
+        "EV per Bet:     ${:.2} [${:.2}, ${:.2}]\n",
+        metrics.ev_per_bet.point_estimate, metrics.ev_per_bet.ci_lower, metrics.ev_per_bet.ci_upper
+    ));
+    output.push_str(&format!(
+        "ROI:            {:.1}% [{:.1}%, {:.1}%]\n",
+        metrics.roi.point_estimate * 100.0,
+        metrics.roi.ci_lower * 100.0,
+        metrics.roi.ci_upper * 100.0
+    ));
+    output.push_str(&format!(
+        "Max Drawdown:   ${:.2} [${:.2}, ${:.2}]\n",
+        metrics.max_drawdown.point_estimate,
+        metrics.max_drawdown.ci_lower,
+        metrics.max_drawdown.ci_upper
+    ));
+
+    let ev_significant = metrics.ev_per_bet.is_significant();
+    output.push_str(&format!(
+        "EV Significant: {} (CI excludes zero)\n",
+        if ev_significant { "YES" } else { "NO" }
+    ));
+
+    output
+}
+
+/// Formats Monte Carlo results for text output.
+fn format_monte_carlo_section(results: &MonteCarloResults) -> String {
+    let mut output = String::new();
+
+    output.push_str("\nMONTE CARLO SIMULATION\n");
+    output.push_str("---------------------------------------------------------------\n");
+    output.push_str(&format!(
+        "Simulations:    {} paths x {} bets\n",
+        results.n_simulations, results.n_bets
+    ));
+    output.push_str(&format!(
+        "Prob. of Ruin:  {:.1}%\n",
+        results.prob_ruin * 100.0
+    ));
+    output.push_str(&format!(
+        "Prob. Profit:   {:.1}%\n",
+        results.prob_profit * 100.0
+    ));
+    output.push_str(&format!(
+        "Prob. 2x:       {:.1}%\n",
+        results.prob_double * 100.0
+    ));
+    output.push_str(&format!("Median Equity:  ${:.2}\n", results.median_equity));
+    output.push_str(&format!(
+        "Equity P5-P95:  ${:.2} - ${:.2}\n",
+        results.equity_p5, results.equity_p95
+    ));
+
+    let favorable = results.prob_profit > 0.5 && results.prob_ruin < 0.1;
+    output.push_str(&format!(
+        "Favorable:      {}\n",
+        if favorable {
+            "YES (profit > 50%, ruin < 10%)"
+        } else {
+            "NO"
+        }
+    ));
+
+    output
+}
+
+/// Formats regime analysis results for text output.
+fn format_regime_section(metrics: &RegimeMetrics) -> String {
+    let mut output = String::new();
+
+    output.push_str("\nREGIME ANALYSIS\n");
+    output.push_str("---------------------------------------------------------------\n");
+
+    // Volatility regimes
+    output.push_str("By Volatility:\n");
+    for regime in [
+        VolatilityRegime::Low,
+        VolatilityRegime::Medium,
+        VolatilityRegime::High,
+    ] {
+        if let Some(m) = metrics.by_volatility.get(&regime) {
+            output.push_str(&format!(
+                "  {:8} {:.1}% win rate ({} bets)\n",
+                format!("{:?}:", regime),
+                m.win_rate * 100.0,
+                m.total_bets
+            ));
+        }
+    }
+
+    // Trend regimes
+    output.push_str("By Trend:\n");
+    for regime in [
+        TrendRegime::Bullish,
+        TrendRegime::Ranging,
+        TrendRegime::Bearish,
+    ] {
+        if let Some(m) = metrics.by_trend.get(&regime) {
+            output.push_str(&format!(
+                "  {:8} {:.1}% win rate ({} bets)\n",
+                format!("{:?}:", regime),
+                m.win_rate * 100.0,
+                m.total_bets
+            ));
+        }
+    }
+
+    // Time periods
+    output.push_str("By Time Period:\n");
+    let periods = [
+        TimePeriod::AsiaOpen,
+        TimePeriod::AsiaSession,
+        TimePeriod::EuropeOpen,
+        TimePeriod::EuropeSession,
+        TimePeriod::USOpen,
+        TimePeriod::USSession,
+        TimePeriod::USClose,
+    ];
+    for period in periods {
+        if let Some(m) = metrics.by_time_period.get(&period) {
+            if m.total_bets >= 3 {
+                output.push_str(&format!(
+                    "  {:14} {:.1}% win rate ({} bets)\n",
+                    format!("{:?}:", period),
+                    m.win_rate * 100.0,
+                    m.total_bets
+                ));
+            }
+        }
+    }
+
+    output
+}
+
+/// Formats edge analysis results for text output.
+fn format_edge_section(analysis: &EdgeAnalysis, summary: &EdgeSummary) -> String {
+    let mut output = String::new();
+
+    output.push_str("\nEDGE ANALYSIS\n");
+    output.push_str("---------------------------------------------------------------\n");
+
+    // Overall edge
+    output.push_str(&format!("Classification: {:?}\n", summary.classification));
+    output.push_str(&format!(
+        "Overall Edge:   {:.1}% (p={:.4})\n",
+        analysis.overall.edge * 100.0,
+        analysis.overall.p_value
+    ));
+    output.push_str(&format!(
+        "Wilson 95% CI:  [{:.1}%, {:.1}%]\n",
+        analysis.overall.wilson_ci.0 * 100.0,
+        analysis.overall.wilson_ci.1 * 100.0
+    ));
+
+    // Conditional edges
+    output.push_str("\nConditional Edge by Signal Strength:\n");
+    output.push_str(&format!(
+        "  Baseline:        {:.1}% (n={})\n",
+        analysis.conditional.baseline.win_rate * 100.0,
+        analysis.conditional.baseline.n_samples
+    ));
+    if analysis.conditional.high_strength.n_samples > 0 {
+        output.push_str(&format!(
+            "  High Strength:   {:.1}% (n={})\n",
+            analysis.conditional.high_strength.win_rate * 100.0,
+            analysis.conditional.high_strength.n_samples
+        ));
+    }
+    if analysis.conditional.very_high_strength.n_samples > 0 {
+        output.push_str(&format!(
+            "  Very High:       {:.1}% (n={})\n",
+            analysis.conditional.very_high_strength.win_rate * 100.0,
+            analysis.conditional.very_high_strength.n_samples
+        ));
+    }
+
+    // Edge decay
+    output.push_str("\nEdge Stability:\n");
+    output.push_str(&format!(
+        "  Decay Slope:     {:.6}\n",
+        analysis.decay.decay_slope
+    ));
+    output.push_str(&format!(
+        "  Is Decaying:     {}\n",
+        if analysis.decay.is_decaying {
+            "YES (WARNING)"
+        } else {
+            "NO"
+        }
+    ));
+
+    // Time-of-day
+    if !analysis.time_of_day.best_hours.is_empty() {
+        output.push_str(&format!(
+            "  Best Hours:      {:?} UTC\n",
+            analysis.time_of_day.best_hours
+        ));
+    }
+    if !analysis.time_of_day.worst_hours.is_empty() {
+        output.push_str(&format!(
+            "  Worst Hours:     {:?} UTC\n",
+            analysis.time_of_day.worst_hours
+        ));
+    }
+
+    // Summary recommendations
+    output.push_str(&format!(
+        "\nGo/No-Go:       {}\n",
+        if summary.go_no_go { "GO" } else { "NO-GO" }
+    ));
+    output.push_str(&format!(
+        "Kelly Fraction: {:.0}% recommended\n",
+        summary.recommended_kelly_fraction * 100.0
+    ));
+
+    output
+}
+
+// ============================================================================
+// Enhanced Go/No-Go Decision
+// ============================================================================
+
+/// Simple Go/No-Go decision (for basic backtest without Phase 3).
+fn determine_go_no_go(metrics: &BinaryMetrics) -> String {
+    let decision = determine_go_no_go_enhanced(metrics, &None);
+    format!(
+        "\nGO/NO-GO: {}\nRecommendation: {}",
+        decision.decision, decision.recommendation
+    )
+}
+
+/// Determines enhanced Go/No-Go decision incorporating Phase 3 insights.
+fn determine_go_no_go_enhanced(
+    metrics: &BinaryMetrics,
+    phase3: &Option<Phase3Results>,
+) -> GoNoGoDecision {
+    let mut passed = Vec::new();
+    let mut failed = Vec::new();
+
+    // Basic criteria
+    let has_sufficient_samples = metrics.total_bets >= 100;
+    let has_good_win_rate = metrics.win_rate > 0.53;
+    let is_significant = metrics.binomial_p_value < 0.05;
+    let ci_above_50 = metrics.wilson_ci_lower > 0.50;
+    let is_profitable = metrics.net_pnl > Decimal::ZERO;
+
+    if has_sufficient_samples {
+        passed.push("100+ bets".to_string());
+    } else {
+        failed.push(format!("Only {} bets (need 100+)", metrics.total_bets));
+    }
+
+    if has_good_win_rate {
+        passed.push(format!("{:.1}% win rate > 53%", metrics.win_rate * 100.0));
+    } else {
+        failed.push(format!("{:.1}% win rate < 53%", metrics.win_rate * 100.0));
+    }
+
+    if is_significant {
+        passed.push(format!("p={:.4} < 0.05", metrics.binomial_p_value));
+    } else {
+        failed.push(format!("p={:.4} >= 0.05", metrics.binomial_p_value));
+    }
+
+    if ci_above_50 {
+        passed.push(format!(
+            "CI lower {:.1}% > 50%",
+            metrics.wilson_ci_lower * 100.0
+        ));
+    } else {
+        failed.push(format!(
+            "CI lower {:.1}% <= 50%",
+            metrics.wilson_ci_lower * 100.0
+        ));
+    }
+
+    if is_profitable {
+        passed.push(format!("Net P&L: +${:.2}", metrics.net_pnl));
+    } else {
+        failed.push(format!("Net P&L: ${:.2}", metrics.net_pnl));
+    }
+
+    // Phase 3 criteria (if available)
+    let mut phase3_pass = true;
+
+    if let Some(ref p3) = phase3 {
+        // Bootstrap: EV CI should exclude zero
+        if let Some(ref bootstrap) = p3.bootstrap {
+            if bootstrap.ev_per_bet.is_significant() {
+                passed.push("Bootstrap EV CI excludes zero".to_string());
+            } else {
+                failed.push("Bootstrap EV CI includes zero".to_string());
+                phase3_pass = false;
+            }
+        }
+
+        // Monte Carlo: should be favorable
+        if let Some(ref mc) = p3.monte_carlo {
+            let favorable = mc.prob_profit > 0.5 && mc.prob_ruin < 0.1;
+            if favorable {
+                passed.push(format!(
+                    "MC: {:.0}% profit, {:.0}% ruin",
+                    mc.prob_profit * 100.0,
+                    mc.prob_ruin * 100.0
+                ));
+            } else {
+                failed.push(format!(
+                    "MC unfavorable: {:.0}% profit, {:.0}% ruin",
+                    mc.prob_profit * 100.0,
+                    mc.prob_ruin * 100.0
+                ));
+                phase3_pass = false;
+            }
+        }
+
+        // Edge: should not be decaying significantly
+        if let Some(ref edge) = p3.edge {
+            if !edge.decay.is_decaying {
+                passed.push("No significant edge decay".to_string());
+            } else {
+                failed.push(format!(
+                    "Edge decay detected (slope={:.6})",
+                    edge.decay.decay_slope
+                ));
+                // Don't fail entirely for decay, just warn
+            }
+        }
+
+        // Edge summary
+        if let Some(ref summary) = p3.edge_summary {
+            if summary.go_no_go {
+                passed.push(format!("Edge analysis: {:?}", summary.classification));
+            } else {
+                failed.push(format!("Edge insufficient: {:?}", summary.classification));
+                phase3_pass = false;
+            }
+        }
+    }
+
+    // Final decision
+    let basic_pass = has_sufficient_samples
+        && has_good_win_rate
+        && is_significant
+        && ci_above_50
+        && is_profitable;
+
+    let (decision, recommendation) = if basic_pass && phase3_pass && phase3.is_some() {
+        (
+            "GO",
+            "All criteria passed. Proceed to paper trading with recommended Kelly fraction.",
+        )
+    } else if basic_pass && phase3.is_none() {
+        (
+            "GO (BASIC)",
+            "Passed basic criteria. Run --full-analysis for comprehensive validation.",
+        )
+    } else if metrics.total_bets < 100 {
+        (
+            "PENDING",
+            "Collect more data (need 100+ bets for significance).",
+        )
+    } else if metrics.binomial_p_value < 0.10 && metrics.win_rate > 0.52 {
+        (
+            "CONDITIONAL",
+            "Shows promise but needs more validation or data.",
+        )
+    } else {
+        ("NO-GO", "Strategy does not show significant edge.")
+    };
+
+    GoNoGoDecision {
+        decision,
+        passed_criteria: passed,
+        failed_criteria: failed,
+        recommendation,
+    }
+}
+
+/// Formats the enhanced Go/No-Go section.
+fn format_go_no_go_enhanced(decision: &GoNoGoDecision) -> String {
+    let mut output = String::new();
+
+    output.push_str("\n===============================================================\n");
+    output.push_str(&format!("GO/NO-GO: {}\n", decision.decision));
+    output.push_str("===============================================================\n");
+
+    if !decision.passed_criteria.is_empty() {
+        output.push_str("\nPassed:\n");
+        for criterion in &decision.passed_criteria {
+            output.push_str(&format!("  [+] {}\n", criterion));
+        }
+    }
+
+    if !decision.failed_criteria.is_empty() {
+        output.push_str("\nFailed:\n");
+        for criterion in &decision.failed_criteria {
+            output.push_str(&format!("  [-] {}\n", criterion));
+        }
+    }
+
+    output.push_str(&format!("\nRecommendation: {}\n", decision.recommendation));
+
+    output
+}
+
+// ============================================================================
+// Signal Conversion
+// ============================================================================
 
 /// Converts a SignalSnapshotRecord to a (timestamp, SignalValue) tuple.
 fn snapshot_to_signal(record: &SignalSnapshotRecord) -> Option<(DateTime<Utc>, SignalValue)> {
@@ -238,42 +886,12 @@ fn format_text_report(results: &BacktestResults) -> String {
         "Fill Rate:         {:.1}%\n",
         results.fill_rate() * 100.0
     ));
+
+    // Basic Go/No-Go
+    output.push_str(&determine_go_no_go(metrics));
     output.push('\n');
 
-    // Go/No-Go decision
-    output.push_str("===============================================================\n");
-    let go_decision = determine_go_no_go(metrics);
-    output.push_str(&format!("GO/NO-GO: {}\n", go_decision));
-    output.push_str("===============================================================\n");
-
     output
-}
-
-/// Determines the Go/No-Go decision based on metrics.
-fn determine_go_no_go(metrics: &BinaryMetrics) -> &'static str {
-    // Criteria:
-    // 1. At least 100 bets (sufficient sample size)
-    // 2. Win rate > 53%
-    // 3. p-value < 0.05 (statistically significant)
-    // 4. Wilson CI lower bound > 50%
-    // 5. Positive net P&L
-
-    let has_sufficient_samples = metrics.total_bets >= 100;
-    let has_good_win_rate = metrics.win_rate > 0.53;
-    let is_significant = metrics.binomial_p_value < 0.05;
-    let ci_above_50 = metrics.wilson_ci_lower > 0.50;
-    let is_profitable = metrics.net_pnl > Decimal::ZERO;
-
-    if has_sufficient_samples && has_good_win_rate && is_significant && ci_above_50 && is_profitable
-    {
-        "GO - All criteria met, proceed to paper trading"
-    } else if metrics.total_bets < 100 {
-        "PENDING - Insufficient sample size (need 100+ bets)"
-    } else if metrics.binomial_p_value < 0.10 && metrics.win_rate > 0.52 {
-        "CONDITIONAL - Shows promise, needs more validation"
-    } else {
-        "NO-GO - Strategy does not show significant edge"
-    }
 }
 
 /// Runs the binary-backtest command.
@@ -310,9 +928,10 @@ pub async fn run_binary_backtest(args: BinaryBacktestArgs) -> Result<()> {
     tracing::info!("Stake: ${:.2}", args.stake);
     tracing::info!("Fee tier: {:?}", fee_tier);
 
-    // Get database URL
+    // Get database URL (clone before consuming since we need &args later)
     let db_url = args
         .db_url
+        .clone()
         .ok_or_else(|| anyhow!("DATABASE_URL must be set via --db-url or DATABASE_URL env var"))?;
 
     // Create database pool
@@ -394,21 +1013,72 @@ pub async fn run_binary_backtest(args: BinaryBacktestArgs) -> Result<()> {
         results.metrics.win_rate * 100.0
     );
 
+    // Run Phase 3 analyses if enabled
+    let phase3 =
+        if args.full_analysis || args.bootstrap || args.monte_carlo || args.regimes || args.edge {
+            if results.settlements.is_empty() {
+                tracing::warn!("No settlements for Phase 3 analysis");
+                None
+            } else {
+                tracing::info!("Running Phase 3 statistical analyses...");
+                Some(run_phase3_analyses(&results.settlements, &args))
+            }
+        } else {
+            None
+        };
+
+    // Enhanced Go/No-Go decision
+    let go_decision = determine_go_no_go_enhanced(&results.metrics, &phase3);
+
     // Output results
     match format {
         OutputFormat::Text => {
             let report = format_text_report(&results);
             println!("{}", report);
+
+            // Add Phase 3 sections if available
+            if let Some(ref p3) = phase3 {
+                println!("\n===============================================================");
+                println!("                    PHASE 3 ANALYSIS                          ");
+                println!("===============================================================");
+
+                if let Some(ref bootstrap) = p3.bootstrap {
+                    println!("{}", format_bootstrap_section(bootstrap));
+                }
+
+                if let Some(ref mc) = p3.monte_carlo {
+                    println!("{}", format_monte_carlo_section(mc));
+                }
+
+                if let Some(ref regimes) = p3.regimes {
+                    println!("{}", format_regime_section(regimes));
+                }
+
+                if let (Some(ref edge), Some(ref summary)) = (&p3.edge, &p3.edge_summary) {
+                    println!("{}", format_edge_section(edge, summary));
+                }
+            }
+
+            // Enhanced Go/No-Go
+            println!("{}", format_go_no_go_enhanced(&go_decision));
         }
         OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(&results)?;
+            let enhanced = EnhancedBacktestResults {
+                backtest: results.clone(),
+                phase3,
+            };
+            let json = serde_json::to_string_pretty(&enhanced)?;
             println!("{}", json);
         }
     }
 
     // Write to file if requested
     if let Some(output_path) = args.output {
-        let json = serde_json::to_string_pretty(&results)?;
+        let enhanced = EnhancedBacktestResults {
+            backtest: results,
+            phase3: None, // Recalculate if needed for file output
+        };
+        let json = serde_json::to_string_pretty(&enhanced)?;
         std::fs::write(&output_path, json)?;
         tracing::info!("Results written to {}", output_path);
     }
@@ -419,7 +1089,7 @@ pub async fn run_binary_backtest(args: BinaryBacktestArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{TimeZone, Timelike};
     use rust_decimal_macros::dec;
 
     // ============================================

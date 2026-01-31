@@ -50,6 +50,11 @@ pub enum SignalType {
     FundingRate,
     LiquidationCascade,
     News,
+    // Phase 2.2 Enhanced Signals
+    FundingPercentile,
+    MomentumExhaustion,
+    WallBias,
+    CompositeRequireN,
 }
 
 impl SignalType {
@@ -60,6 +65,11 @@ impl SignalType {
             SignalType::FundingRate,
             SignalType::LiquidationCascade,
             SignalType::News,
+            // Phase 2.2 Enhanced Signals
+            SignalType::FundingPercentile,
+            SignalType::MomentumExhaustion,
+            SignalType::WallBias,
+            SignalType::CompositeRequireN,
         ]
     }
 
@@ -70,6 +80,11 @@ impl SignalType {
             SignalType::FundingRate => "funding_rate",
             SignalType::LiquidationCascade => "liquidation_cascade",
             SignalType::News => "news",
+            // Phase 2.2 Enhanced Signals
+            SignalType::FundingPercentile => "funding_percentile",
+            SignalType::MomentumExhaustion => "momentum_exhaustion",
+            SignalType::WallBias => "wall_bias",
+            SignalType::CompositeRequireN => "composite_require_n",
         }
     }
 
@@ -80,6 +95,13 @@ impl SignalType {
             "funding" | "funding_rate" => Some(SignalType::FundingRate),
             "liquidation" | "liquidation_cascade" | "liq" => Some(SignalType::LiquidationCascade),
             "news" => Some(SignalType::News),
+            // Phase 2.2 Enhanced Signals
+            "funding_percentile" | "fp" | "percentile" => Some(SignalType::FundingPercentile),
+            "momentum" | "momentum_exhaustion" | "me" => Some(SignalType::MomentumExhaustion),
+            "wall" | "wall_bias" | "wb" => Some(SignalType::WallBias),
+            "composite" | "composite_require_n" | "require_n" | "rn" => {
+                Some(SignalType::CompositeRequireN)
+            }
             _ => None,
         }
     }
@@ -108,7 +130,7 @@ pub fn parse_signals(s: &str) -> Result<Vec<SignalType>> {
 
         let signal = SignalType::parse(&name).ok_or_else(|| {
             anyhow!(
-                "Unknown signal: '{}'. Valid signals: obi, funding, liquidation, news",
+                "Unknown signal: '{}'. Valid signals: obi, funding, liquidation, news, fp (funding_percentile), momentum, wall, composite",
                 name
             )
         })?;
@@ -237,10 +259,12 @@ pub async fn run_backfill_signals(args: BackfillSignalsArgs) -> Result<()> {
     use algo_trade_core::Direction;
     use algo_trade_data::{SignalDirection, SignalSnapshotRecord, SignalSnapshotRepository};
     use algo_trade_signals::{
-        FundingRateSignal, LiquidationCascadeSignal, NewsSignal, OrderBookImbalanceSignal,
-        SignalContextBuilder, SignalRegistry,
+        CompositeSignal, FundingPercentileConfig, FundingRateSignal, LiquidationCascadeSignal,
+        MomentumExhaustionConfig, MomentumExhaustionSignal, NewsSignal, OrderBookImbalanceSignal,
+        SignalContextBuilder, SignalRegistry, WallDetectionConfig,
     };
     use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use sqlx::postgres::PgPoolOptions;
 
     // Parse arguments
@@ -307,6 +331,49 @@ pub async fn run_backfill_signals(args: BackfillSignalsArgs) -> Result<()> {
             }
             SignalType::News => {
                 registry.register(Box::new(NewsSignal::default()));
+            }
+            // Phase 2.2 Enhanced Signals
+            SignalType::FundingPercentile => {
+                // Funding rate with 30-day percentile analysis
+                let percentile_config = FundingPercentileConfig {
+                    lookback_periods: 90, // 30 days * 3 funding periods/day
+                    high_threshold: 0.80, // Top 20%
+                    low_threshold: 0.20,  // Bottom 20%
+                    min_data_points: 30,
+                };
+                let signal = FundingRateSignal::default().with_percentile_config(percentile_config);
+                registry.register(Box::new(signal));
+            }
+            SignalType::MomentumExhaustion => {
+                // Momentum exhaustion signal (stalling after big moves)
+                let config = MomentumExhaustionConfig {
+                    big_move_threshold: 0.02, // 2% move threshold
+                    big_move_lookback: 6,     // 6 candles (~90 min at 15m)
+                    stall_ratio: 0.3,         // Stall if range is 30% of move
+                    stall_lookback: 2,        // 2 candles for stall detection
+                    min_candles: 8,           // Minimum candles required
+                };
+                let signal = MomentumExhaustionSignal::new(config, 1.0);
+                registry.register(Box::new(signal));
+            }
+            SignalType::WallBias => {
+                // Order book wall bias with floor/ceiling semantics
+                let wall_config = WallDetectionConfig {
+                    min_wall_size_btc: dec!(5),
+                    proximity_bps: 200,
+                };
+                let signal = OrderBookImbalanceSignal::default().with_wall_detection(wall_config);
+                // Register with a different name to distinguish from base OBI
+                registry.register_with_name(Box::new(signal), "wall_bias");
+            }
+            SignalType::CompositeRequireN => {
+                // Composite signal requiring 2+ signals to agree
+                // Uses the base signals that are already registered
+                let composite = CompositeSignal::require_n("composite_require_n", 2)
+                    .with_generator(Box::new(FundingRateSignal::default()))
+                    .with_generator(Box::new(LiquidationCascadeSignal::default()))
+                    .with_generator(Box::new(OrderBookImbalanceSignal::default()));
+                registry.register(Box::new(composite));
             }
         }
     }
@@ -412,9 +479,9 @@ mod tests {
     // ============================================
 
     #[test]
-    fn signal_type_all_returns_four_types() {
+    fn signal_type_all_returns_eight_types() {
         let all = SignalType::all();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 8); // 4 original + 4 Phase 2.2 enhanced signals
     }
 
     #[test]
@@ -426,6 +493,11 @@ mod tests {
         assert_eq!(SignalType::FundingRate.name(), "funding_rate");
         assert_eq!(SignalType::LiquidationCascade.name(), "liquidation_cascade");
         assert_eq!(SignalType::News.name(), "news");
+        // Phase 2.2 signals
+        assert_eq!(SignalType::FundingPercentile.name(), "funding_percentile");
+        assert_eq!(SignalType::MomentumExhaustion.name(), "momentum_exhaustion");
+        assert_eq!(SignalType::WallBias.name(), "wall_bias");
+        assert_eq!(SignalType::CompositeRequireN.name(), "composite_require_n");
     }
 
     #[test]
@@ -440,6 +512,14 @@ mod tests {
             Some(SignalType::LiquidationCascade)
         );
         assert_eq!(SignalType::parse("news"), Some(SignalType::News));
+        // Phase 2.2 short names
+        assert_eq!(SignalType::parse("fp"), Some(SignalType::FundingPercentile));
+        assert_eq!(
+            SignalType::parse("me"),
+            Some(SignalType::MomentumExhaustion)
+        );
+        assert_eq!(SignalType::parse("wb"), Some(SignalType::WallBias));
+        assert_eq!(SignalType::parse("rn"), Some(SignalType::CompositeRequireN));
     }
 
     #[test]
@@ -481,13 +561,13 @@ mod tests {
     #[test]
     fn parse_signals_all_returns_all_types() {
         let signals = parse_signals("all").unwrap();
-        assert_eq!(signals.len(), 4);
+        assert_eq!(signals.len(), 8); // 4 original + 4 Phase 2.2
     }
 
     #[test]
     fn parse_signals_empty_returns_all_types() {
         let signals = parse_signals("").unwrap();
-        assert_eq!(signals.len(), 4);
+        assert_eq!(signals.len(), 8); // 4 original + 4 Phase 2.2
     }
 
     #[test]

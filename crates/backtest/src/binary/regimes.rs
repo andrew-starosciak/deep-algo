@@ -73,7 +73,7 @@ pub struct RegimeCombination {
 }
 
 /// Metrics grouped by regime.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegimeMetrics {
     /// Metrics by volatility regime.
     pub by_volatility: HashMap<VolatilityRegime, BinaryMetrics>,
