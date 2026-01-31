@@ -7,6 +7,7 @@ pub mod binary_backtest;
 pub mod calculate_returns;
 pub mod collect_signals;
 pub mod data_status;
+pub mod entry_strategy_sim;
 pub mod validate_signals;
 
 pub use backfill_funding::{run_backfill_funding, BackfillFundingArgs};
@@ -16,4 +17,5 @@ pub use binary_backtest::{run_binary_backtest, BinaryBacktestArgs};
 pub use calculate_returns::{run_calculate_returns, CalculateReturnsArgs};
 pub use collect_signals::{run_collect_signals, CollectSignalsArgs};
 pub use data_status::{run_data_status, DataStatusArgs};
+pub use entry_strategy_sim::{run_entry_strategy_sim, EntryStrategySimArgs};
 pub use validate_signals::{run_validate_signals, ValidateSignalsArgs};
