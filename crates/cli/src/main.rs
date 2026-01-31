@@ -8,7 +8,7 @@ mod tui_live_bot;
 use commands::{
     BackfillFundingArgs, BackfillOhlcvArgs, BackfillSignalsArgs, BinaryBacktestArgs,
     CalculateReturnsArgs, CollectPolymarketArgs, CollectSignalsArgs, DataStatusArgs,
-    EntryStrategySimArgs, ValidateSignalsArgs,
+    EntryStrategySimArgs, PolymarketPaperTradeArgs, ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -128,6 +128,8 @@ enum Commands {
     EntryStrategySim(EntryStrategySimArgs),
     /// Collect Polymarket odds with optional market filtering
     CollectPolymarket(CollectPolymarketArgs),
+    /// Paper trade on Polymarket using signal-based decisions
+    PolymarketPaperTrade(PolymarketPaperTradeArgs),
 }
 
 #[tokio::main]
@@ -241,6 +243,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::CollectPolymarket(args) => {
             commands::run_collect_polymarket(args).await?;
+        }
+        Commands::PolymarketPaperTrade(args) => {
+            commands::run_polymarket_paper_trade(args).await?;
         }
     }
 

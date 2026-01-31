@@ -9,6 +9,7 @@ pub mod collect_polymarket;
 pub mod collect_signals;
 pub mod data_status;
 pub mod entry_strategy_sim;
+pub mod polymarket_paper_trade;
 pub mod validate_signals;
 
 pub use backfill_funding::{run_backfill_funding, BackfillFundingArgs};
@@ -20,4 +21,5 @@ pub use collect_polymarket::{run_collect_polymarket, CollectPolymarketArgs};
 pub use collect_signals::{run_collect_signals, CollectSignalsArgs};
 pub use data_status::{run_data_status, DataStatusArgs};
 pub use entry_strategy_sim::{run_entry_strategy_sim, EntryStrategySimArgs};
+pub use polymarket_paper_trade::{run_polymarket_paper_trade, PolymarketPaperTradeArgs};
 pub use validate_signals::{run_validate_signals, ValidateSignalsArgs};

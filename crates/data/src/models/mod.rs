@@ -7,6 +7,7 @@ pub mod funding;
 pub mod liquidation;
 pub mod news;
 pub mod orderbook;
+pub mod paper_trade;
 pub mod polymarket;
 pub mod signal_snapshot;
 pub mod trade;
@@ -17,6 +18,9 @@ pub use liquidation::{
 };
 pub use news::{NewsEventRecord, NewsSentiment, NewsSignalDirection};
 pub use orderbook::OrderBookSnapshotRecord;
+pub use paper_trade::{
+    KellyCriterion, PaperTradeDirection, PaperTradeRecord, PaperTradeStatus, TradeDecision,
+};
 pub use polymarket::PolymarketOddsRecord;
 pub use signal_snapshot::{SignalDirection, SignalSnapshotRecord};
 pub use trade::{BinaryTradeRecord, TradeDirection, TradeOutcome};

@@ -19,15 +19,16 @@ pub use parquet_storage::ParquetStorage;
 
 // Re-export models
 pub use models::{
-    BinaryTradeRecord, CascadeDirection, FundingBias, FundingRateRecord,
+    BinaryTradeRecord, CascadeDirection, FundingBias, FundingRateRecord, KellyCriterion,
     LiquidationAggregateRecord, LiquidationRecord, LiquidationSide, NewsEventRecord, NewsSentiment,
-    NewsSignalDirection, OrderBookSnapshotRecord, PolymarketOddsRecord, SignalDirection,
-    SignalSnapshotRecord, TradeDirection, TradeOutcome,
+    NewsSignalDirection, OrderBookSnapshotRecord, PaperTradeDirection, PaperTradeRecord,
+    PaperTradeStatus, PolymarketOddsRecord, SignalDirection, SignalSnapshotRecord, TradeDecision,
+    TradeDirection, TradeOutcome,
 };
 
 // Re-export repositories
 pub use repositories::{
     BinaryTradeRepository, FundingRateRepository, LiquidationRepository, NewsEventRepository,
-    OhlcvRepository, OrderBookRepository, PolymarketOddsRepository, Repositories,
-    SignalSnapshotRepository, ValidationStats,
+    OhlcvRepository, OrderBookRepository, PaperTradeRepository, PaperTradeStatistics,
+    PolymarketOddsRepository, Repositories, SignalSnapshotRepository, ValidationStats,
 };
