@@ -18,23 +18,87 @@ Liquidation Data → LiquidationCascadeSignal → Paper Trade Bot → Entry Stra
 | Polymarket odds collection | WORKING | `collect-polymarket` |
 | Paper trading framework | WORKING | `polymarket-paper-trade` |
 | Entry strategies | WORKING | `--entry-strategy edge_threshold` |
-| **Signal → Paper Trade wiring** | **GAP** | Uses `simulate_signal` placeholder |
+| Signal → Paper Trade wiring | WORKING | `--signal-mode cascade` with real signals |
+| Startup script | WORKING | `scripts/start-polymarket-bot.sh` |
 
-## The Gap
+## Architecture
 
-The `polymarket-paper-trade` command currently uses a placeholder `simulate_signal` function (line 842) instead of the real `LiquidationCascadeSignal` generator.
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    start-polymarket-bot.sh                               │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐  │
+│   │ collect-signals  │    │ collect-polymarket│    │ polymarket-paper │  │
+│   │ (background)     │    │ (background)      │    │ -trade (foreground│  │
+│   └────────┬─────────┘    └────────┬─────────┘    └────────┬─────────┘  │
+│            │                       │                        │            │
+│            ▼                       ▼                        ▼            │
+│   ┌──────────────────────────────────────────────────────────────────┐  │
+│   │                         TimescaleDB                               │  │
+│   │   liquidations │ funding_rates │ polymarket_odds │ paper_trades   │  │
+│   └──────────────────────────────────────────────────────────────────┘  │
+│                                     │                                    │
+│                                     ▼                                    │
+│                        ┌────────────────────────┐                       │
+│                        │ LiquidationCascadeSignal│                       │
+│                        │ - Query liquidations    │                       │
+│                        │ - Build aggregate       │                       │
+│                        │ - Compute signal        │                       │
+│                        └───────────┬────────────┘                       │
+│                                    ▼                                     │
+│                        ┌────────────────────────┐                       │
+│                        │   Decision Engine      │                       │
+│                        │ - Kelly sizing         │                       │
+│                        │ - Edge threshold       │                       │
+│                        │ - Entry strategy       │                       │
+│                        └───────────┬────────────┘                       │
+│                                    ▼                                     │
+│                        ┌────────────────────────┐                       │
+│                        │   Paper Trade Logger   │                       │
+│                        │ - Signal fired/not     │                       │
+│                        │ - Trade placed/skipped │                       │
+│                        │ - Entry timing         │                       │
+│                        └────────────────────────┘                       │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
-**What needs to happen:**
-1. Query recent liquidation data from database
-2. Build `SignalContext` with `LiquidationAggregate`
-3. Call `LiquidationCascadeSignal.compute()`
-4. Use the real signal output for trade decisions
+---
+
+## Quick Start
+
+### One-Command Startup
+
+```bash
+# Start everything with defaults
+./scripts/start-polymarket-bot.sh
+
+# Or with custom configuration
+./scripts/start-polymarket-bot.sh \
+  --duration 7d \
+  --signal-mode cascade \
+  --min-signal-strength 0.6 \
+  --min-edge 0.03 \
+  --entry-strategy edge_threshold \
+  --entry-threshold 0.05 \
+  --bankroll 10000
+
+# Test with simulated signals first
+./scripts/start-polymarket-bot.sh --simulated --duration 1h
+```
+
+The script starts:
+1. **Data collector** - Liquidations + funding rates (background)
+2. **Polymarket collector** - BTC market odds (background)
+3. **Paper trading bot** - Real signals with entry timing (foreground)
+
+Logs are written to `logs/` directory.
 
 ---
 
 ## Phase 1: Data Collection (Ready Now)
 
-### Start Collecting Liquidation Data
+### Manual Start (if not using script)
 
 ```bash
 # Terminal 1: Collect liquidations, funding rates, and order book from Binance/Hyperliquid
@@ -113,32 +177,44 @@ LIMIT 24;
 
 ---
 
-## Phase 3: Paper Trading (NEEDS WIRING)
+## Phase 3: Paper Trading (READY)
 
-### Current Command (Uses Placeholder Signal)
+### Run with Real Signals
 
 ```bash
-# This works but uses simulated signals, not real liquidation_cascade
+# Full paper trading with real liquidation cascade signals
 cargo run -p algo-trade-cli -- polymarket-paper-trade \
   --duration 24h \
-  --signal liquidation_cascade \
+  --signal-mode cascade \
   --min-signal-strength 0.6 \
   --kelly-fraction 0.25 \
   --min-edge 0.03 \
+  --min-volume-usd 100000 \
+  --imbalance-threshold 0.6 \
+  --liquidation-window-mins 5 \
   --entry-strategy edge_threshold \
   --entry-threshold 0.05 \
   --entry-fallback-mins 2
 ```
 
-### What Needs to Change
+### Test with Simulated Signals
 
-The `run_trading_loop` function in `polymarket_paper_trade.rs` needs to:
+```bash
+# Use simulated signals for testing without real data
+cargo run -p algo-trade-cli -- polymarket-paper-trade \
+  --duration 1h \
+  --use-simulated-signals
+```
 
-1. **Query recent liquidations** from database (last 5-15 minutes)
-2. **Aggregate into LiquidationAggregate** structure
-3. **Build SignalContext** with the aggregate
-4. **Call LiquidationCascadeSignal.compute()** to get real signal
-5. **Use signal output** for trade decision
+### What the Bot Does
+
+1. **Queries recent liquidations** from database (last 5 minutes)
+2. **Aggregates into LiquidationAggregate** (long/short volumes)
+3. **Builds SignalContext** with the aggregate
+4. **Calls LiquidationCascadeSignal.compute()** to get real signal
+5. **Evaluates trade decision** based on signal strength and edge
+6. **Applies entry strategy** to optimize entry timing
+7. **Logs everything** - signals, decisions, executions
 
 ---
 
@@ -274,19 +350,32 @@ GROUP BY entry_strategy;
 
 ## Next Steps
 
-### Immediate (Wire Real Signals)
+### Now: Run Paper Trading
 
-1. **Modify `polymarket_paper_trade.rs`** to:
-   - Import `LiquidationCascadeSignal` from signals crate
-   - Query liquidation data from `LiquidationRepository`
-   - Build real `SignalContext` with `LiquidationAggregate`
-   - Replace `simulate_signal` with actual signal computation
+```bash
+# Start the full workflow
+./scripts/start-polymarket-bot.sh --duration 7d
 
-### Then (Validate)
+# Watch the logs
+tail -f logs/paper-trade.log
+```
 
-2. **Run paper trading** for 48-72 hours minimum
-3. **Analyze results** - check win rate, edge at entry, signal accuracy
-4. **Tune parameters** based on results
+### Then: Analyze Results
+
+```bash
+# Check paper trade performance
+psql $DATABASE_URL -c "
+SELECT
+  COUNT(*) as trades,
+  SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
+  ROUND(AVG(CASE WHEN outcome IS NOT NULL THEN
+    CASE WHEN outcome = 'win' THEN 1.0 ELSE 0.0 END
+  END) * 100, 1) as win_rate_pct,
+  SUM(pnl) as total_pnl
+FROM paper_trades
+WHERE timestamp > NOW() - INTERVAL '7 days';
+"
+```
 
 ### Production Criteria
 
@@ -295,3 +384,11 @@ Before live trading:
 - [ ] Win rate > 52% with statistical significance (p < 0.05)
 - [ ] Positive expected value after fees
 - [ ] Entry strategy improves outcomes vs immediate entry
+
+### Parameter Tuning
+
+Based on paper trading results, tune:
+- `--min-signal-strength` (higher = fewer but stronger signals)
+- `--min-volume-usd` (higher = only major liquidation events)
+- `--imbalance-threshold` (higher = stronger directional conviction)
+- `--entry-threshold` (higher = wait for better entry prices)
