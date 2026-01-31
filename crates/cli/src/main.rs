@@ -6,8 +6,8 @@ mod tui_backtest_manager;
 mod tui_live_bot;
 
 use commands::{
-    BackfillOhlcvArgs, BackfillSignalsArgs, CalculateReturnsArgs, CollectSignalsArgs,
-    ValidateSignalsArgs,
+    BackfillOhlcvArgs, BackfillSignalsArgs, BinaryBacktestArgs, CalculateReturnsArgs,
+    CollectSignalsArgs, ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -117,6 +117,8 @@ enum Commands {
     CalculateReturns(CalculateReturnsArgs),
     /// Generate validation reports for signals
     ValidateSignals(ValidateSignalsArgs),
+    /// Run binary outcome backtest using signal data
+    BinaryBacktest(BinaryBacktestArgs),
 }
 
 #[tokio::main]
@@ -215,6 +217,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::ValidateSignals(args) => {
             commands::run_validate_signals(args).await?;
+        }
+        Commands::BinaryBacktest(args) => {
+            commands::run_binary_backtest(args).await?;
         }
     }
 
