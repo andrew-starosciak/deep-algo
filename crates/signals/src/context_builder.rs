@@ -143,7 +143,7 @@ impl SignalContextBuilder {
             ctx = ctx.with_historical_funding_rates(historical_funding);
         }
 
-        // Query liquidation aggregates
+        // Query liquidation aggregates (5-minute window for cascade signal)
         if let Some(liq_agg) = self
             .query_liquidation_aggregate(&repos.liquidation, timestamp)
             .await?
@@ -153,6 +153,14 @@ impl SignalContextBuilder {
             if total > Decimal::ZERO {
                 ctx = ctx.with_liquidation_usd(total);
             }
+        }
+
+        // Query 24-hour liquidation aggregates (for ratio signal)
+        if let Some(liq_agg_24h) = self
+            .query_liquidation_aggregate_24h(&repos.liquidation, timestamp)
+            .await?
+        {
+            ctx = ctx.with_liquidation_aggregates_24h(liq_agg_24h);
         }
 
         // Query news events
@@ -290,14 +298,25 @@ impl SignalContextBuilder {
         Ok(historical)
     }
 
-    /// Queries and aggregates liquidations in the window before timestamp.
-    async fn query_liquidation_aggregate(
+    /// Queries and aggregates liquidations within a specified window before timestamp.
+    ///
+    /// This is the core aggregation method used by both 5-minute (cascade) and
+    /// 24-hour (ratio) liquidation queries. Data is filtered strictly before
+    /// `timestamp` to avoid look-ahead bias.
+    ///
+    /// # Arguments
+    /// * `repo` - Liquidation repository
+    /// * `timestamp` - Point-in-time for the query (exclusive upper bound)
+    /// * `window_duration` - How far back to look
+    /// * `window_minutes` - Window size in minutes (for metadata)
+    async fn query_liquidation_aggregate_with_window(
         &self,
         repo: &LiquidationRepository,
         timestamp: DateTime<Utc>,
+        window_duration: chrono::Duration,
+        window_minutes: i32,
     ) -> Result<Option<LiquidationAggregate>> {
-        let window_start =
-            timestamp - chrono::Duration::minutes(self.liquidation_window_minutes.into());
+        let window_start = timestamp - window_duration;
         let window_end = timestamp;
 
         let liquidations = repo
@@ -314,7 +333,7 @@ impl SignalContextBuilder {
             return Ok(None);
         }
 
-        // Aggregate
+        // Aggregate long and short volumes
         let mut long_volume = Decimal::ZERO;
         let mut short_volume = Decimal::ZERO;
         let mut count_long = 0i32;
@@ -332,13 +351,48 @@ impl SignalContextBuilder {
 
         Ok(Some(LiquidationAggregate {
             timestamp,
-            window_minutes: self.liquidation_window_minutes,
+            window_minutes,
             long_volume_usd: long_volume,
             short_volume_usd: short_volume,
             net_delta_usd: long_volume - short_volume,
             count_long,
             count_short,
         }))
+    }
+
+    /// Queries and aggregates liquidations in the configured window (default 5 min).
+    ///
+    /// Used by the liquidation cascade signal to detect rapid liquidation events.
+    async fn query_liquidation_aggregate(
+        &self,
+        repo: &LiquidationRepository,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Option<LiquidationAggregate>> {
+        self.query_liquidation_aggregate_with_window(
+            repo,
+            timestamp,
+            chrono::Duration::minutes(self.liquidation_window_minutes.into()),
+            self.liquidation_window_minutes,
+        )
+        .await
+    }
+
+    /// Queries and aggregates liquidations over 24 hours.
+    ///
+    /// Used by the liquidation ratio signal to detect long-term imbalance
+    /// between long and short liquidations for contrarian reversal signals.
+    async fn query_liquidation_aggregate_24h(
+        &self,
+        repo: &LiquidationRepository,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Option<LiquidationAggregate>> {
+        self.query_liquidation_aggregate_with_window(
+            repo,
+            timestamp,
+            chrono::Duration::hours(24),
+            24 * 60, // 1440 minutes
+        )
+        .await
     }
 
     /// Queries news events in the window before timestamp.

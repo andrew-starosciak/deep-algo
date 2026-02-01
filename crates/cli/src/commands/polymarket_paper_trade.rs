@@ -150,6 +150,13 @@ pub struct PolymarketPaperTradeArgs {
     #[arg(long, default_value = "4")]
     pub max_signal_age_mins: i64,
 
+    /// Maximum liquidation aggregate age in minutes before ignoring (0 to disable)
+    /// Prevents signals from firing based on data from the previous window.
+    /// Should be <= liquidation_window_mins to ensure data is from current window.
+    /// Recommended: 5 minutes (same as default liquidation window).
+    #[arg(long, default_value = "5")]
+    pub max_aggregate_age_mins: i64,
+
     // =========================================================================
     // Real Signal Arguments
     // =========================================================================
@@ -1309,10 +1316,11 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     let window_timer = WindowTimer::new(args.window_minutes, args.entry_cutoff_mins);
 
     tracing::info!(
-        "Window timing: {}m windows, {}m entry cutoff, {}m max signal age (settle at :00/:15/:30/:45)",
+        "Window timing: {}m windows, {}m entry cutoff, {}m max signal age, {}m max aggregate age (settle at :00/:15/:30/:45)",
         args.window_minutes,
         args.entry_cutoff_mins,
-        args.max_signal_age_mins
+        args.max_signal_age_mins,
+        args.max_aggregate_age_mins
     );
 
     // Create settlement service
@@ -1360,6 +1368,7 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     let signal_type = args.signal.clone();
 
     let max_signal_age_mins = args.max_signal_age_mins;
+    let max_aggregate_age_mins = args.max_aggregate_age_mins;
     let trading_handle = tokio::spawn(async move {
         let ctx = TradingLoopContext {
             executor: executor_clone,
@@ -1379,6 +1388,7 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
             entry_fee_rate,
             composite_config,
             max_signal_age_mins,
+            max_aggregate_age_mins,
         };
         run_trading_loop(ctx).await
     });
@@ -1444,6 +1454,8 @@ struct TradingLoopContext {
     composite_config: CompositeSignalConfig,
     /// Maximum signal age in minutes before rejecting entry (0 to disable)
     max_signal_age_mins: i64,
+    /// Maximum liquidation aggregate age in minutes before ignoring (0 to disable)
+    max_aggregate_age_mins: i64,
 }
 
 /// Main trading loop that polls for opportunities and executes trades.
@@ -1466,6 +1478,7 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
         entry_fee_rate,
         composite_config,
         max_signal_age_mins,
+        max_aggregate_age_mins,
     } = ctx;
 
     // Use faster polling when we have pending entries, slower otherwise
@@ -1581,7 +1594,7 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
             }
         } else if let Some(ref mut signal) = liq_signal {
             // Use real liquidation signal
-            match compute_real_signal(&liq_repo, signal, &signal_config, now).await {
+            match compute_real_signal(&liq_repo, signal, &signal_config, now, max_aggregate_age_mins).await {
                 Ok(result) => {
                     // Log signal computation
                     if result.is_directional {
@@ -1917,6 +1930,7 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
 /// * `signal` - The liquidation cascade signal generator
 /// * `config` - Signal configuration
 /// * `now` - Current timestamp
+/// * `max_aggregate_age_mins` - Maximum age of aggregate in minutes (0 to disable)
 ///
 /// # Errors
 /// Returns an error if database query fails or signal computation fails.
@@ -1925,6 +1939,7 @@ async fn compute_real_signal(
     signal: &mut LiquidationCascadeSignal,
     config: &SignalConfig,
     now: DateTime<Utc>,
+    max_aggregate_age_mins: i64,
 ) -> Result<SignalResult> {
     // Fetch latest aggregate
     let aggregate_record = liq_repo
@@ -1937,6 +1952,22 @@ async fn compute_real_signal(
 
     // Convert to core type and compute signal
     let signal_value = if let Some(record) = aggregate_record {
+        // Check if aggregate is too old (likely from previous window)
+        if max_aggregate_age_mins > 0 {
+            let aggregate_age = now - record.timestamp;
+            let max_age = chrono::Duration::minutes(max_aggregate_age_mins);
+
+            if aggregate_age > max_age {
+                tracing::debug!(
+                    aggregate_timestamp = %record.timestamp.format("%H:%M:%S"),
+                    aggregate_age_secs = aggregate_age.num_seconds(),
+                    max_age_mins = max_aggregate_age_mins,
+                    "Liquidation aggregate too old (likely from previous window), returning neutral"
+                );
+                return Ok(SignalResult::from_signal_value(&SignalValue::neutral()));
+            }
+        }
+
         let core_agg = convert_aggregate_record_to_core(&record);
         let ctx = SignalContext::new(now, &config.liquidation_symbol)
             .with_exchange(&config.liquidation_exchange)
@@ -2077,6 +2108,7 @@ mod tests {
             entry_cutoff_mins: 2,
             entry_poll_secs: 10,
             max_signal_age_mins: 4,
+            max_aggregate_age_mins: 5,
             // Signal config defaults
             use_simulated_signals: true,
             signal_mode: "cascade".to_string(),
@@ -2925,6 +2957,7 @@ mod tests {
                 liquidation_exchange: "bybit".to_string(),
                 entry_cutoff_mins: 2,
                 max_signal_age_mins: 4,
+                max_aggregate_age_mins: 5,
                 // Composite signal config
                 enable_composite: false,
                 min_signals_agree: 2,
@@ -2971,6 +3004,7 @@ mod tests {
                 window_minutes: 15,
                 entry_poll_secs: 10,
                 max_signal_age_mins: 4,
+                max_aggregate_age_mins: 5,
                 // Use simulated signals
                 use_simulated_signals: true,
                 signal_mode: "cascade".to_string(),
@@ -3141,6 +3175,7 @@ mod tests {
                 window_minutes: 15,
                 entry_poll_secs: 10,
                 max_signal_age_mins: 4,
+                max_aggregate_age_mins: 5,
                 use_simulated_signals: false,
                 signal_mode: "cascade".to_string(),
                 min_volume_usd: 150000.0,

@@ -45,6 +45,7 @@ MIN_VOLUME_USD="${MIN_VOLUME_USD:-100000}"
 IMBALANCE_THRESHOLD="${IMBALANCE_THRESHOLD:-0.6}"
 BANKROLL="${BANKROLL:-10000}"
 SETTLEMENT_FEE_RATE="${SETTLEMENT_FEE_RATE:-0.02}"  # 2% settlement fee
+MAX_AGGREGATE_AGE_MINS="${MAX_AGGREGATE_AGE_MINS:-5}"  # Reject stale aggregates from previous window
 
 # Composite signal configuration (multiple signals must agree)
 ENABLE_COMPOSITE="${ENABLE_COMPOSITE:-false}"
@@ -100,6 +101,10 @@ while [[ $# -gt 0 ]]; do
             SETTLEMENT_FEE_RATE="$2"
             shift 2
             ;;
+        --max-aggregate-age-mins)
+            MAX_AGGREGATE_AGE_MINS="$2"
+            shift 2
+            ;;
         --simulated)
             USE_SIMULATED="--use-simulated-signals"
             shift
@@ -139,6 +144,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --min-volume-usd <n>      Min liquidation volume (default: 100000)"
             echo "  --bankroll <n>            Starting bankroll (default: 10000)"
             echo "  --settlement-fee-rate <n> Settlement fee rate (default: 0.02)"
+            echo "  --max-aggregate-age-mins <n> Max age of liquidation data (default: 5)"
             echo "  --simulated               Use simulated signals (for testing)"
             echo ""
             echo "Composite signal options (require 2+ signals to agree):"
@@ -304,6 +310,7 @@ PAPER_TRADE_ARGS=(
     --liquidation-symbol BTCUSDT
     --liquidation-exchange binance
     --settlement-fee-rate "$SETTLEMENT_FEE_RATE"
+    --max-aggregate-age-mins "$MAX_AGGREGATE_AGE_MINS"
 )
 
 # Add simulated flag if requested (default is real signals)

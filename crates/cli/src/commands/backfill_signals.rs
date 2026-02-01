@@ -55,6 +55,7 @@ pub enum SignalType {
     MomentumExhaustion,
     WallBias,
     CompositeRequireN,
+    LiquidationRatio,
 }
 
 impl SignalType {
@@ -70,6 +71,7 @@ impl SignalType {
             SignalType::MomentumExhaustion,
             SignalType::WallBias,
             SignalType::CompositeRequireN,
+            SignalType::LiquidationRatio,
         ]
     }
 
@@ -85,6 +87,7 @@ impl SignalType {
             SignalType::MomentumExhaustion => "momentum_exhaustion",
             SignalType::WallBias => "wall_bias",
             SignalType::CompositeRequireN => "composite_require_n",
+            SignalType::LiquidationRatio => "liquidation_ratio",
         }
     }
 
@@ -101,6 +104,9 @@ impl SignalType {
             "wall" | "wall_bias" | "wb" => Some(SignalType::WallBias),
             "composite" | "composite_require_n" | "require_n" | "rn" => {
                 Some(SignalType::CompositeRequireN)
+            }
+            "liq_ratio" | "liquidation_ratio" | "lr" | "ratio" => {
+                Some(SignalType::LiquidationRatio)
             }
             _ => None,
         }
@@ -130,7 +136,7 @@ pub fn parse_signals(s: &str) -> Result<Vec<SignalType>> {
 
         let signal = SignalType::parse(&name).ok_or_else(|| {
             anyhow!(
-                "Unknown signal: '{}'. Valid signals: obi, funding, liquidation, news, fp (funding_percentile), momentum, wall, composite",
+                "Unknown signal: '{}'. Valid signals: obi, funding, liquidation, news, fp (funding_percentile), momentum, wall, composite, liq_ratio",
                 name
             )
         })?;
@@ -260,8 +266,8 @@ pub async fn run_backfill_signals(args: BackfillSignalsArgs) -> Result<()> {
     use algo_trade_data::{SignalDirection, SignalSnapshotRecord, SignalSnapshotRepository};
     use algo_trade_signals::{
         CompositeSignal, FundingPercentileConfig, FundingRateSignal, LiquidationCascadeSignal,
-        MomentumExhaustionConfig, MomentumExhaustionSignal, NewsSignal, OrderBookImbalanceSignal,
-        SignalContextBuilder, SignalRegistry, WallDetectionConfig,
+        LiquidationRatioSignal, MomentumExhaustionConfig, MomentumExhaustionSignal, NewsSignal,
+        OrderBookImbalanceSignal, SignalContextBuilder, SignalRegistry, WallDetectionConfig,
     };
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -375,6 +381,10 @@ pub async fn run_backfill_signals(args: BackfillSignalsArgs) -> Result<()> {
                     .with_generator(Box::new(OrderBookImbalanceSignal::default()));
                 registry.register(Box::new(composite));
             }
+            SignalType::LiquidationRatio => {
+                // 24-hour liquidation ratio signal (contrarian)
+                registry.register(Box::new(LiquidationRatioSignal::default()));
+            }
         }
     }
 
@@ -479,9 +489,9 @@ mod tests {
     // ============================================
 
     #[test]
-    fn signal_type_all_returns_eight_types() {
+    fn signal_type_all_returns_nine_types() {
         let all = SignalType::all();
-        assert_eq!(all.len(), 8); // 4 original + 4 Phase 2.2 enhanced signals
+        assert_eq!(all.len(), 9); // 4 original + 5 Phase 2.2 enhanced signals
     }
 
     #[test]
@@ -498,6 +508,7 @@ mod tests {
         assert_eq!(SignalType::MomentumExhaustion.name(), "momentum_exhaustion");
         assert_eq!(SignalType::WallBias.name(), "wall_bias");
         assert_eq!(SignalType::CompositeRequireN.name(), "composite_require_n");
+        assert_eq!(SignalType::LiquidationRatio.name(), "liquidation_ratio");
     }
 
     #[test]
@@ -520,6 +531,11 @@ mod tests {
         );
         assert_eq!(SignalType::parse("wb"), Some(SignalType::WallBias));
         assert_eq!(SignalType::parse("rn"), Some(SignalType::CompositeRequireN));
+        assert_eq!(SignalType::parse("lr"), Some(SignalType::LiquidationRatio));
+        assert_eq!(
+            SignalType::parse("liq_ratio"),
+            Some(SignalType::LiquidationRatio)
+        );
     }
 
     #[test]
@@ -561,13 +577,13 @@ mod tests {
     #[test]
     fn parse_signals_all_returns_all_types() {
         let signals = parse_signals("all").unwrap();
-        assert_eq!(signals.len(), 8); // 4 original + 4 Phase 2.2
+        assert_eq!(signals.len(), 9); // 4 original + 5 Phase 2.2
     }
 
     #[test]
     fn parse_signals_empty_returns_all_types() {
         let signals = parse_signals("").unwrap();
-        assert_eq!(signals.len(), 8); // 4 original + 4 Phase 2.2
+        assert_eq!(signals.len(), 9); // 4 original + 5 Phase 2.2
     }
 
     #[test]
