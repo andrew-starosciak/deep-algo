@@ -2,9 +2,13 @@
 //!
 //! Polls Polymarket CLOB for BTC-related market prices and emits
 //! `PolymarketOddsRecord` for storage and signal processing.
+//!
+//! Supports both traditional CLOB markets and 15-minute Up/Down markets
+//! via the Gamma API.
 
 use crate::client::PolymarketClient;
-use crate::models::Market;
+use crate::gamma::GammaClient;
+use crate::models::{Coin, Market};
 use algo_trade_data::PolymarketOddsRecord;
 use anyhow::Result;
 use chrono::Utc;
@@ -25,6 +29,10 @@ pub struct OddsCollectorConfig {
     pub min_liquidity: Decimal,
     /// Maximum number of markets to track
     pub max_markets: usize,
+    /// Coins to track for 15-minute markets (empty = disabled)
+    pub coins_15min: Vec<Coin>,
+    /// Whether to use Gamma API for 15-minute market discovery
+    pub enable_15min_discovery: bool,
 }
 
 impl Default for OddsCollectorConfig {
@@ -34,6 +42,8 @@ impl Default for OddsCollectorConfig {
             discovery_interval: Duration::from_secs(3600), // 1 hour
             min_liquidity: Decimal::ZERO,
             max_markets: 50,
+            coins_15min: vec![Coin::Btc], // Default to BTC only
+            enable_15min_discovery: true,
         }
     }
 }
@@ -64,6 +74,20 @@ impl OddsCollectorConfig {
     #[must_use]
     pub fn with_max_markets(mut self, max: usize) -> Self {
         self.max_markets = max;
+        self
+    }
+
+    /// Sets coins for 15-minute market discovery.
+    #[must_use]
+    pub fn with_15min_coins(mut self, coins: Vec<Coin>) -> Self {
+        self.coins_15min = coins;
+        self
+    }
+
+    /// Enables or disables 15-minute market discovery.
+    #[must_use]
+    pub fn with_15min_discovery(mut self, enable: bool) -> Self {
+        self.enable_15min_discovery = enable;
         self
     }
 }
@@ -124,9 +148,14 @@ pub enum OddsCollectorEvent {
 ///
 /// Continuously polls Polymarket for BTC-related market prices
 /// and emits records through a channel.
+///
+/// Supports both traditional CLOB markets and 15-minute Up/Down markets
+/// via the Gamma API.
 pub struct OddsCollector {
-    /// Polymarket API client
+    /// Polymarket CLOB API client
     client: PolymarketClient,
+    /// Gamma API client for 15-minute markets
+    gamma_client: GammaClient,
     /// Configuration
     config: OddsCollectorConfig,
     /// Output channel for odds records
@@ -148,12 +177,20 @@ impl OddsCollector {
     ) -> Self {
         Self {
             client,
+            gamma_client: GammaClient::new(),
             config,
             tx,
             event_tx: None,
             tracked_markets: Vec::new(),
             stats: OddsCollectorStats::default(),
         }
+    }
+
+    /// Sets a custom Gamma client (useful for testing).
+    #[must_use]
+    pub fn with_gamma_client(mut self, gamma_client: GammaClient) -> Self {
+        self.gamma_client = gamma_client;
+        self
     }
 
     /// Sets an event channel for monitoring.
@@ -173,20 +210,58 @@ impl OddsCollector {
         &self.tracked_markets
     }
 
-    /// Discovers BTC-related markets and updates the tracked list.
-    pub async fn discover_markets(&mut self) -> Result<usize> {
-        tracing::info!("Discovering BTC-related markets...");
+    /// Discovers 15-minute markets using Gamma API.
+    async fn discover_15min_markets(&self) -> Vec<Market> {
+        if !self.config.enable_15min_discovery || self.config.coins_15min.is_empty() {
+            return vec![];
+        }
 
-        let markets = if self.config.min_liquidity > Decimal::ZERO {
+        tracing::info!(
+            coins = ?self.config.coins_15min.iter().map(|c| c.slug_prefix()).collect::<Vec<_>>(),
+            "Discovering 15-minute markets via Gamma API"
+        );
+
+        let markets = self
+            .gamma_client
+            .get_15min_markets_for_coins(&self.config.coins_15min)
+            .await;
+
+        tracing::info!(count = markets.len(), "Discovered 15-minute markets");
+
+        markets
+    }
+
+    /// Discovers all markets (both CLOB and 15-minute).
+    pub async fn discover_markets(&mut self) -> Result<usize> {
+        tracing::info!("Discovering markets...");
+
+        // Get 15-minute markets from Gamma API (prioritize these)
+        let markets_15min = self.discover_15min_markets().await;
+        let count_15min = markets_15min.len();
+
+        // Get general BTC markets from CLOB API
+        let markets_clob = if self.config.min_liquidity > Decimal::ZERO {
             self.client
                 .discover_tradeable_btc_markets(self.config.min_liquidity)
-                .await?
+                .await
+                .unwrap_or_default()
         } else {
-            self.client.discover_btc_markets().await?
+            self.client.discover_btc_markets().await.unwrap_or_default()
         };
+        let count_clob = markets_clob.len();
+
+        // Combine: 15-minute markets first, then CLOB markets
+        let mut all_markets = markets_15min;
+        all_markets.extend(markets_clob);
+
+        // Deduplicate by condition ID
+        let all_markets = deduplicate_markets(all_markets);
 
         // Limit number of tracked markets
-        let markets: Vec<Market> = markets.into_iter().take(self.config.max_markets).collect();
+        let markets: Vec<Market> = all_markets
+            .into_iter()
+            .take(self.config.max_markets)
+            .collect();
 
         let count = markets.len();
         self.tracked_markets = markets;
@@ -195,21 +270,68 @@ impl OddsCollector {
         self.emit_event(OddsCollectorEvent::MarketsDiscovered { count })
             .await;
 
-        tracing::info!("Discovered {} BTC-related markets", count);
+        tracing::info!(
+            total = count,
+            from_15min = count_15min,
+            from_clob = count_clob,
+            "Market discovery complete"
+        );
         Ok(count)
     }
 
     /// Polls current prices for all tracked markets and emits records.
+    ///
+    /// For 15-minute markets, fetches fresh prices from the Gamma API each cycle.
+    /// For CLOB markets, uses cached prices from discovery.
     pub async fn poll_prices(&mut self) -> Result<usize> {
-        if self.tracked_markets.is_empty() {
-            return Ok(0);
-        }
-
         let timestamp = Utc::now();
         let mut records_emitted = 0;
 
+        // Fetch fresh 15-minute market prices from Gamma API
+        if self.config.enable_15min_discovery && !self.config.coins_15min.is_empty() {
+            let fresh_markets = self
+                .gamma_client
+                .get_15min_markets_for_coins(&self.config.coins_15min)
+                .await;
+
+            for market in fresh_markets {
+                let (up_price, down_price) = match (market.up_price(), market.down_price()) {
+                    (Some(up), Some(down)) => (up, down),
+                    _ => continue,
+                };
+
+                let record = PolymarketOddsRecord::new(
+                    timestamp,
+                    market.condition_id.clone(),
+                    market.question.clone(),
+                    up_price,
+                    down_price,
+                )
+                .with_metadata(market.volume_24h, market.liquidity, market.end_date);
+
+                if self.tx.send(record).await.is_err() {
+                    tracing::warn!("Odds record channel closed");
+                    break;
+                }
+
+                records_emitted += 1;
+
+                tracing::debug!(
+                    market_id = %market.condition_id,
+                    up_price = %up_price,
+                    down_price = %down_price,
+                    "Polled fresh 15-min market price"
+                );
+            }
+        }
+
+        // For non-15min markets, use cached prices from tracked_markets
         for market in &self.tracked_markets {
-            // Skip if market doesn't have prices
+            // Skip 15-min markets (already handled above with fresh prices)
+            if market.is_15min_market() {
+                continue;
+            }
+
             let (yes_price, no_price) = match (market.yes_price(), market.no_price()) {
                 (Some(y), Some(n)) => (y, n),
                 _ => continue,
@@ -328,6 +450,7 @@ pub fn deduplicate_markets(markets: Vec<Market>) -> Vec<Market> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gamma::GammaClient;
     use crate::models::Token;
     use rust_decimal_macros::dec;
 
@@ -372,6 +495,33 @@ mod tests {
         }
     }
 
+    fn sample_15min_market() -> Market {
+        Market {
+            condition_id: "btc-15min-up".to_string(),
+            question: "Bitcoin Up or Down - 15 min".to_string(),
+            description: None,
+            end_date: None,
+            tokens: vec![
+                Token {
+                    token_id: "up-token".to_string(),
+                    outcome: "Up".to_string(),
+                    price: dec!(0.55),
+                    winner: None,
+                },
+                Token {
+                    token_id: "down-token".to_string(),
+                    outcome: "Down".to_string(),
+                    price: dec!(0.45),
+                    winner: None,
+                },
+            ],
+            active: true,
+            tags: Some(vec!["15min".to_string()]),
+            volume_24h: None,
+            liquidity: Some(dec!(10000)),
+        }
+    }
+
     // ========== OddsCollectorConfig Tests ==========
 
     #[test]
@@ -381,6 +531,24 @@ mod tests {
         assert_eq!(config.discovery_interval, Duration::from_secs(3600));
         assert_eq!(config.min_liquidity, Decimal::ZERO);
         assert_eq!(config.max_markets, 50);
+        assert_eq!(config.coins_15min, vec![Coin::Btc]);
+        assert!(config.enable_15min_discovery);
+    }
+
+    #[test]
+    fn test_config_with_15min_coins() {
+        let config =
+            OddsCollectorConfig::default().with_15min_coins(vec![Coin::Btc, Coin::Eth, Coin::Sol]);
+        assert_eq!(config.coins_15min.len(), 3);
+        assert!(config.coins_15min.contains(&Coin::Btc));
+        assert!(config.coins_15min.contains(&Coin::Eth));
+        assert!(config.coins_15min.contains(&Coin::Sol));
+    }
+
+    #[test]
+    fn test_config_with_15min_discovery_disabled() {
+        let config = OddsCollectorConfig::default().with_15min_discovery(false);
+        assert!(!config.enable_15min_discovery);
     }
 
     #[test]
@@ -502,7 +670,8 @@ mod tests {
     #[tokio::test]
     async fn test_poll_prices_empty_markets() {
         let client = PolymarketClient::new();
-        let config = OddsCollectorConfig::default();
+        // Disable 15-min discovery for this test (tests cached markets only)
+        let config = OddsCollectorConfig::default().with_15min_discovery(false);
         let (tx, _rx) = mpsc::channel(100);
 
         let mut collector = OddsCollector::new(client, config, tx);
@@ -514,7 +683,8 @@ mod tests {
     #[tokio::test]
     async fn test_poll_prices_with_markets() {
         let client = PolymarketClient::new();
-        let config = OddsCollectorConfig::default();
+        // Disable 15-min discovery for this test (tests cached markets only)
+        let config = OddsCollectorConfig::default().with_15min_discovery(false);
         let (tx, mut rx) = mpsc::channel(100);
 
         let mut collector = OddsCollector::new(client, config, tx);
@@ -535,7 +705,8 @@ mod tests {
     #[tokio::test]
     async fn test_poll_prices_skips_markets_without_prices() {
         let client = PolymarketClient::new();
-        let config = OddsCollectorConfig::default();
+        // Disable 15-min discovery for this test (tests cached markets only)
+        let config = OddsCollectorConfig::default().with_15min_discovery(false);
         let (tx, _rx) = mpsc::channel(100);
 
         let mut collector = OddsCollector::new(client, config, tx);
@@ -551,9 +722,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_poll_prices_with_15min_markets_mocked() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock Gamma API response
+        Mock::given(method("GET"))
+            .and(path("/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "slug": "btc-updown-15m-test",
+                    "markets": [{
+                        "conditionId": "0xtest-15min",
+                        "outcomePrices": "[\"0.55\", \"0.45\"]",
+                        "clobTokenIds": "[\"up-token\", \"down-token\"]",
+                        "liquidity": "10000",
+                        "question": "BTC 15-min test",
+                        "active": true
+                    }]
+                }
+            ])))
+            .mount(&mock_server)
+            .await;
+
+        let client = PolymarketClient::new();
+        let config = OddsCollectorConfig::default().with_15min_coins(vec![Coin::Btc]);
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let gamma_client = GammaClient::new().with_base_url(mock_server.uri());
+        let mut collector = OddsCollector::new(client, config, tx).with_gamma_client(gamma_client);
+
+        let count = collector.poll_prices().await.unwrap();
+
+        assert_eq!(count, 1);
+
+        // Verify record was sent with Up/Down prices
+        let record = rx.recv().await.unwrap();
+        assert_eq!(record.market_id, "0xtest-15min");
+        assert_eq!(record.outcome_yes_price, dec!(0.55));
+        assert_eq!(record.outcome_no_price, dec!(0.45));
+    }
+
+    #[tokio::test]
+    async fn test_poll_prices_mixed_markets_mocked() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+
+        // Mock Gamma API response for 15-min market
+        Mock::given(method("GET"))
+            .and(path("/events"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "slug": "btc-updown-15m-test",
+                    "markets": [{
+                        "conditionId": "0xtest-15min",
+                        "outcomePrices": "[\"0.60\", \"0.40\"]",
+                        "clobTokenIds": "[\"up\", \"down\"]",
+                        "active": true
+                    }]
+                }
+            ])))
+            .mount(&mock_server)
+            .await;
+
+        let client = PolymarketClient::new();
+        let config = OddsCollectorConfig::default().with_15min_coins(vec![Coin::Btc]);
+        let (tx, mut rx) = mpsc::channel(100);
+
+        let gamma_client = GammaClient::new().with_base_url(mock_server.uri());
+        let mut collector = OddsCollector::new(client, config, tx).with_gamma_client(gamma_client);
+        // Add a cached CLOB market
+        collector.tracked_markets = vec![sample_btc_market()];
+
+        let count = collector.poll_prices().await.unwrap();
+
+        // 1 from Gamma API (15-min) + 1 from cached (CLOB)
+        assert_eq!(count, 2);
+
+        // First record: 15-min market (fetched fresh)
+        let record1 = rx.recv().await.unwrap();
+        assert_eq!(record1.market_id, "0xtest-15min");
+        assert_eq!(record1.outcome_yes_price, dec!(0.60));
+
+        // Second record: CLOB market (cached)
+        let record2 = rx.recv().await.unwrap();
+        assert_eq!(record2.market_id, "btc-100k");
+        assert_eq!(record2.outcome_yes_price, dec!(0.65));
+    }
+
+    #[tokio::test]
     async fn test_poll_prices_handles_closed_channel() {
         let client = PolymarketClient::new();
-        let config = OddsCollectorConfig::default();
+        // Disable 15-min discovery for this test
+        let config = OddsCollectorConfig::default().with_15min_discovery(false);
         let (tx, rx) = mpsc::channel(1);
 
         let mut collector = OddsCollector::new(client, config, tx);
@@ -665,7 +930,8 @@ mod tests {
     #[tokio::test]
     async fn test_collector_emits_events() {
         let client = PolymarketClient::new();
-        let config = OddsCollectorConfig::default();
+        // Disable 15-min discovery for this test
+        let config = OddsCollectorConfig::default().with_15min_discovery(false);
         let (tx, _rx) = mpsc::channel(100);
         let (event_tx, mut event_rx) = mpsc::channel(100);
 

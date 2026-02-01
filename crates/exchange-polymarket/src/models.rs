@@ -78,6 +78,40 @@ impl Market {
     pub fn is_tradeable(&self) -> bool {
         self.active && self.yes_price().is_some() && self.no_price().is_some()
     }
+
+    /// Returns the "Up" token if present (for 15-min markets).
+    #[must_use]
+    pub fn up_token(&self) -> Option<&Token> {
+        self.tokens
+            .iter()
+            .find(|t| t.outcome.eq_ignore_ascii_case("up"))
+    }
+
+    /// Returns the "Down" token if present (for 15-min markets).
+    #[must_use]
+    pub fn down_token(&self) -> Option<&Token> {
+        self.tokens
+            .iter()
+            .find(|t| t.outcome.eq_ignore_ascii_case("down"))
+    }
+
+    /// Returns the up price (for 15-min markets, 0.0 to 1.0).
+    #[must_use]
+    pub fn up_price(&self) -> Option<Decimal> {
+        self.up_token().map(|t| t.price)
+    }
+
+    /// Returns the down price (for 15-min markets, 0.0 to 1.0).
+    #[must_use]
+    pub fn down_price(&self) -> Option<Decimal> {
+        self.down_token().map(|t| t.price)
+    }
+
+    /// Returns true if this is a 15-minute Up/Down market.
+    #[must_use]
+    pub fn is_15min_market(&self) -> bool {
+        self.up_token().is_some() && self.down_token().is_some()
+    }
 }
 
 /// A token representing an outcome in a binary market.
@@ -196,6 +230,152 @@ pub struct RawToken {
     #[serde(default)]
     pub price: Option<f64>,
     pub winner: Option<bool>,
+}
+
+// ============================================================================
+// Gamma API Types (for 15-minute market discovery)
+// ============================================================================
+
+/// Supported coins for 15-minute markets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Coin {
+    Btc,
+    Eth,
+    Sol,
+    Xrp,
+}
+
+impl Coin {
+    /// Returns the slug prefix for this coin.
+    #[must_use]
+    pub fn slug_prefix(&self) -> &'static str {
+        match self {
+            Coin::Btc => "btc",
+            Coin::Eth => "eth",
+            Coin::Sol => "sol",
+            Coin::Xrp => "xrp",
+        }
+    }
+
+    /// Returns all supported coins.
+    #[must_use]
+    pub fn all() -> &'static [Coin] {
+        &[Coin::Btc, Coin::Eth, Coin::Sol, Coin::Xrp]
+    }
+}
+
+/// Gamma API event response (contains markets).
+#[derive(Debug, Clone, Deserialize)]
+pub struct GammaEvent {
+    pub slug: String,
+    pub title: Option<String>,
+    pub markets: Vec<GammaMarket>,
+}
+
+/// Gamma API market data for a 15-minute binary option.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GammaMarket {
+    /// Condition ID for the market
+    #[serde(rename = "conditionId")]
+    pub condition_id: String,
+
+    /// JSON string array: "[\"0.53\", \"0.47\"]"
+    #[serde(rename = "outcomePrices")]
+    pub outcome_prices: String,
+
+    /// JSON string array: "[\"token_id_1\", \"token_id_2\"]"
+    #[serde(rename = "clobTokenIds")]
+    pub clob_token_ids: String,
+
+    /// Liquidity as string (e.g., "11888.4997")
+    pub liquidity: Option<String>,
+
+    /// End date in ISO format
+    #[serde(rename = "endDate")]
+    pub end_date: Option<String>,
+
+    /// Start date in ISO format
+    #[serde(rename = "startDate")]
+    pub start_date: Option<String>,
+
+    /// Question/title of the market
+    pub question: Option<String>,
+
+    /// Whether the market is active
+    pub active: Option<bool>,
+}
+
+impl GammaMarket {
+    /// Parses outcome prices from JSON string array.
+    #[must_use]
+    pub fn parse_outcome_prices(&self) -> Option<(Decimal, Decimal)> {
+        let prices: Vec<String> = serde_json::from_str(&self.outcome_prices).ok()?;
+        if prices.len() >= 2 {
+            let up_price = prices[0].parse::<Decimal>().ok()?;
+            let down_price = prices[1].parse::<Decimal>().ok()?;
+            Some((up_price, down_price))
+        } else {
+            None
+        }
+    }
+
+    /// Parses CLOB token IDs from JSON string array.
+    #[must_use]
+    pub fn parse_clob_token_ids(&self) -> Option<(String, String)> {
+        let ids: Vec<String> = serde_json::from_str(&self.clob_token_ids).ok()?;
+        if ids.len() >= 2 {
+            Some((ids[0].clone(), ids[1].clone()))
+        } else {
+            None
+        }
+    }
+
+    /// Parses liquidity from string.
+    #[must_use]
+    pub fn parse_liquidity(&self) -> Option<Decimal> {
+        self.liquidity.as_ref()?.parse::<Decimal>().ok()
+    }
+
+    /// Converts to internal Market type.
+    #[must_use]
+    pub fn to_market(&self) -> Option<Market> {
+        let (up_price, down_price) = self.parse_outcome_prices()?;
+        let (up_token_id, down_token_id) = self.parse_clob_token_ids()?;
+
+        let end_date = self.end_date.as_ref().and_then(|s| {
+            DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        });
+
+        Some(Market {
+            condition_id: self.condition_id.clone(),
+            question: self
+                .question
+                .clone()
+                .unwrap_or_else(|| format!("15-min Up/Down {}", self.condition_id)),
+            description: None,
+            end_date,
+            tokens: vec![
+                Token {
+                    token_id: up_token_id,
+                    outcome: "Up".to_string(),
+                    price: up_price,
+                    winner: None,
+                },
+                Token {
+                    token_id: down_token_id,
+                    outcome: "Down".to_string(),
+                    price: down_price,
+                    winner: None,
+                },
+            ],
+            active: self.active.unwrap_or(true),
+            tags: Some(vec!["15min".to_string(), "updown".to_string()]),
+            volume_24h: None,
+            liquidity: self.parse_liquidity(),
+        })
+    }
 }
 
 impl From<RawMarket> for Market {
@@ -591,5 +771,148 @@ mod tests {
         assert!(market.end_date.is_none());
         assert!(market.volume_24h.is_none());
         assert!(market.liquidity.is_none());
+    }
+
+    // ========== Coin Tests ==========
+
+    #[test]
+    fn test_coin_slug_prefix() {
+        assert_eq!(Coin::Btc.slug_prefix(), "btc");
+        assert_eq!(Coin::Eth.slug_prefix(), "eth");
+        assert_eq!(Coin::Sol.slug_prefix(), "sol");
+        assert_eq!(Coin::Xrp.slug_prefix(), "xrp");
+    }
+
+    #[test]
+    fn test_coin_all() {
+        let all = Coin::all();
+        assert_eq!(all.len(), 4);
+        assert!(all.contains(&Coin::Btc));
+        assert!(all.contains(&Coin::Eth));
+        assert!(all.contains(&Coin::Sol));
+        assert!(all.contains(&Coin::Xrp));
+    }
+
+    // ========== GammaMarket Tests ==========
+
+    #[test]
+    fn test_gamma_market_parse_outcome_prices() {
+        let market = GammaMarket {
+            condition_id: "0xabc".to_string(),
+            outcome_prices: "[\"0.53\", \"0.47\"]".to_string(),
+            clob_token_ids: "[\"t1\", \"t2\"]".to_string(),
+            liquidity: Some("10000".to_string()),
+            end_date: None,
+            start_date: None,
+            question: None,
+            active: Some(true),
+        };
+
+        let (up, down) = market.parse_outcome_prices().unwrap();
+        assert_eq!(up, dec!(0.53));
+        assert_eq!(down, dec!(0.47));
+    }
+
+    #[test]
+    fn test_gamma_market_parse_outcome_prices_invalid() {
+        let market = GammaMarket {
+            condition_id: "0xabc".to_string(),
+            outcome_prices: "invalid".to_string(),
+            clob_token_ids: "[\"t1\", \"t2\"]".to_string(),
+            liquidity: None,
+            end_date: None,
+            start_date: None,
+            question: None,
+            active: None,
+        };
+
+        assert!(market.parse_outcome_prices().is_none());
+    }
+
+    #[test]
+    fn test_gamma_market_parse_clob_token_ids() {
+        let market = GammaMarket {
+            condition_id: "0xabc".to_string(),
+            outcome_prices: "[\"0.5\", \"0.5\"]".to_string(),
+            clob_token_ids: "[\"111529abc\", \"33881def\"]".to_string(),
+            liquidity: None,
+            end_date: None,
+            start_date: None,
+            question: None,
+            active: None,
+        };
+
+        let (up_id, down_id) = market.parse_clob_token_ids().unwrap();
+        assert_eq!(up_id, "111529abc");
+        assert_eq!(down_id, "33881def");
+    }
+
+    #[test]
+    fn test_gamma_market_to_market() {
+        let gamma_market = GammaMarket {
+            condition_id: "0xabc123".to_string(),
+            outcome_prices: "[\"0.60\", \"0.40\"]".to_string(),
+            clob_token_ids: "[\"up-token\", \"down-token\"]".to_string(),
+            liquidity: Some("15000.50".to_string()),
+            end_date: Some("2026-01-31T12:15:00Z".to_string()),
+            start_date: Some("2026-01-31T12:00:00Z".to_string()),
+            question: Some("Will BTC go up?".to_string()),
+            active: Some(true),
+        };
+
+        let market = gamma_market.to_market().unwrap();
+
+        assert_eq!(market.condition_id, "0xabc123");
+        assert_eq!(market.question, "Will BTC go up?");
+        assert!(market.is_15min_market());
+        assert_eq!(market.up_price(), Some(dec!(0.60)));
+        assert_eq!(market.down_price(), Some(dec!(0.40)));
+        assert_eq!(market.liquidity, Some(dec!(15000.50)));
+        assert!(market.active);
+    }
+
+    // ========== Market Up/Down Tests ==========
+
+    #[test]
+    fn test_market_up_down_tokens() {
+        let market = Market {
+            condition_id: "15min-btc".to_string(),
+            question: "15-min BTC Up/Down".to_string(),
+            description: None,
+            end_date: None,
+            tokens: vec![
+                Token {
+                    token_id: "up-1".to_string(),
+                    outcome: "Up".to_string(),
+                    price: dec!(0.55),
+                    winner: None,
+                },
+                Token {
+                    token_id: "down-1".to_string(),
+                    outcome: "Down".to_string(),
+                    price: dec!(0.45),
+                    winner: None,
+                },
+            ],
+            active: true,
+            tags: None,
+            volume_24h: None,
+            liquidity: Some(dec!(10000)),
+        };
+
+        assert!(market.is_15min_market());
+        assert_eq!(market.up_price(), Some(dec!(0.55)));
+        assert_eq!(market.down_price(), Some(dec!(0.45)));
+        assert!(market.up_token().is_some());
+        assert!(market.down_token().is_some());
+    }
+
+    #[test]
+    fn test_market_is_not_15min_market() {
+        let market = sample_market(); // Uses Yes/No tokens
+
+        assert!(!market.is_15min_market());
+        assert!(market.up_token().is_none());
+        assert!(market.down_token().is_none());
     }
 }
