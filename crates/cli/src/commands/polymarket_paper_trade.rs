@@ -2684,8 +2684,8 @@ mod tests {
         assert!((config.entry_config.offset_pct - 0.5).abs() < f64::EPSILON);
 
         let strategy = config.create_entry_strategy();
-        // Should be FallbackEntry wrapping FixedTimeEntry since fallback_mins > 0
-        assert_eq!(strategy.name(), "FallbackEntry");
+        // FallbackEntry returns inner strategy name (FixedTimeEntry)
+        assert_eq!(strategy.name(), "FixedTimeEntry");
     }
 
     #[test]

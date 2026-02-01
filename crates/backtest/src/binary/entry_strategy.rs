@@ -14,6 +14,8 @@
 //! The module uses Brownian bridge price paths to simulate realistic price movements
 //! that are anchored at both the open and close prices.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use chrono::Duration;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -992,14 +994,24 @@ impl EntryStrategy for ImmediateEntry {
 ///
 /// This is useful for ensuring entry happens within a window even if optimal
 /// conditions aren't met (e.g., "try to get 5% edge, but enter by minute 12 anyway").
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct FallbackEntry<S: EntryStrategy> {
     /// The primary entry strategy to try first.
     inner: S,
     /// Time offset at which to fall back to immediate entry.
     fallback_offset: Duration,
-    /// Whether fallback was used (tracked for reporting).
-    used_fallback: bool,
+    /// Tracks whether the last evaluation used fallback (for reporting).
+    last_used_fallback: AtomicBool,
+}
+
+impl<S: EntryStrategy + Clone> Clone for FallbackEntry<S> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            fallback_offset: self.fallback_offset,
+            last_used_fallback: AtomicBool::new(self.last_used_fallback.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl<S: EntryStrategy> FallbackEntry<S> {
@@ -1013,20 +1025,26 @@ impl<S: EntryStrategy> FallbackEntry<S> {
         Self {
             inner,
             fallback_offset,
-            used_fallback: false,
+            last_used_fallback: AtomicBool::new(false),
         }
     }
 
     /// Returns whether the fallback was used in the last evaluation.
     #[must_use]
     pub fn used_fallback(&self) -> bool {
-        self.used_fallback
+        self.last_used_fallback.load(Ordering::Relaxed)
     }
 
     /// Returns a reference to the inner strategy.
     #[must_use]
     pub fn inner(&self) -> &S {
         &self.inner
+    }
+
+    /// Returns the name of the inner strategy.
+    #[must_use]
+    pub fn inner_name(&self) -> &str {
+        self.inner.name()
     }
 }
 
@@ -1037,21 +1055,26 @@ impl<S: EntryStrategy> EntryStrategy for FallbackEntry<S> {
 
         // If inner strategy says enter, use that
         if inner_decision.is_entry() {
+            self.last_used_fallback.store(false, Ordering::Relaxed);
             return inner_decision;
         }
 
         // Check if we've reached or passed the fallback time
         if ctx.current_offset >= self.fallback_offset {
             // Fall back to immediate entry
+            self.last_used_fallback.store(true, Ordering::Relaxed);
             return EntryDecision::enter(ctx.current_offset, ctx.direction);
         }
 
         // Not yet at fallback time, return inner strategy's no-entry decision
+        self.last_used_fallback.store(false, Ordering::Relaxed);
         inner_decision
     }
 
     fn name(&self) -> &str {
-        "FallbackEntry"
+        // Return the inner strategy's name since that's what users care about
+        // Call used_fallback() after evaluate() to check if fallback was used
+        self.inner.name()
     }
 
     fn description(&self) -> &str {
@@ -2143,7 +2166,7 @@ mod tests {
     fn fallback_entry_name_is_correct() {
         let inner = FixedTimeEntry::at_open();
         let fallback = FallbackEntry::new(inner, Duration::minutes(12));
-        assert_eq!(fallback.name(), "FallbackEntry");
+        assert_eq!(fallback.name(), "FixedTimeEntry"); // Returns inner strategy name
     }
 
     // ============================================================
@@ -2335,8 +2358,8 @@ mod tests {
         let config = EntryStrategyConfig::fixed_time(0.5).with_fallback(2);
         let strategy = create_entry_strategy(&config);
 
-        // Should be a FallbackEntry wrapping FixedTimeEntry
-        assert_eq!(strategy.name(), "FallbackEntry");
+        // FallbackEntry returns inner strategy name
+        assert_eq!(strategy.name(), "FixedTimeEntry");
     }
 
     #[test]
@@ -2352,7 +2375,8 @@ mod tests {
         let config = EntryStrategyConfig::edge_threshold(dec!(0.05)).with_fallback(3);
         let strategy = create_entry_strategy(&config);
 
-        assert_eq!(strategy.name(), "FallbackEntry");
+        // FallbackEntry returns inner strategy name
+        assert_eq!(strategy.name(), "EdgeThresholdEntry");
     }
 
     #[test]

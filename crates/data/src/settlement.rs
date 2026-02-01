@@ -242,14 +242,34 @@ impl SettlementService {
         let mut results = Vec::new();
 
         for trade in &pending {
-            // Calculate window boundaries (for logging/tracking purposes)
-            let _window_start = calculate_window_start(trade.timestamp, self.window_minutes);
-            let _window_end = calculate_window_end(trade.timestamp, self.window_minutes);
+            // Calculate window boundaries
+            let window_start = calculate_window_start(trade.timestamp, self.window_minutes);
+            let window_end = calculate_window_end(trade.timestamp, self.window_minutes);
 
-            // For simplified settlement, use current price
-            // In production, track prices at exact boundaries
-            let start_price = current_price; // Approximation
-            let end_price = current_price; // Approximation
+            // Use the captured window start price if available, otherwise warn
+            let start_price = if let Some(captured_start) = trade.btc_price_window_start {
+                captured_start
+            } else {
+                tracing::warn!(
+                    trade_id = trade.id,
+                    window_start = %window_start,
+                    "No window start price captured, using current price (inaccurate)"
+                );
+                current_price
+            };
+
+            // Use current price as end price (we're settling just after window ended)
+            let end_price = current_price;
+
+            tracing::debug!(
+                trade_id = trade.id,
+                window_start = %window_start,
+                window_end = %window_end,
+                start_price = %start_price,
+                end_price = %end_price,
+                price_change = %(end_price - start_price),
+                "Settlement prices"
+            );
 
             // Settle the trade
             let result = self.settle_trade(trade, start_price, end_price, fee_rate);
