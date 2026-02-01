@@ -144,6 +144,12 @@ pub struct PolymarketPaperTradeArgs {
     #[arg(long, default_value = "10")]
     pub entry_poll_secs: u64,
 
+    /// Maximum signal age in minutes before rejecting entry (0 to disable)
+    /// Cascade signals become stale as the initial move may have already played out.
+    /// Recommended: 3-4 minutes for 15-minute windows.
+    #[arg(long, default_value = "4")]
+    pub max_signal_age_mins: i64,
+
     // =========================================================================
     // Real Signal Arguments
     // =========================================================================
@@ -544,6 +550,8 @@ pub struct PendingEntry {
     pub traded: bool,
     /// BTC price when the signal was detected (approximates window start price).
     pub btc_price_at_signal: Option<Decimal>,
+    /// When the signal was detected (for staleness checking).
+    pub signal_detected_at: DateTime<Utc>,
 }
 
 impl PendingEntry {
@@ -556,6 +564,7 @@ impl PendingEntry {
         estimated_prob: Decimal,
         window_start: DateTime<Utc>,
         window_end: DateTime<Utc>,
+        signal_detected_at: DateTime<Utc>,
     ) -> Self {
         Self {
             market,
@@ -566,6 +575,7 @@ impl PendingEntry {
             window_end,
             traded: false,
             btc_price_at_signal: None,
+            signal_detected_at,
         }
     }
 
@@ -586,6 +596,22 @@ impl PendingEntry {
     #[must_use]
     pub fn current_offset(&self, now: DateTime<Utc>) -> chrono::Duration {
         now - self.window_start
+    }
+
+    /// Returns the age of the signal (time since detection).
+    #[must_use]
+    pub fn signal_age(&self, now: DateTime<Utc>) -> chrono::Duration {
+        now - self.signal_detected_at
+    }
+
+    /// Returns true if the signal is too old based on the max age.
+    /// A stale signal indicates the initial move may have already played out.
+    #[must_use]
+    pub fn is_signal_stale(&self, now: DateTime<Utc>, max_age_mins: i64) -> bool {
+        if max_age_mins <= 0 {
+            return false; // Disabled
+        }
+        self.signal_age(now).num_minutes() >= max_age_mins
     }
 
     /// Creates an EntryContext for strategy evaluation.
@@ -1283,9 +1309,10 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     let window_timer = WindowTimer::new(args.window_minutes, args.entry_cutoff_mins);
 
     tracing::info!(
-        "Window timing: {}m windows, {}m entry cutoff (settle at :00/:15/:30/:45)",
+        "Window timing: {}m windows, {}m entry cutoff, {}m max signal age (settle at :00/:15/:30/:45)",
         args.window_minutes,
-        args.entry_cutoff_mins
+        args.entry_cutoff_mins,
+        args.max_signal_age_mins
     );
 
     // Create settlement service
@@ -1332,6 +1359,7 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     let executor_clone = executor.clone();
     let signal_type = args.signal.clone();
 
+    let max_signal_age_mins = args.max_signal_age_mins;
     let trading_handle = tokio::spawn(async move {
         let ctx = TradingLoopContext {
             executor: executor_clone,
@@ -1350,6 +1378,7 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
             window_duration,
             entry_fee_rate,
             composite_config,
+            max_signal_age_mins,
         };
         run_trading_loop(ctx).await
     });
@@ -1413,6 +1442,8 @@ struct TradingLoopContext {
     entry_fee_rate: Decimal,
     /// Composite signal configuration for multi-signal voting
     composite_config: CompositeSignalConfig,
+    /// Maximum signal age in minutes before rejecting entry (0 to disable)
+    max_signal_age_mins: i64,
 }
 
 /// Main trading loop that polls for opportunities and executes trades.
@@ -1434,6 +1465,7 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
         window_duration,
         entry_fee_rate,
         composite_config,
+        max_signal_age_mins,
     } = ctx;
 
     // Use faster polling when we have pending entries, slower otherwise
@@ -1657,6 +1689,7 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
                 estimated_prob,
                 current_window.start,
                 current_window.end,
+                now, // Track when signal was detected for staleness checking
             );
             if let Some(price) = btc_price_at_signal {
                 pending = pending.with_btc_price(price);
@@ -1669,6 +1702,7 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
                 window_start = %current_window.start.format("%H:%M"),
                 window_end = %current_window.end.format("%H:%M"),
                 btc_price = ?btc_price_at_signal,
+                signal_detected_at = %now.format("%H:%M:%S"),
                 "Created pending entry - waiting for entry strategy"
             );
 
@@ -1694,6 +1728,21 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
                     signal_strength = pending.signal_strength,
                     direction = if pending.signal_direction { "Yes" } else { "No" },
                     "Pending entry EXPIRED without trading - entry conditions not met"
+                );
+                entries_to_remove.push(*window_start);
+                continue;
+            }
+
+            // Check if signal is too old (cascade move may have already played out)
+            if pending.is_signal_stale(now, max_signal_age_mins) {
+                let signal_age_mins = pending.signal_age(now).num_minutes();
+                tracing::info!(
+                    window_start = %window_start.format("%H:%M"),
+                    signal_age_mins = signal_age_mins,
+                    max_age_mins = max_signal_age_mins,
+                    signal_strength = pending.signal_strength,
+                    direction = if pending.signal_direction { "Yes" } else { "No" },
+                    "Signal too stale - initial move likely played out, skipping entry"
                 );
                 entries_to_remove.push(*window_start);
                 continue;
@@ -2027,6 +2076,7 @@ mod tests {
             window_minutes: 15,
             entry_cutoff_mins: 2,
             entry_poll_secs: 10,
+            max_signal_age_mins: 4,
             // Signal config defaults
             use_simulated_signals: true,
             signal_mode: "cascade".to_string(),
@@ -2874,6 +2924,7 @@ mod tests {
                 liquidation_symbol: "ETHUSDT".to_string(),
                 liquidation_exchange: "bybit".to_string(),
                 entry_cutoff_mins: 2,
+                max_signal_age_mins: 4,
                 // Composite signal config
                 enable_composite: false,
                 min_signals_agree: 2,
@@ -2919,6 +2970,7 @@ mod tests {
                 entry_fallback_mins: 2,
                 window_minutes: 15,
                 entry_poll_secs: 10,
+                max_signal_age_mins: 4,
                 // Use simulated signals
                 use_simulated_signals: true,
                 signal_mode: "cascade".to_string(),
@@ -3088,6 +3140,7 @@ mod tests {
                 entry_fallback_mins: 2,
                 window_minutes: 15,
                 entry_poll_secs: 10,
+                max_signal_age_mins: 4,
                 use_simulated_signals: false,
                 signal_mode: "cascade".to_string(),
                 min_volume_usd: 150000.0,
