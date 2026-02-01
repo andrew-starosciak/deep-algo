@@ -11,6 +11,7 @@ pub mod data_status;
 pub mod entry_strategy_sim;
 pub mod polymarket_paper_trade;
 pub mod validate_signals;
+pub mod window_timing;
 
 pub use backfill_funding::{run_backfill_funding, BackfillFundingArgs};
 pub use backfill_ohlcv::{run_backfill_ohlcv, BackfillOhlcvArgs};

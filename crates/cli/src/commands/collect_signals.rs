@@ -273,9 +273,9 @@ impl HealthStats {
 /// Returns an error if database connection fails or collectors cannot start.
 pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
     use algo_trade_data::{
-        FundingRateRecord, FundingRateRepository, LiquidationRecord, LiquidationRepository,
-        NewsEventRecord, NewsEventRepository, OrderBookRepository, OrderBookSnapshotRecord,
-        PolymarketOddsRecord, PolymarketOddsRepository,
+        FundingRateRecord, FundingRateRepository, LiquidationAggregateRecord, LiquidationRecord,
+        LiquidationRepository, NewsEventRecord, NewsEventRepository, OrderBookRepository,
+        OrderBookSnapshotRecord, PolymarketOddsRecord, PolymarketOddsRepository,
     };
     use algo_trade_polymarket::{OddsCollector, OddsCollectorConfig, PolymarketClient};
     use algo_trade_signals::{
@@ -381,25 +381,47 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
 
             Source::Liquidations => {
                 let (tx, rx) = mpsc::channel::<LiquidationRecord>(CHANNEL_SIZE);
-                let config = LiquidationCollectorConfig::for_symbol(&args.symbol);
+                let (agg_tx, agg_rx) =
+                    mpsc::channel::<LiquidationAggregateRecord>(CHANNEL_SIZE);
+                let config = LiquidationCollectorConfig::for_symbol(&args.symbol)
+                    .with_aggregate_interval(Duration::from_secs(60)); // Emit aggregates every 60s
                 let shutdown = shutdown.clone();
+                let shutdown_agg = shutdown.clone();
                 let health = health_stats.clone();
+                let health_agg = health_stats.clone();
 
-                // Spawn collector
-                let mut collector = LiquidationCollector::new(config, tx);
+                // Spawn collector with aggregate channel
+                let mut collector = LiquidationCollector::new(config, tx)
+                    .with_aggregate_channel(agg_tx);
                 handles.push(tokio::spawn(async move {
                     if let Err(e) = collector.run().await {
                         tracing::error!("Liquidation collector error: {}", e);
                     }
                 }));
 
-                // Spawn database writer
+                // Spawn database writer for individual liquidations
                 let repo = liquidation_repo.clone();
                 handles.push(tokio::spawn(async move {
                     run_database_writer(rx, repo, shutdown, health, Source::Liquidations).await;
                 }));
 
-                tracing::info!("Started Liquidation collector for {}", args.symbol);
+                // Spawn database writer for aggregates
+                let repo_agg = liquidation_repo.clone();
+                handles.push(tokio::spawn(async move {
+                    run_database_writer(
+                        agg_rx,
+                        repo_agg,
+                        shutdown_agg,
+                        health_agg,
+                        Source::Liquidations,
+                    )
+                    .await;
+                }));
+
+                tracing::info!(
+                    "Started Liquidation collector for {} (with aggregate persistence)",
+                    args.symbol
+                );
             }
 
             Source::Polymarket => {
@@ -544,6 +566,18 @@ impl BatchInsert<algo_trade_data::FundingRateRecord> for algo_trade_data::Fundin
 impl BatchInsert<algo_trade_data::LiquidationRecord> for algo_trade_data::LiquidationRepository {
     async fn insert_batch(&self, records: &[algo_trade_data::LiquidationRecord]) -> Result<()> {
         self.insert_events_batch(records).await
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchInsert<algo_trade_data::LiquidationAggregateRecord>
+    for algo_trade_data::LiquidationRepository
+{
+    async fn insert_batch(
+        &self,
+        records: &[algo_trade_data::LiquidationAggregateRecord],
+    ) -> Result<()> {
+        self.insert_aggregates_batch(records).await
     }
 }
 

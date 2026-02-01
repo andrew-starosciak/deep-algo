@@ -11,8 +11,8 @@ use rust_decimal_macros::dec;
 use tracing::info;
 
 use algo_trade_backtest::binary::{
-    BetDirection, EdgeThresholdEntry, EntryContext, EntryDecision, EntryStrategy,
-    FixedTimeEntry, PricePath, PricePoint,
+    BetDirection, EdgeThresholdEntry, EntryContext, EntryDecision, EntryStrategy, FixedTimeEntry,
+    PricePath, PricePoint,
 };
 use algo_trade_data::{OhlcvRecord, OhlcvRepository, SignalSnapshotRepository};
 
@@ -70,6 +70,7 @@ pub struct EntryStrategySimArgs {
 
 /// Entry strategy comparison result for a single window.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct WindowResult {
     timestamp: DateTime<Utc>,
     signal_direction: BetDirection,
@@ -82,6 +83,7 @@ struct WindowResult {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct StrategyWindowResult {
     strategy_name: String,
     entered: bool,
@@ -94,6 +96,7 @@ struct StrategyWindowResult {
 
 /// Aggregate statistics across all windows.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct AggregateStats {
     strategy_name: String,
     total_windows: usize,
@@ -146,10 +149,7 @@ pub async fn run_entry_strategy_sim(args: EntryStrategySimArgs) -> Result<()> {
     let min_strength = Decimal::try_from(args.min_strength)?;
     let filtered_signals: Vec<_> = signals
         .into_iter()
-        .filter(|s| {
-            s.strength >= min_strength
-                && (s.direction == "up" || s.direction == "down")
-        })
+        .filter(|s| s.strength >= min_strength && (s.direction == "up" || s.direction == "down"))
         .collect();
 
     info!(
@@ -261,7 +261,7 @@ pub async fn run_entry_strategy_sim(args: EntryStrategySimArgs) -> Result<()> {
                 result.entry_price.map(|ep| {
                     match direction {
                         BetDirection::Yes => price_path.open_price - ep, // Lower entry = better for Yes
-                        BetDirection::No => ep - price_path.open_price,  // Higher entry = better for No
+                        BetDirection::No => ep - price_path.open_price, // Higher entry = better for No
                     }
                 })
             } else {
@@ -464,11 +464,7 @@ fn compute_aggregate_stats(
 }
 
 /// Print simulation results.
-fn print_results(
-    results: &[WindowResult],
-    stats: &[AggregateStats],
-    args: &EntryStrategySimArgs,
-) {
+fn print_results(results: &[WindowResult], stats: &[AggregateStats], args: &EntryStrategySimArgs) {
     println!();
     println!("===============================================================");
     println!("              ENTRY STRATEGY SIMULATION RESULTS                ");
@@ -517,10 +513,10 @@ fn print_results(
                 best_edge = Some((stat.strategy_name.clone(), edge));
             }
         }
-        if stat.windows_entered > 0 {
-            if best_win_rate.is_none() || stat.win_rate > best_win_rate.as_ref().unwrap().1 {
-                best_win_rate = Some((stat.strategy_name.clone(), stat.win_rate));
-            }
+        if stat.windows_entered > 0
+            && (best_win_rate.is_none() || stat.win_rate > best_win_rate.as_ref().unwrap().1)
+        {
+            best_win_rate = Some((stat.strategy_name.clone(), stat.win_rate));
         }
     }
 
@@ -529,11 +525,7 @@ fn print_results(
     println!("---------------------------------------------------------------");
 
     if let Some((name, edge)) = best_edge {
-        println!(
-            "Highest Avg Edge:    {} ({:.2}%)",
-            name,
-            edge * dec!(100)
-        );
+        println!("Highest Avg Edge:    {} ({:.2}%)", name, edge * dec!(100));
     }
 
     if let Some((name, wr)) = best_win_rate {
@@ -563,9 +555,9 @@ fn print_results(
         }
 
         println!(
-            "Trade-off: {} entry rate vs {} entry rate",
-            format!("{:.0}%", imm.entry_rate * 100.0),
-            format!("{:.0}%", thresh.entry_rate * 100.0),
+            "Trade-off: {:.0}% entry rate vs {:.0}% entry rate",
+            imm.entry_rate * 100.0,
+            thresh.entry_rate * 100.0,
         );
     }
 
@@ -590,18 +582,12 @@ fn print_results(
             "Best balanced strategy: {} (edge * entry rate)",
             best.strategy_name
         );
-        println!(
-            "  - Entry rate: {:.1}%",
-            best.entry_rate * 100.0
-        );
+        println!("  - Entry rate: {:.1}%", best.entry_rate * 100.0);
         println!(
             "  - Avg edge: {:.2}%",
             best.avg_edge_at_entry.unwrap_or(Decimal::ZERO) * dec!(100)
         );
-        println!(
-            "  - Win rate: {:.1}%",
-            best.win_rate * 100.0
-        );
+        println!("  - Win rate: {:.1}%", best.win_rate * 100.0);
     }
 
     println!();

@@ -248,6 +248,8 @@ pub struct SignalContext {
     pub news_events: Option<Vec<NewsEvent>>,
     /// Historical OHLCV candles for momentum analysis (most recent last)
     pub historical_ohlcv: Option<Vec<OhlcvCandle>>,
+    /// 24-hour liquidation aggregate for ratio signal
+    pub liquidation_aggregates_24h: Option<LiquidationAggregate>,
 }
 
 impl SignalContext {
@@ -267,6 +269,7 @@ impl SignalContext {
             liquidation_aggregates: None,
             news_events: None,
             historical_ohlcv: None,
+            liquidation_aggregates_24h: None,
         }
     }
 
@@ -337,6 +340,13 @@ impl SignalContext {
     #[must_use]
     pub fn with_historical_ohlcv(mut self, candles: Vec<OhlcvCandle>) -> Self {
         self.historical_ohlcv = Some(candles);
+        self
+    }
+
+    /// Sets 24-hour liquidation aggregate for ratio signal.
+    #[must_use]
+    pub fn with_liquidation_aggregates_24h(mut self, aggregate: LiquidationAggregate) -> Self {
+        self.liquidation_aggregates_24h = Some(aggregate);
         self
     }
 
