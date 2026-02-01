@@ -1,11 +1,14 @@
-# Hyperliquid Algorithmic Trading System
+# Statistical Trading Engine
 
-A production-grade algorithmic trading system for Hyperliquid exchange, built in Rust with full modularity and backtest-live parity.
+A production-grade algorithmic trading system built in Rust with full modularity and backtest-live parity. Supports Hyperliquid perpetuals and Polymarket binary options.
 
 ## Features
 
 - **Event-Driven Architecture**: Identical code runs in backtesting and live trading
 - **Pluggable Strategies**: Implement `Strategy` trait for custom algorithms
+- **Multi-Signal Composites**: Combine multiple indicators with voting consensus
+- **Polymarket Paper Trading**: Bitcoin 15-minute binary options with real-time signals
+- **Statistical Validation**: Wilson CI, binomial tests, walk-forward optimization
 - **Multi-Tier Storage**: Arrow (hot), TimescaleDB (warm), Parquet (cold)
 - **Web API**: Axum-based REST + WebSocket for real-time control
 - **Bot Orchestration**: Actor-pattern multi-bot coordination with Tokio
@@ -17,7 +20,8 @@ A production-grade algorithmic trading system for Hyperliquid exchange, built in
 
 - Rust 1.75+ (2021 edition)
 - PostgreSQL with TimescaleDB extension
-- Hyperliquid API access
+- Hyperliquid API access (for perpetuals trading)
+- Polygon RPC endpoint (optional, for Chainlink settlement - uses public endpoint by default)
 
 ### Installation
 
@@ -136,6 +140,98 @@ just backtest BTC ma_crossover
 cargo run -p algo-trade-cli -- backtest \
   --data data/btc_jan2025.csv \
   --strategy ma_crossover
+```
+
+### Polymarket Paper Trading
+
+Paper trade Bitcoin 15-minute binary options on Polymarket using real-time signals.
+
+#### Quick Start
+
+```bash
+# Start paper trading with default settings (liquidation cascade signal)
+./scripts/start-polymarket-bot.sh --duration 24h
+```
+
+This starts:
+1. Data collectors (liquidations, funding rates)
+2. Polymarket odds collector
+3. Paper trading bot with edge-threshold entry strategy
+
+#### Multi-Signal Composite Mode
+
+Based on research findings, use multiple signals with voting for higher conviction trades:
+
+```bash
+# Require 2+ signals to agree before trading
+./scripts/start-polymarket-bot.sh --duration 24h \
+    --composite \
+    --min-signals-agree 2 \
+    --enable-orderbook \
+    --enable-funding \
+    --enable-liq-ratio
+```
+
+**Available Signals:**
+| Signal | Flag | Description |
+|--------|------|-------------|
+| Liquidation Cascade | (always on) | Detects momentum from large liquidation events |
+| Order Book Imbalance | `--enable-orderbook` | Bid/ask wall detection for support/resistance |
+| Funding Rate Percentile | `--enable-funding` | Compares to 30-day history (top/bottom 20%) |
+| Liquidation Ratio | `--enable-liq-ratio` | 24h long vs short liquidation ratio |
+
+#### Configuration Options
+
+```bash
+./scripts/start-polymarket-bot.sh --help
+
+# Key options:
+--duration <time>         # Trading duration (default: 24h)
+--signal-mode <mode>      # cascade|exhaustion|combined (default: cascade)
+--min-signal-strength <n> # Minimum signal strength 0.0-1.0 (default: 0.6)
+--min-edge <n>            # Minimum edge threshold (default: 0.03)
+--max-price <n>           # Max price for decent odds (default: 0.55)
+--kelly-fraction <n>      # Kelly fraction for sizing (default: 0.25)
+--entry-strategy <s>      # immediate|fixed_time|edge_threshold (default: edge_threshold)
+--max-signal-age-mins <n> # Max signal age before rejection (default: 4, 0 to disable)
+--bankroll <n>            # Starting bankroll (default: 10000)
+--simulated               # Use simulated signals for testing
+```
+
+#### Signal Age Constraint
+
+Liquidation cascades cause rapid price moves that may retrace before the 15-minute window settles. The `--max-signal-age-mins` flag prevents entering trades on stale signals where the initial momentum move has likely already played out.
+
+```
+Window: 14:00 - 14:15
+[0-2 min]  CASCADE detected - trade with full confidence
+[2-4 min]  TRANSITION - still tradeable (within default 4-min threshold)
+[4+ min]   STALE - signal rejected, initial move likely played out
+```
+
+Adjust based on your risk tolerance:
+- `--max-signal-age-mins 3` - More aggressive, fewer but fresher trades
+- `--max-signal-age-mins 5` - More permissive, captures more signals
+- `--max-signal-age-mins 0` - Disabled (not recommended for cascade mode)
+
+#### How It Works
+
+1. **Signal Generation**: Monitors liquidation data, funding rates, and order books
+2. **Composite Voting**: When `--composite` enabled, requires N signals to agree on direction
+3. **Entry Strategy**: Waits for favorable edge before entering (edge_threshold mode)
+4. **Position Sizing**: Uses Kelly criterion with configurable fraction
+5. **Settlement**: Tracks outcomes via Chainlink BTC/USD price feed on Polygon
+
+#### Example Output
+
+```
+Paper trading config: signal=composite, mode=real (Cascade) from BTCUSDT/binance
+Composite mode: require 2 signals to agree (orderbook=true, funding=true, liq_ratio=true)
+Entry strategy: edge_threshold (poll every 10s)
+
+Composite signal fired: direction=Up, strength=0.72, signals_agreed=2
+Entry strategy triggered - executing trade: edge=0.058
+Paper trade stored: market_id=btc-15min, entry_offset_mins=7
 ```
 
 ### Web API Only
@@ -367,11 +463,13 @@ DOCKER_BUILDKIT=1 docker compose build --no-cache
 ### Workspace Crates
 
 - **core**: Event types, traits, trading engine
+- **signals**: Signal generators (order book, funding, liquidations, news)
 - **exchange-hyperliquid**: Hyperliquid REST/WebSocket integration
+- **exchange-polymarket**: Polymarket CLOB integration
 - **data**: TimescaleDB, Arrow, Parquet storage
 - **strategy**: Strategy implementations (MA crossover, RSI, etc.)
 - **execution**: Order management and execution
-- **backtest**: Historical simulation with performance metrics
+- **backtest**: Historical simulation with binary metrics
 - **bot-orchestrator**: Multi-bot actor-pattern coordination
 - **web-api**: Axum REST + WebSocket API
 - **cli**: Command-line interface

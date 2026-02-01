@@ -386,9 +386,98 @@ else
 fi
 
 # =============================================================================
-# SECTION 7: SIGNAL VALIDATION STATUS
+# SECTION 7: SIGNAL TIMING ANALYSIS
 # =============================================================================
-print_header "7. SIGNAL VALIDATION STATUS"
+print_header "7. SIGNAL TIMING ANALYSIS"
+
+echo -e "${BOLD}Entry Offset Analysis:${NC}"
+echo "How long after signal detection did we enter trades?"
+echo ""
+
+TIMING_DATA=$(run_sql "SELECT COUNT(*) FROM paper_trades WHERE status = 'settled' AND created_at IS NOT NULL;")
+if [ "$TIMING_DATA" -gt 0 ]; then
+    run_sql_pretty "
+    SELECT
+        CASE
+            WHEN EXTRACT(EPOCH FROM (created_at - timestamp))/60 < 2 THEN '0-2 min (Fresh)'
+            WHEN EXTRACT(EPOCH FROM (created_at - timestamp))/60 < 4 THEN '2-4 min (Good)'
+            WHEN EXTRACT(EPOCH FROM (created_at - timestamp))/60 < 6 THEN '4-6 min (Marginal)'
+            ELSE '6+ min (Stale)'
+        END as entry_delay,
+        COUNT(*) as trades,
+        SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
+        ROUND(100.0 * SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as win_rate_pct,
+        SUM(pnl)::numeric(10,2) as total_pnl
+    FROM paper_trades
+    WHERE status = 'settled'
+      AND created_at IS NOT NULL
+      AND timestamp IS NOT NULL
+    GROUP BY 1
+    ORDER BY 1;
+    "
+
+    # Compare fresh vs stale signal performance
+    FRESH_WINRATE=$(run_sql "
+    SELECT ROUND(100.0 * SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1)
+    FROM paper_trades
+    WHERE status = 'settled'
+      AND EXTRACT(EPOCH FROM (created_at - timestamp))/60 < 4;
+    " | tr -d ' ')
+
+    STALE_WINRATE=$(run_sql "
+    SELECT ROUND(100.0 * SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1)
+    FROM paper_trades
+    WHERE status = 'settled'
+      AND EXTRACT(EPOCH FROM (created_at - timestamp))/60 >= 4;
+    " | tr -d ' ')
+
+    echo ""
+    echo -e "${BOLD}Signal Freshness Insights:${NC}"
+
+    if [ -n "$FRESH_WINRATE" ] && [ "$FRESH_WINRATE" != "" ]; then
+        print_insight "Fresh signals (<4 min) win rate: ${FRESH_WINRATE}%"
+    fi
+    if [ -n "$STALE_WINRATE" ] && [ "$STALE_WINRATE" != "" ]; then
+        print_insight "Stale signals (4+ min) win rate: ${STALE_WINRATE}%"
+    fi
+
+    if [ -n "$FRESH_WINRATE" ] && [ -n "$STALE_WINRATE" ] && [ "$FRESH_WINRATE" != "" ] && [ "$STALE_WINRATE" != "" ]; then
+        if awk "BEGIN {exit !($FRESH_WINRATE > $STALE_WINRATE + 10)}"; then
+            print_recommendation "Fresh signals outperform stale - keep max_signal_age_mins at 4 or lower"
+        elif awk "BEGIN {exit !($STALE_WINRATE > $FRESH_WINRATE + 10)}"; then
+            print_warning "Stale signals outperforming fresh - may indicate exhaustion pattern, consider --signal-mode exhaustion"
+        else
+            print_insight "Signal freshness has minimal impact - timing is not the key factor"
+        fi
+    fi
+
+    # Window position analysis
+    echo ""
+    echo -e "${BOLD}Entry Position in Window:${NC}"
+    echo "When during the 15-min window did we enter?"
+    run_sql_pretty "
+    SELECT
+        CASE
+            WHEN EXTRACT(MINUTE FROM created_at) % 15 < 5 THEN '0-5 min (Early)'
+            WHEN EXTRACT(MINUTE FROM created_at) % 15 < 10 THEN '5-10 min (Mid)'
+            ELSE '10-15 min (Late)'
+        END as window_position,
+        COUNT(*) as trades,
+        SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) as wins,
+        ROUND(100.0 * SUM(CASE WHEN outcome = 'win' THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0), 1) as win_rate_pct
+    FROM paper_trades
+    WHERE status = 'settled'
+    GROUP BY 1
+    ORDER BY 1;
+    "
+else
+    echo -e "${YELLOW}No timing data available yet.${NC}"
+fi
+
+# =============================================================================
+# SECTION 8: SIGNAL VALIDATION STATUS
+# =============================================================================
+print_header "8. SIGNAL VALIDATION STATUS"
 
 echo -e "${BOLD}Running signal validation...${NC}"
 echo ""
@@ -403,9 +492,9 @@ VALIDATION_OUTPUT=$(cargo run -p algo-trade-cli --quiet -- validate-signals \
 echo "$VALIDATION_OUTPUT" | grep -E "(APPROVED|CONDITIONAL|REJECTED|NEEDS|>>> GO|>>> NO-GO|Signals by)" || echo "Validation completed"
 
 # =============================================================================
-# SECTION 8: RECOMMENDATIONS
+# SECTION 9: RECOMMENDATIONS
 # =============================================================================
-print_header "8. RECOMMENDATIONS"
+print_header "9. RECOMMENDATIONS"
 
 echo ""
 echo -e "${BOLD}Based on the analysis:${NC}"
@@ -447,9 +536,9 @@ if [ "$LIQ_COUNT" -lt 10 ]; then
 fi
 
 # =============================================================================
-# SECTION 9: SUGGESTED NEXT ACTIONS
+# SECTION 10: SUGGESTED NEXT ACTIONS
 # =============================================================================
-print_header "9. NEXT ACTIONS CHECKLIST"
+print_header "10. NEXT ACTIONS CHECKLIST"
 
 echo ""
 echo "  [ ] Review any losing trades for patterns"
