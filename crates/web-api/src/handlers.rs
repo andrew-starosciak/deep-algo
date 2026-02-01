@@ -59,6 +59,14 @@ pub async fn create_bot(
         paper_slippage_bps: 10.0,
         paper_commission_rate: 0.00025,
         wallet: None,
+        // Microstructure bridge (disabled by default for web API)
+        microstructure_enabled: false,
+        microstructure_entry_filter_threshold: 0.6,
+        microstructure_exit_liquidation_threshold: 0.8,
+        microstructure_exit_funding_threshold: 0.9,
+        microstructure_stress_size_multiplier: 0.5,
+        microstructure_entry_timing_enabled: false,
+        microstructure_timing_support_threshold: 0.3,
     };
 
     registry

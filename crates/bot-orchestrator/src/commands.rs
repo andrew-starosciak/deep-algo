@@ -63,6 +63,55 @@ pub struct BotConfig {
     // Wallet configuration (loaded from env vars at runtime, not serialized)
     #[serde(skip)]
     pub wallet: Option<WalletConfig>,
+
+    // Microstructure bridge configuration
+    /// Enable microstructure signal filtering for strategy
+    #[serde(default)]
+    pub microstructure_enabled: bool,
+
+    /// Entry filter: block entries when microstructure conflicts (0.0 to 1.0)
+    #[serde(default = "default_entry_filter_threshold")]
+    pub microstructure_entry_filter_threshold: f64,
+
+    /// Exit trigger: force exit on liquidation cascade (0.0 to 1.0)
+    #[serde(default = "default_exit_liquidation_threshold")]
+    pub microstructure_exit_liquidation_threshold: f64,
+
+    /// Exit trigger: force exit on extreme funding (0.0 to 1.0)
+    #[serde(default = "default_exit_funding_threshold")]
+    pub microstructure_exit_funding_threshold: f64,
+
+    /// Sizing adjustment: reduce size under stress (0.0 to 1.0)
+    #[serde(default = "default_stress_size_multiplier")]
+    pub microstructure_stress_size_multiplier: f64,
+
+    /// Enable entry timing based on order book support
+    #[serde(default)]
+    pub microstructure_entry_timing_enabled: bool,
+
+    /// Entry timing: minimum order book support threshold (0.0 to 1.0)
+    #[serde(default = "default_timing_support_threshold")]
+    pub microstructure_timing_support_threshold: f64,
+}
+
+const fn default_entry_filter_threshold() -> f64 {
+    0.6
+}
+
+const fn default_exit_liquidation_threshold() -> f64 {
+    0.8
+}
+
+const fn default_exit_funding_threshold() -> f64 {
+    0.9
+}
+
+const fn default_stress_size_multiplier() -> f64 {
+    0.5
+}
+
+const fn default_timing_support_threshold() -> f64 {
+    0.3
 }
 
 fn default_initial_capital() -> Decimal {

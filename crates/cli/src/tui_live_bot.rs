@@ -609,6 +609,14 @@ async fn create_bot(app: &App, token: &str) -> Result<String> {
         paper_slippage_bps: 10.0,
         paper_commission_rate: 0.00025,
         wallet: None, // Loaded from env at runtime
+        // Microstructure bridge (disabled by default in TUI)
+        microstructure_enabled: false,
+        microstructure_entry_filter_threshold: 0.6,
+        microstructure_exit_liquidation_threshold: 0.8,
+        microstructure_exit_funding_threshold: 0.9,
+        microstructure_stress_size_multiplier: 0.5,
+        microstructure_entry_timing_enabled: false,
+        microstructure_timing_support_threshold: 0.3,
     };
 
     app.registry.spawn_bot(config).await?;

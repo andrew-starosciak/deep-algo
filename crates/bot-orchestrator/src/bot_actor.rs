@@ -3,12 +3,15 @@ use crate::events::{BotEvent, EnhancedBotStatus};
 use crate::execution_wrapper::ExecutionHandlerWrapper;
 use algo_trade_core::TradingSystem;
 use algo_trade_hyperliquid::{HyperliquidClient, LiveDataProvider, PaperTradingExecutionHandler};
-use algo_trade_strategy::{create_strategy, SimpleRiskManager};
+use algo_trade_signals::bridge::{
+    CachedMicroSignals, MicrostructureFilterConfig, OrchestratorCommand,
+};
+use algo_trade_strategy::{create_strategy_with_bridge, BridgeConfig, SimpleRiskManager};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, RwLock};
 
 pub struct BotActor {
     config: BotConfig,
@@ -21,6 +24,9 @@ pub struct BotActor {
     event_tx: broadcast::Sender<BotEvent>,
     status_tx: watch::Sender<EnhancedBotStatus>,
     recent_events: VecDeque<BotEvent>,
+
+    // Microstructure bridge (optional)
+    orchestrator_tx: Option<mpsc::Sender<OrchestratorCommand>>,
 }
 
 impl BotActor {
@@ -44,6 +50,7 @@ impl BotActor {
             event_tx,
             status_tx,
             recent_events: VecDeque::with_capacity(10),
+            orchestrator_tx: None,
         }
     }
 
@@ -125,13 +132,70 @@ impl BotActor {
             }
         };
 
-        // Create strategy
-        let strategy = create_strategy(
-            &self.config.strategy,
-            self.config.symbol.clone(),
-            self.config.strategy_config.clone(),
-        )
-        .context("Failed to create strategy")?;
+        // Create strategy (with optional microstructure bridge)
+        let (strategy, orchestrator_tx) = if self.config.microstructure_enabled {
+            tracing::info!(
+                "Bot {} enabling microstructure bridge with entry_filter={:.2}, exit_liq={:.2}, exit_funding={:.2}",
+                self.config.bot_id,
+                self.config.microstructure_entry_filter_threshold,
+                self.config.microstructure_exit_liquidation_threshold,
+                self.config.microstructure_exit_funding_threshold,
+            );
+
+            // Create shared signal cache
+            let signals = Arc::new(RwLock::new(CachedMicroSignals::default()));
+
+            // Create filter config from bot config
+            let filter_config = MicrostructureFilterConfig {
+                entry_filter_enabled: true,
+                entry_filter_threshold: self.config.microstructure_entry_filter_threshold,
+                exit_trigger_enabled: true,
+                exit_liquidation_threshold: self.config.microstructure_exit_liquidation_threshold,
+                exit_funding_threshold: self.config.microstructure_exit_funding_threshold,
+                sizing_adjustment_enabled: true,
+                stress_size_multiplier: self.config.microstructure_stress_size_multiplier,
+                entry_timing_enabled: self.config.microstructure_entry_timing_enabled,
+                timing_support_threshold: self.config.microstructure_timing_support_threshold,
+            };
+
+            // Create bridge config
+            let bridge_config = BridgeConfig {
+                signals: signals.clone(),
+                filter_config,
+            };
+
+            // Create strategy with bridge wrapping
+            let strategy = create_strategy_with_bridge(
+                &self.config.strategy,
+                self.config.symbol.clone(),
+                self.config.strategy_config.clone(),
+                Some(bridge_config),
+            )
+            .context("Failed to create strategy with microstructure bridge")?;
+
+            // Spawn orchestrator (TODO: requires database pool - placeholder for now)
+            // For now we just log that orchestrator would be started
+            // The actual implementation requires passing PgPool to BotActor
+            tracing::warn!(
+                "Microstructure orchestrator not yet started - requires database integration"
+            );
+            let orchestrator_tx: Option<mpsc::Sender<OrchestratorCommand>> = None;
+
+            (strategy, orchestrator_tx)
+        } else {
+            // Create strategy without bridge (backwards compatible)
+            let strategy = create_strategy_with_bridge(
+                &self.config.strategy,
+                self.config.symbol.clone(),
+                self.config.strategy_config.clone(),
+                None,
+            )
+            .context("Failed to create strategy")?;
+
+            (strategy, None)
+        };
+
+        self.orchestrator_tx = orchestrator_tx;
 
         // Feed warmup events to strategy to initialize state
         for event in warmup_events {

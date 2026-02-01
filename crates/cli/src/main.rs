@@ -734,6 +734,14 @@ async fn run_backtest_daemon(_config_path: &str, strategy_name: &str) -> anyhow:
         paper_slippage_bps: 10.0,
         paper_commission_rate: 0.00025,
         wallet: None, // Paper trading, no wallet needed
+        // Microstructure bridge (disabled for backtest daemon)
+        microstructure_enabled: false,
+        microstructure_entry_filter_threshold: 0.6,
+        microstructure_exit_liquidation_threshold: 0.8,
+        microstructure_exit_funding_threshold: 0.9,
+        microstructure_stress_size_multiplier: 0.5,
+        microstructure_entry_timing_enabled: false,
+        microstructure_timing_support_threshold: 0.3,
     };
 
     tracing::info!("Initial setup complete");
