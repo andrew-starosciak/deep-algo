@@ -6,11 +6,13 @@
 //! - Repositories for typed database access
 //! - CSV and Parquet storage utilities
 
+pub mod chainlink;
 pub mod csv_storage;
 pub mod database;
 pub mod models;
 pub mod parquet_storage;
 pub mod repositories;
+pub mod settlement;
 
 // Re-export commonly used types
 pub use csv_storage::CsvStorage;
@@ -31,4 +33,13 @@ pub use repositories::{
     BinaryTradeRepository, FundingRateRepository, LiquidationRepository, NewsEventRepository,
     OhlcvRepository, OrderBookRepository, PaperTradeRepository, PaperTradeStatistics,
     PolymarketOddsRepository, Repositories, SignalSnapshotRepository, ValidationStats,
+};
+
+// Re-export Chainlink price feed types
+pub use chainlink::{ChainlinkPriceData, ChainlinkPriceFeed, SettlementResult, WindowPrices};
+
+// Re-export settlement service
+pub use settlement::{
+    calculate_window_end, calculate_window_start, LiveWindowTracker, SettlementService,
+    TradeSettlementResult,
 };
