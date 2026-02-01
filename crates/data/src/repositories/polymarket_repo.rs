@@ -140,7 +140,9 @@ impl PolymarketOddsRepository {
         Ok(record)
     }
 
-    /// Gets the latest odds for all active markets.
+    /// Gets the latest odds for all markets (including expired).
+    ///
+    /// Note: Use `get_active_markets()` instead to filter out expired markets.
     ///
     /// # Errors
     /// Returns an error if the database query fails.
@@ -151,6 +153,29 @@ impl PolymarketOddsRepository {
                 timestamp, market_id, question, outcome_yes_price, outcome_no_price,
                 volume_24h, liquidity, end_date
             FROM polymarket_odds
+            ORDER BY market_id, timestamp DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Gets the latest odds for active (non-expired) markets only.
+    ///
+    /// Filters to markets where `end_date > NOW()` to prevent trading on expired markets.
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails.
+    pub async fn get_active_markets(&self) -> Result<Vec<PolymarketOddsRecord>> {
+        let records = sqlx::query_as::<_, PolymarketOddsRecord>(
+            r#"
+            SELECT DISTINCT ON (market_id)
+                timestamp, market_id, question, outcome_yes_price, outcome_no_price,
+                volume_24h, liquidity, end_date
+            FROM polymarket_odds
+            WHERE end_date IS NOT NULL AND end_date > NOW()
             ORDER BY market_id, timestamp DESC
             "#,
         )

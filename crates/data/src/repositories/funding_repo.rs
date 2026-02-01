@@ -240,6 +240,57 @@ impl FundingRateRepository {
         Ok((percentile, zscore))
     }
 
+    /// Queries 30-day funding rate percentile for a current rate.
+    ///
+    /// Returns the percentile (0.0 to 1.0) of `current_rate` compared to the last 30 days.
+    ///
+    /// # Arguments
+    /// * `symbol` - Trading pair symbol (e.g., "BTCUSDT")
+    /// * `exchange` - Exchange name (e.g., "binance")
+    /// * `current_rate` - Current funding rate to compare
+    /// * `timestamp` - End time for the 30-day window
+    ///
+    /// # Returns
+    /// `Some(percentile)` if sufficient data exists, `None` otherwise.
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails.
+    pub async fn query_30d_percentile(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        current_rate: Decimal,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Option<f64>> {
+        let start = timestamp - chrono::Duration::days(30);
+
+        // Get count of rates <= current and total count
+        let result: Option<(Option<i64>, Option<i64>)> = sqlx::query_as(
+            r#"
+            SELECT
+                COUNT(*) FILTER (WHERE funding_rate <= $4) as count_below,
+                COUNT(*) as total_count
+            FROM funding_rates
+            WHERE symbol = $1 AND exchange = $2
+              AND timestamp >= $3 AND timestamp < $5
+            "#,
+        )
+        .bind(symbol)
+        .bind(exchange)
+        .bind(start)
+        .bind(current_rate)
+        .bind(timestamp)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match result {
+            Some((Some(count_below), Some(total))) if total > 0 => {
+                Ok(Some(count_below as f64 / total as f64))
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Deletes old records before a given timestamp.
     ///
     /// # Errors
@@ -286,6 +337,31 @@ mod tests {
         let json = serde_json::to_string(&record);
         assert!(json.is_ok());
     }
+
+    // Note: query_30d_percentile tests require a running database.
+    // These are documented integration tests that would be run with:
+    // cargo test -p algo-trade-data --test '*' -- --ignored
+    //
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_query_30d_percentile_calculates_correctly() {
+    //     // Setup: Insert 100 funding rates over 30 days
+    //     // Assert: Percentile of median value is ~0.5
+    // }
+    //
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_query_30d_percentile_returns_none_for_empty() {
+    //     // Setup: Empty database
+    //     // Assert: Returns None
+    // }
+    //
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_query_30d_percentile_respects_time_range() {
+    //     // Setup: Insert records inside and outside 30 day window
+    //     // Assert: Only 30 day window records are used
+    // }
 
     #[test]
     fn test_funding_rate_with_statistics() {

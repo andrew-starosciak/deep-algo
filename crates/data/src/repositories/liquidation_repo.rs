@@ -334,6 +334,54 @@ impl LiquidationRepository {
     }
 
     // =========================================================================
+    // 24-Hour Aggregate Query
+    // =========================================================================
+
+    /// Queries 24-hour liquidation aggregate for a symbol.
+    ///
+    /// Returns (long_volume_usd, short_volume_usd) for the 24 hours ending at `timestamp`.
+    ///
+    /// # Arguments
+    /// * `symbol` - Trading pair symbol (e.g., "BTCUSDT")
+    /// * `exchange` - Exchange name (e.g., "binance")
+    /// * `timestamp` - End time for the 24-hour window
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails.
+    pub async fn query_24h_aggregate(
+        &self,
+        symbol: &str,
+        exchange: &str,
+        timestamp: DateTime<Utc>,
+    ) -> Result<(Decimal, Decimal)> {
+        let start = timestamp - chrono::Duration::hours(24);
+
+        let result: Option<(Option<Decimal>, Option<Decimal>)> = sqlx::query_as(
+            r#"
+            SELECT
+                COALESCE(SUM(CASE WHEN side = 'long' THEN usd_value ELSE 0 END), 0) as long_volume,
+                COALESCE(SUM(CASE WHEN side = 'short' THEN usd_value ELSE 0 END), 0) as short_volume
+            FROM liquidations
+            WHERE symbol = $1 AND exchange = $2
+              AND timestamp >= $3 AND timestamp <= $4
+            "#,
+        )
+        .bind(symbol)
+        .bind(exchange)
+        .bind(start)
+        .bind(timestamp)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match result {
+            Some((Some(long_vol), Some(short_vol))) => Ok((long_vol, short_vol)),
+            Some((Some(long_vol), None)) => Ok((long_vol, Decimal::ZERO)),
+            Some((None, Some(short_vol))) => Ok((Decimal::ZERO, short_vol)),
+            _ => Ok((Decimal::ZERO, Decimal::ZERO)),
+        }
+    }
+
+    // =========================================================================
     // Cleanup
     // =========================================================================
 
@@ -425,6 +473,31 @@ mod tests {
         let json = serde_json::to_string(&record);
         assert!(json.is_ok());
     }
+
+    // Note: query_24h_aggregate tests require a running database.
+    // These are documented integration tests that would be run with:
+    // cargo test -p algo-trade-data --test '*' -- --ignored
+    //
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_query_24h_aggregate_sums_correctly() {
+    //     // Setup: Insert liquidation records for last 24h
+    //     // Assert: Long and short volumes are summed correctly
+    // }
+    //
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_query_24h_aggregate_respects_time_range() {
+    //     // Setup: Insert records inside and outside 24h window
+    //     // Assert: Only 24h window records are counted
+    // }
+    //
+    // #[tokio::test]
+    // #[ignore]
+    // async fn test_query_24h_aggregate_returns_zero_for_empty() {
+    //     // Setup: Empty database
+    //     // Assert: Returns (0, 0)
+    // }
 
     #[test]
     fn test_aggregate_from_liquidations() {
