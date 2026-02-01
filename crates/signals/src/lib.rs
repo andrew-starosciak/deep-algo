@@ -1,3 +1,4 @@
+pub mod bridge;
 pub mod collector;
 pub mod common;
 pub mod context_builder;
@@ -41,4 +42,11 @@ pub use validation::{
     analyze_signal_correlation, calculate_ic, calculate_ranks, determine_recommendation,
     test_directional_accuracy, test_return_significance, CorrelationAnalysis, ICAnalysis,
     Recommendation, SignificanceTest, TestType, ValidationReport, ValidationResult,
+};
+
+// Re-export bridge module for strategy enhancement
+pub use bridge::{
+    CachedMicroSignals, EnhancedStrategy, FilterResult, MicrostructureFilter,
+    MicrostructureFilterConfig, MicrostructureOrchestrator, OrchestratorCommand,
+    SharedMicroSignals,
 };
