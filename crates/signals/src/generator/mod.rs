@@ -6,6 +6,7 @@
 mod composite;
 mod funding_rate;
 pub mod liquidation_cascade;
+pub mod liquidation_ratio;
 pub mod momentum;
 pub mod news_signal;
 mod orderbook_imbalance;
@@ -21,6 +22,9 @@ pub use funding_rate::{
 pub use liquidation_cascade::{
     calculate_net_delta, detect_exhaustion, is_cascade, CascadeConfig, ExhaustionConfig,
     ExhaustionSignal, LiquidationCascadeSignal, LiquidationSignalMode,
+};
+pub use liquidation_ratio::{
+    calculate_ratio_signal, LiquidationAggregate24h, LiquidationRatioConfig, LiquidationRatioSignal,
 };
 pub use momentum::{
     detect_big_move, detect_momentum_exhaustion, detect_stall, BigMoveResult,
