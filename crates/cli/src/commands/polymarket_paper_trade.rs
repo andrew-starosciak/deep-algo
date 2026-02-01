@@ -20,7 +20,7 @@
 #![allow(dead_code)]
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use clap::Args;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -32,9 +32,10 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::commands::collect_signals::parse_duration;
+use crate::commands::window_timing::WindowTimer;
 use algo_trade_backtest::{
-    create_entry_strategy, EntryStrategy, EntryStrategyConfig, EntryStrategyType, FeeModel,
-    FeeTier, PolymarketFees,
+    create_entry_strategy, BetDirection, EntryContext, EntryDecision, EntryStrategy,
+    EntryStrategyConfig, EntryStrategyType, FeeModel, FeeTier, PolymarketFees,
 };
 use algo_trade_core::{
     Direction, LiquidationAggregate, SignalContext, SignalGenerator, SignalValue,
@@ -42,9 +43,12 @@ use algo_trade_core::{
 use algo_trade_data::{
     KellyCriterion, LiquidationAggregateRecord, LiquidationRepository, PaperTradeDirection,
     PaperTradeRecord, PaperTradeRepository, PolymarketOddsRecord, PolymarketOddsRepository,
+    SettlementService,
 };
 use algo_trade_signals::{
-    CascadeConfig, ExhaustionConfig, LiquidationCascadeSignal, LiquidationSignalMode,
+    CascadeConfig, CompositeSignal, ExhaustionConfig, FundingPercentileConfig, FundingRateSignal,
+    FundingSignalMode, LiquidationCascadeSignal, LiquidationRatioConfig, LiquidationRatioSignal,
+    LiquidationSignalMode, OrderBookImbalanceSignal,
 };
 
 /// Arguments for the polymarket-paper-trade command.
@@ -73,6 +77,12 @@ pub struct PolymarketPaperTradeArgs {
     /// Minimum edge required to place a bet (0.0 to 1.0)
     #[arg(long, default_value = "0.02")]
     pub min_edge: f64,
+
+    /// Maximum price to buy shares at (0.0 to 1.0)
+    /// Per research: only buy when price <= 0.55 for decent odds (1.82x+ payout)
+    /// At 0.80, payout is only 1.25x which offers poor risk/reward
+    #[arg(long, default_value = "0.55")]
+    pub max_price: f64,
 
     /// Initial bankroll in USD
     #[arg(long, default_value = "10000")]
@@ -121,9 +131,14 @@ pub struct PolymarketPaperTradeArgs {
     #[arg(long, default_value = "2")]
     pub entry_fallback_mins: i64,
 
-    /// Window duration in minutes
+    /// Window duration in minutes (Polymarket BTC settles every 15 mins at :00/:15/:30/:45)
     #[arg(long, default_value = "15")]
     pub window_minutes: i64,
+
+    /// Minimum time remaining in window to enter a trade (minutes)
+    /// Don't enter trades with less than this time before settlement
+    #[arg(long, default_value = "2")]
+    pub entry_cutoff_mins: i64,
 
     /// Entry poll interval in seconds for monitoring entry conditions
     #[arg(long, default_value = "10")]
@@ -132,8 +147,9 @@ pub struct PolymarketPaperTradeArgs {
     // =========================================================================
     // Real Signal Arguments
     // =========================================================================
-    /// Use simulated signals instead of real liquidation data
-    #[arg(long, default_value = "true")]
+    /// Use simulated signals instead of real liquidation data.
+    /// Pass --use-simulated-signals to enable, omit for real signals.
+    #[arg(long, default_value_t = false)]
     pub use_simulated_signals: bool,
 
     /// Signal mode: cascade, exhaustion, or combined
@@ -159,6 +175,41 @@ pub struct PolymarketPaperTradeArgs {
     /// Exchange for liquidation data (e.g., binance)
     #[arg(long, default_value = "binance")]
     pub liquidation_exchange: String,
+
+    // =========================================================================
+    // Composite Signal Arguments
+    // =========================================================================
+    /// Enable composite voting mode (requires multiple signals to agree)
+    #[arg(long, default_value_t = false)]
+    pub enable_composite: bool,
+
+    /// Minimum number of signals that must agree for composite mode (default: 2)
+    #[arg(long, default_value = "2")]
+    pub min_signals_agree: usize,
+
+    /// Include order book imbalance signal in composite
+    #[arg(long, default_value_t = false)]
+    pub enable_orderbook_signal: bool,
+
+    /// Include funding rate percentile signal in composite
+    #[arg(long, default_value_t = false)]
+    pub enable_funding_signal: bool,
+
+    /// Include 24h liquidation ratio signal in composite
+    #[arg(long, default_value_t = false)]
+    pub enable_liq_ratio_signal: bool,
+
+    // =========================================================================
+    // Settlement Arguments
+    // =========================================================================
+    /// Polygon RPC URL for Chainlink price feed settlement.
+    /// Uses public endpoint if not provided (rate-limited).
+    #[arg(long, env = "POLYGON_RPC_URL")]
+    pub polygon_rpc_url: Option<String>,
+
+    /// Settlement fee rate (0.0 to 1.0, e.g., 0.02 for 2%)
+    #[arg(long, default_value = "0.02")]
+    pub settlement_fee_rate: f64,
 }
 
 // =============================================================================
@@ -212,6 +263,63 @@ impl Default for SignalConfig {
             liquidation_symbol: "BTCUSDT".to_string(),
             liquidation_exchange: "binance".to_string(),
         }
+    }
+}
+
+/// Configuration for composite signal mode.
+#[derive(Debug, Clone)]
+pub struct CompositeSignalConfig {
+    /// Whether composite mode is enabled.
+    pub enabled: bool,
+    /// Minimum number of signals that must agree.
+    pub min_signals_agree: usize,
+    /// Enable order book imbalance signal.
+    pub enable_orderbook: bool,
+    /// Enable funding rate percentile signal.
+    pub enable_funding: bool,
+    /// Enable 24h liquidation ratio signal.
+    pub enable_liq_ratio: bool,
+}
+
+impl Default for CompositeSignalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_signals_agree: 2,
+            enable_orderbook: false,
+            enable_funding: false,
+            enable_liq_ratio: false,
+        }
+    }
+}
+
+impl CompositeSignalConfig {
+    /// Creates a CompositeSignalConfig from CLI arguments.
+    #[must_use]
+    pub fn from_args(args: &PolymarketPaperTradeArgs) -> Self {
+        Self {
+            enabled: args.enable_composite,
+            min_signals_agree: args.min_signals_agree.max(1),
+            enable_orderbook: args.enable_orderbook_signal,
+            enable_funding: args.enable_funding_signal,
+            enable_liq_ratio: args.enable_liq_ratio_signal,
+        }
+    }
+
+    /// Returns the number of enabled signals.
+    #[must_use]
+    pub fn enabled_signal_count(&self) -> usize {
+        let mut count = 0;
+        if self.enable_orderbook {
+            count += 1;
+        }
+        if self.enable_funding {
+            count += 1;
+        }
+        if self.enable_liq_ratio {
+            count += 1;
+        }
+        count
     }
 }
 
@@ -284,6 +392,55 @@ pub fn create_liquidation_signal(config: &SignalConfig) -> LiquidationCascadeSig
     }
 
     signal
+}
+
+/// Creates a `CompositeSignal` with the configured generators.
+///
+/// # Arguments
+/// * `composite_config` - Composite signal configuration from CLI args
+///
+/// # Returns
+/// A configured `CompositeSignal` using require_n combination method.
+#[must_use]
+pub fn create_composite_signal(composite_config: &CompositeSignalConfig) -> CompositeSignal {
+    let mut composite =
+        CompositeSignal::require_n("composite_multi_signal", composite_config.min_signals_agree);
+
+    // Add order book imbalance signal
+    if composite_config.enable_orderbook {
+        let orderbook_signal = OrderBookImbalanceSignal::default();
+        composite.add_generator(Box::new(orderbook_signal));
+        tracing::info!("Added order book imbalance signal to composite");
+    }
+
+    // Add funding rate percentile signal
+    if composite_config.enable_funding {
+        let funding_signal = FundingRateSignal::default()
+            .with_percentile_config(FundingPercentileConfig {
+                lookback_periods: 90, // 30 days * 3 periods/day
+                high_threshold: 0.80, // Top 20%
+                low_threshold: 0.20,  // Bottom 20%
+                min_data_points: 30,
+            })
+            .with_signal_mode(FundingSignalMode::Percentile);
+        composite.add_generator(Box::new(funding_signal));
+        tracing::info!("Added funding rate percentile signal to composite");
+    }
+
+    // Add 24h liquidation ratio signal
+    if composite_config.enable_liq_ratio {
+        let liq_ratio_signal = LiquidationRatioSignal::new(LiquidationRatioConfig::default());
+        composite.add_generator(Box::new(liq_ratio_signal));
+        tracing::info!("Added 24h liquidation ratio signal to composite");
+    }
+
+    tracing::info!(
+        "Composite signal created with {} generators, require {} to agree",
+        composite.generator_count(),
+        composite_config.min_signals_agree
+    );
+
+    composite
 }
 
 /// Converts a `Direction` to a (signal_direction, is_directional) tuple.
@@ -365,6 +522,99 @@ pub fn format_signal_log(result: &SignalResult, market_id: &str) -> String {
 }
 
 // =============================================================================
+// Pending Entry Tracking
+// =============================================================================
+
+/// Tracks a pending entry opportunity waiting for optimal timing.
+#[derive(Debug, Clone)]
+pub struct PendingEntry {
+    /// Market data snapshot when signal fired.
+    pub market: PolymarketOddsRecord,
+    /// Signal strength when opportunity was detected.
+    pub signal_strength: f64,
+    /// Signal direction (true = Yes/Up, false = No/Down).
+    pub signal_direction: bool,
+    /// Estimated probability of the predicted outcome.
+    pub estimated_prob: Decimal,
+    /// Window start time.
+    pub window_start: DateTime<Utc>,
+    /// Window end time.
+    pub window_end: DateTime<Utc>,
+    /// Whether we've already placed a trade for this window.
+    pub traded: bool,
+    /// BTC price when the signal was detected (approximates window start price).
+    pub btc_price_at_signal: Option<Decimal>,
+}
+
+impl PendingEntry {
+    /// Creates a new pending entry.
+    #[must_use]
+    pub fn new(
+        market: PolymarketOddsRecord,
+        signal_strength: f64,
+        signal_direction: bool,
+        estimated_prob: Decimal,
+        window_start: DateTime<Utc>,
+        window_end: DateTime<Utc>,
+    ) -> Self {
+        Self {
+            market,
+            signal_strength,
+            signal_direction,
+            estimated_prob,
+            window_start,
+            window_end,
+            traded: false,
+            btc_price_at_signal: None,
+        }
+    }
+
+    /// Sets the BTC price captured when the signal was detected.
+    #[must_use]
+    pub fn with_btc_price(mut self, price: Decimal) -> Self {
+        self.btc_price_at_signal = Some(price);
+        self
+    }
+
+    /// Returns true if this entry opportunity has expired (window ended).
+    #[must_use]
+    pub fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        now >= self.window_end
+    }
+
+    /// Returns the current offset from window start.
+    #[must_use]
+    pub fn current_offset(&self, now: DateTime<Utc>) -> chrono::Duration {
+        now - self.window_start
+    }
+
+    /// Creates an EntryContext for strategy evaluation.
+    #[must_use]
+    pub fn to_entry_context(
+        &self,
+        current_price: Decimal,
+        now: DateTime<Utc>,
+        window_duration: chrono::Duration,
+        fee_rate: Decimal,
+    ) -> EntryContext {
+        let direction = if self.signal_direction {
+            BetDirection::Yes
+        } else {
+            BetDirection::No
+        };
+
+        EntryContext::new(
+            current_price,
+            self.estimated_prob,
+            self.current_offset(now),
+            window_duration,
+            direction,
+            fee_rate,
+        )
+    }
+}
+
+// =============================================================================
 // Decision Engine Configuration
 // =============================================================================
 
@@ -377,6 +627,8 @@ pub struct DecisionEngineConfig {
     pub min_signal_strength: f64,
     /// Minimum edge required.
     pub min_edge: Decimal,
+    /// Maximum price to buy at (for decent odds).
+    pub max_price: Decimal,
     /// Kelly criterion calculator.
     pub kelly: KellyCriterion,
     /// Fee model for fee calculations.
@@ -430,6 +682,7 @@ impl DecisionEngineConfig {
             signal_type: args.signal.clone(),
             min_signal_strength: args.min_signal_strength,
             min_edge: Decimal::try_from(args.min_edge).unwrap_or(dec!(0.02)),
+            max_price: Decimal::try_from(args.max_price).unwrap_or(dec!(0.55)),
             kelly,
             fee_tier,
             use_fixed_stake: args.use_fixed_stake,
@@ -541,6 +794,17 @@ impl DecisionEngine {
         } else {
             (PaperTradeDirection::No, market.outcome_no_price)
         };
+
+        // Check max price (poor odds filter)
+        // Per research: only buy when price <= 0.55 for decent odds (1.82x+ payout)
+        // At price 0.80, payout is only 1.25x which offers poor risk/reward
+        if price > self.config.max_price {
+            let payout = Decimal::ONE / price;
+            return TradeDecision::no_trade(&format!(
+                "Price {:.2} exceeds max {:.2} (payout only {:.2}x, need better odds)",
+                price, self.config.max_price, payout
+            ));
+        }
 
         // Convert signal strength to estimated probability
         // Signal strength of 0.6 means 60% confidence in the direction
@@ -819,7 +1083,7 @@ impl PaperTradeExecutor {
 
         // Create paper trade record
         let estimated_prob = DecisionEngine::signal_to_probability(signal_strength, price);
-        let trade = PaperTradeRecord::new(
+        let mut trade = PaperTradeRecord::new(
             now,
             market.market_id.clone(),
             market.question.clone(),
@@ -837,6 +1101,11 @@ impl PaperTradeExecutor {
             "market_yes_price": market.outcome_yes_price.to_string(),
             "market_no_price": market.outcome_no_price.to_string(),
         }));
+
+        // Store market end_date for proper settlement timing
+        if let Some(end_date) = market.end_date {
+            trade = trade.with_market_end_date(end_date);
+        }
 
         self.engine.record_trade(&market.market_id, now);
         self.trades_count += 1;
@@ -868,6 +1137,18 @@ impl PaperTradeExecutor {
             } else {
                 self.losses += 1;
             }
+        }
+    }
+
+    /// Applies settlement results from the settlement service.
+    ///
+    /// Updates bankroll and win/loss counts based on external settlement.
+    pub fn apply_settlement(&mut self, pnl: Decimal, won: bool) {
+        self.engine.update_bankroll(pnl);
+        if won {
+            self.wins += 1;
+        } else {
+            self.losses += 1;
         }
     }
 
@@ -966,6 +1247,7 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     // Create executor
     let config = DecisionEngineConfig::from_args(&args);
     let signal_config = config.signal_config.clone();
+    let entry_config = config.entry_config.clone();
     let initial_bankroll = Decimal::try_from(args.bankroll).unwrap_or(dec!(10000));
     let executor = Arc::new(Mutex::new(PaperTradeExecutor::new(
         config,
@@ -997,6 +1279,53 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
     // Shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    // Create window timer for Polymarket 15-minute clock alignment
+    let window_timer = WindowTimer::new(args.window_minutes, args.entry_cutoff_mins);
+
+    tracing::info!(
+        "Window timing: {}m windows, {}m entry cutoff (settle at :00/:15/:30/:45)",
+        args.window_minutes,
+        args.entry_cutoff_mins
+    );
+
+    // Create settlement service
+    let settlement_service = if let Some(rpc_url) = args.polygon_rpc_url.clone() {
+        SettlementService::new(rpc_url, args.window_minutes)
+    } else {
+        SettlementService::default_polygon(args.window_minutes)
+    };
+    let settlement_fee_rate = Decimal::try_from(args.settlement_fee_rate).unwrap_or(dec!(0.02));
+    let settlement_service = Arc::new(Mutex::new(settlement_service));
+
+    tracing::info!(
+        "Settlement: Chainlink BTC/USD on Polygon, fee_rate={:.2}%",
+        settlement_fee_rate * dec!(100)
+    );
+
+    // Create entry strategy
+    let entry_strategy = create_entry_strategy(&entry_config);
+    let entry_poll_interval = Duration::from_secs(args.entry_poll_secs);
+    let window_duration = chrono::Duration::minutes(args.window_minutes);
+    let entry_fee_rate = Decimal::try_from(args.settlement_fee_rate).unwrap_or(dec!(0.02));
+
+    tracing::info!(
+        "Entry strategy: {} (poll every {}s)",
+        entry_config.strategy_type.as_str(),
+        args.entry_poll_secs
+    );
+
+    // Create composite signal configuration
+    let composite_config = CompositeSignalConfig::from_args(&args);
+    if composite_config.enabled {
+        tracing::info!(
+            "Composite mode: require {} signals to agree (orderbook={}, funding={}, liq_ratio={})",
+            composite_config.min_signals_agree,
+            composite_config.enable_orderbook,
+            composite_config.enable_funding,
+            composite_config.enable_liq_ratio
+        );
+    }
+
     // Main trading loop
     let poll_interval = Duration::from_secs(args.poll_interval_secs);
     let shutdown_clone = shutdown.clone();
@@ -1013,6 +1342,14 @@ pub async fn run_polymarket_paper_trade(args: PolymarketPaperTradeArgs) -> Resul
             shutdown: shutdown_clone,
             signal_type,
             signal_config,
+            window_timer,
+            settlement_service,
+            settlement_fee_rate,
+            entry_strategy,
+            entry_poll_interval,
+            window_duration,
+            entry_fee_rate,
+            composite_config,
         };
         run_trading_loop(ctx).await
     });
@@ -1060,6 +1397,22 @@ struct TradingLoopContext {
     shutdown: Arc<AtomicBool>,
     signal_type: String,
     signal_config: SignalConfig,
+    /// Window timer for Polymarket 15-minute clock alignment
+    window_timer: WindowTimer,
+    /// Settlement service for settling trades via Chainlink
+    settlement_service: Arc<Mutex<SettlementService>>,
+    /// Fee rate for settlement
+    settlement_fee_rate: Decimal,
+    /// Entry strategy for timing trade entries
+    entry_strategy: Box<dyn EntryStrategy>,
+    /// Entry poll interval (faster polling when waiting for entry conditions)
+    entry_poll_interval: Duration,
+    /// Window duration for entry context
+    window_duration: chrono::Duration,
+    /// Fee rate for entry context edge calculation
+    entry_fee_rate: Decimal,
+    /// Composite signal configuration for multi-signal voting
+    composite_config: CompositeSignalConfig,
 }
 
 /// Main trading loop that polls for opportunities and executes trades.
@@ -1069,16 +1422,42 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
         odds_repo,
         paper_repo,
         liq_repo,
-        poll_interval,
+        poll_interval: _poll_interval,
         shutdown,
         signal_type,
         signal_config,
+        window_timer,
+        settlement_service,
+        settlement_fee_rate,
+        entry_strategy,
+        entry_poll_interval,
+        window_duration,
+        entry_fee_rate,
+        composite_config,
     } = ctx;
-    let mut interval = tokio::time::interval(poll_interval);
 
-    // Initialize liquidation signal if using real signals
+    // Use faster polling when we have pending entries, slower otherwise
+    let mut interval = tokio::time::interval(entry_poll_interval);
+
+    // Track pending entry opportunities (keyed by window start time)
+    let mut pending_entries: std::collections::HashMap<DateTime<Utc>, PendingEntry> =
+        std::collections::HashMap::new();
+
+    // Initialize signal generator(s) based on configuration
     let mut liq_signal = if !signal_config.use_simulated {
         Some(create_liquidation_signal(&signal_config))
+    } else {
+        None
+    };
+
+    // Initialize composite signal if enabled
+    let mut composite_signal = if composite_config.enabled {
+        let composite = create_composite_signal(&composite_config);
+        tracing::info!(
+            "Initialized composite signal with {} generators",
+            composite.generator_count()
+        );
+        Some(composite)
     } else {
         None
     };
@@ -1093,8 +1472,42 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
 
         let now = Utc::now();
 
-        // Get latest market data for all markets
-        let markets = match odds_repo.get_latest_all().await {
+        // =====================================================================
+        // WINDOW TIMING CHECK
+        // Polymarket BTC 15-min binaries settle at :00, :15, :30, :45
+        // We need to ensure we have enough time before settlement to enter
+        // =====================================================================
+        let window_status = window_timer.status(now);
+
+        // Log window status periodically (every minute at :00 seconds)
+        if now.second() < 5 {
+            tracing::info!(
+                "Window: {} | {}",
+                window_status,
+                if window_status.can_trade {
+                    "TRADING ENABLED"
+                } else {
+                    "WAITING FOR NEXT WINDOW"
+                }
+            );
+        }
+
+        if !window_status.can_trade {
+            tracing::debug!(
+                "Too close to settlement ({} remaining), waiting for next window at {:02}:{:02}",
+                format!(
+                    "{}m {}s",
+                    window_status.time_remaining.num_minutes(),
+                    window_status.time_remaining.num_seconds() % 60
+                ),
+                window_timer.next_window(now).start.hour(),
+                window_timer.next_window(now).start.minute()
+            );
+            continue;
+        }
+
+        // Get latest market data for ACTIVE markets only (filters out expired)
+        let markets = match odds_repo.get_active_markets().await {
             Ok(m) => m,
             Err(e) => {
                 tracing::error!("Failed to query market data: {}", e);
@@ -1107,8 +1520,34 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
             continue;
         }
 
-        // Compute signal (real or simulated)
-        let (signal_strength, signal_direction) = if let Some(ref mut signal) = liq_signal {
+        // Compute signal (composite, real, or simulated)
+        let (signal_strength, signal_direction) = if let Some(ref mut composite) = composite_signal
+        {
+            // Use composite multi-signal voting
+            // Build a minimal SignalContext for composite signal computation
+            let ctx = SignalContext::new(now, "BTCUSD");
+
+            match composite.compute(&ctx).await {
+                Ok(signal_value) => {
+                    let (direction_bool, is_directional) =
+                        direction_to_signal_bool(signal_value.direction);
+                    if is_directional {
+                        tracing::info!(
+                            direction = if direction_bool { "Up" } else { "Down" },
+                            strength = signal_value.strength,
+                            confidence = signal_value.confidence,
+                            signals_agreed = composite_config.min_signals_agree,
+                            "Composite signal fired"
+                        );
+                    }
+                    (signal_value.strength, direction_bool)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to compute composite signal: {}", e);
+                    (0.0, true) // Neutral fallback
+                }
+            }
+        } else if let Some(ref mut signal) = liq_signal {
             // Use real liquidation signal
             match compute_real_signal(&liq_repo, signal, &signal_config, now).await {
                 Ok(result) => {
@@ -1142,8 +1581,17 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
             (0.0, true) // Placeholder, will be computed per market
         };
 
-        // Evaluate each market
+        // =====================================================================
+        // STEP 1: Check for new signal opportunities and create PendingEntries
+        // =====================================================================
+        let current_window = window_timer.current_window(now);
+
         for market in &markets {
+            // Skip if we already have a pending entry for this window
+            if pending_entries.contains_key(&current_window.start) {
+                continue;
+            }
+
             // Determine signal for this market
             let (strength, direction) = if liq_signal.is_some() {
                 // Real signal already computed above (applies to all markets)
@@ -1153,22 +1601,229 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
                 simulate_signal(&signal_type, market)
             };
 
-            let mut exec = executor.lock().await;
-            if let Some(trade) = exec.execute(market, strength, direction, now) {
-                // Store the trade
-                match paper_repo.insert(&trade).await {
-                    Ok(id) => {
-                        tracing::info!(
-                            trade_id = id,
-                            market_id = %trade.market_id,
-                            signal_strength = strength,
-                            signal_direction = if direction { "yes" } else { "no" },
-                            "Paper trade stored"
-                        );
+            // Check if signal meets minimum strength threshold
+            let exec = executor.lock().await;
+            let min_signal = exec.engine.config.min_signal_strength;
+            let max_price = exec.engine.config.max_price;
+            drop(exec);
+
+            if strength < min_signal {
+                tracing::debug!(
+                    strength = strength,
+                    min_signal = min_signal,
+                    "Signal below minimum threshold"
+                );
+                continue;
+            }
+
+            // Check price constraint
+            let current_price = if direction {
+                market.outcome_yes_price
+            } else {
+                Decimal::ONE - market.outcome_yes_price // No price
+            };
+
+            if current_price > max_price {
+                tracing::debug!(
+                    price = %current_price,
+                    max_price = %max_price,
+                    "Price above maximum threshold"
+                );
+                continue;
+            }
+
+            // Create pending entry - entry strategy will determine when to trade
+            let estimated_prob =
+                Decimal::from_f64_retain(0.5 + strength * 0.3).unwrap_or(dec!(0.55));
+
+            // Capture BTC price at signal detection (approximates window start price)
+            let btc_price_at_signal = {
+                let settlement = settlement_service.lock().await;
+                settlement.get_current_price().await.ok()
+            };
+
+            let mut pending = PendingEntry::new(
+                market.clone(),
+                strength,
+                direction,
+                estimated_prob,
+                current_window.start,
+                current_window.end,
+            );
+            if let Some(price) = btc_price_at_signal {
+                pending = pending.with_btc_price(price);
+            }
+
+            tracing::info!(
+                market_id = %market.market_id,
+                signal_strength = strength,
+                direction = if direction { "Yes" } else { "No" },
+                window_start = %current_window.start.format("%H:%M"),
+                window_end = %current_window.end.format("%H:%M"),
+                btc_price = ?btc_price_at_signal,
+                "Created pending entry - waiting for entry strategy"
+            );
+
+            pending_entries.insert(current_window.start, pending);
+        }
+
+        // =====================================================================
+        // STEP 2: Evaluate pending entries with entry strategy
+        // =====================================================================
+        let mut entries_to_remove = Vec::new();
+
+        for (window_start, pending) in pending_entries.iter_mut() {
+            // Skip if already traded
+            if pending.traded {
+                continue;
+            }
+
+            // Check if window expired
+            if pending.is_expired(now) {
+                tracing::debug!(
+                    window_start = %window_start.format("%H:%M"),
+                    "Pending entry expired without trading"
+                );
+                entries_to_remove.push(*window_start);
+                continue;
+            }
+
+            // Get current market price (fetch latest data)
+            let current_price = if pending.signal_direction {
+                pending.market.outcome_yes_price
+            } else {
+                Decimal::ONE - pending.market.outcome_yes_price
+            };
+
+            // Build entry context for strategy evaluation
+            let entry_ctx =
+                pending.to_entry_context(current_price, now, window_duration, entry_fee_rate);
+
+            // Evaluate entry strategy
+            let decision = entry_strategy.evaluate(&entry_ctx);
+
+            match decision {
+                EntryDecision::Enter {
+                    offset,
+                    direction: bet_dir,
+                } => {
+                    tracing::info!(
+                        strategy = entry_strategy.name(),
+                        offset_mins = offset.num_minutes(),
+                        direction = ?bet_dir,
+                        edge = %entry_ctx.calculate_edge(),
+                        "Entry strategy triggered - executing trade"
+                    );
+
+                    // Get BTC price at entry time
+                    let btc_price_at_entry = {
+                        let settlement = settlement_service.lock().await;
+                        settlement.get_current_price().await.ok()
+                    };
+
+                    // Execute the trade
+                    let mut exec = executor.lock().await;
+                    if let Some(mut trade) = exec.execute(
+                        &pending.market,
+                        pending.signal_strength,
+                        pending.signal_direction,
+                        now,
+                    ) {
+                        // Add BTC prices to trade for analysis
+                        if let (Some(window_start_price), Some(entry_price)) =
+                            (pending.btc_price_at_signal, btc_price_at_entry)
+                        {
+                            trade = trade.with_btc_prices(window_start_price, entry_price);
+                        }
+
+                        // Store the trade
+                        match paper_repo.insert(&trade).await {
+                            Ok(id) => {
+                                tracing::info!(
+                                    trade_id = id,
+                                    market_id = %trade.market_id,
+                                    signal_strength = pending.signal_strength,
+                                    signal_direction = if pending.signal_direction { "yes" } else { "no" },
+                                    entry_offset_mins = offset.num_minutes(),
+                                    edge = %entry_ctx.calculate_edge(),
+                                    btc_window_start = ?pending.btc_price_at_signal,
+                                    btc_at_entry = ?btc_price_at_entry,
+                                    "Paper trade stored via entry strategy"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::error!("Failed to store paper trade: {}", e);
+                            }
+                        }
+                        pending.traded = true;
                     }
-                    Err(e) => {
-                        tracing::error!("Failed to store paper trade: {}", e);
+                }
+                EntryDecision::NoEntry { reason } => {
+                    tracing::debug!(
+                        strategy = entry_strategy.name(),
+                        reason = reason,
+                        offset_mins = entry_ctx.current_offset.num_minutes(),
+                        edge = %entry_ctx.calculate_edge(),
+                        "Entry strategy waiting"
+                    );
+                }
+            }
+        }
+
+        // Cleanup only expired entries (NOT traded entries)
+        // Keep traded entries until window expires to prevent re-evaluating the same window
+        for window_start in entries_to_remove {
+            pending_entries.remove(&window_start);
+        }
+
+        // =====================================================================
+        // SETTLEMENT CHECK
+        // Settle any pending trades whose window has ended
+        // =====================================================================
+        {
+            let mut settlement = settlement_service.lock().await;
+            match settlement
+                .settle_pending_trades(&paper_repo, settlement_fee_rate)
+                .await
+            {
+                Ok(results) if !results.is_empty() => {
+                    let mut exec = executor.lock().await;
+                    let current_session_id = exec.session_id().to_string();
+
+                    // Only update stats for trades from the current session
+                    let mut session_wins = 0u32;
+                    let mut session_losses = 0u32;
+                    for result in &results {
+                        // Look up trade to check session
+                        if let Ok(Some(trade)) = paper_repo.get_by_id(result.trade_id).await {
+                            if trade.session_id == current_session_id {
+                                exec.apply_settlement(result.pnl, result.won);
+                                if result.won {
+                                    session_wins += 1;
+                                } else {
+                                    session_losses += 1;
+                                }
+                            }
+                        }
                     }
+
+                    let wins_count = results.iter().filter(|r| r.won).count();
+                    let losses_count = results.len() - wins_count;
+                    tracing::info!(
+                        settled = results.len(),
+                        wins = wins_count,
+                        losses = losses_count,
+                        session_wins = session_wins,
+                        session_losses = session_losses,
+                        total_pnl = %results.iter().map(|r| r.pnl).sum::<Decimal>(),
+                        "Settled pending trades"
+                    );
+                }
+                Ok(_) => {
+                    // No trades to settle
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to settle pending trades: {}", e);
                 }
             }
         }
@@ -1277,8 +1932,8 @@ mod tests {
             timestamp: sample_timestamp(),
             market_id: "btc-100k-feb".to_string(),
             question: "Will Bitcoin exceed $100k by Feb 2025?".to_string(),
-            outcome_yes_price: dec!(0.60),
-            outcome_no_price: dec!(0.40),
+            outcome_yes_price: dec!(0.50), // Under max_price of 0.55 for decent odds
+            outcome_no_price: dec!(0.50),
             volume_24h: Some(dec!(50000)),
             liquidity: Some(dec!(100000)),
             end_date: None,
@@ -1290,6 +1945,7 @@ mod tests {
             signal_type: "composite".to_string(),
             min_signal_strength: 0.6,
             min_edge: dec!(0.02),
+            max_price: dec!(0.55),
             kelly: KellyCriterion::quarter_kelly(),
             fee_tier: FeeTier::Tier0,
             use_fixed_stake: false,
@@ -1339,6 +1995,7 @@ mod tests {
             stake: 100.0,
             kelly_fraction: 0.25,
             min_edge: 0.02,
+            max_price: 0.55,
             bankroll: 10000.0,
             max_bet_fraction: 0.05,
             fee_tier: "0".to_string(),
@@ -1351,6 +2008,7 @@ mod tests {
             entry_offset_pct: 0.25,
             entry_fallback_mins: 2,
             window_minutes: 15,
+            entry_cutoff_mins: 2,
             entry_poll_secs: 10,
             // Signal config defaults
             use_simulated_signals: true,
@@ -1360,7 +2018,137 @@ mod tests {
             liquidation_window_mins: 5,
             liquidation_symbol: "BTCUSDT".to_string(),
             liquidation_exchange: "binance".to_string(),
+            // Composite signal config defaults
+            enable_composite: false,
+            min_signals_agree: 2,
+            enable_orderbook_signal: false,
+            enable_funding_signal: false,
+            enable_liq_ratio_signal: false,
+            // Settlement config defaults
+            polygon_rpc_url: None,
+            settlement_fee_rate: 0.02,
         }
+    }
+
+    // =========================================================================
+    // CompositeSignalConfig Tests
+    // =========================================================================
+
+    #[test]
+    fn test_composite_signal_config_default() {
+        let config = CompositeSignalConfig::default();
+
+        assert!(!config.enabled);
+        assert_eq!(config.min_signals_agree, 2);
+        assert!(!config.enable_orderbook);
+        assert!(!config.enable_funding);
+        assert!(!config.enable_liq_ratio);
+    }
+
+    #[test]
+    fn test_composite_signal_config_from_args() {
+        let mut args = sample_args();
+        args.enable_composite = true;
+        args.min_signals_agree = 3;
+        args.enable_orderbook_signal = true;
+        args.enable_funding_signal = true;
+        args.enable_liq_ratio_signal = false;
+
+        let config = CompositeSignalConfig::from_args(&args);
+
+        assert!(config.enabled);
+        assert_eq!(config.min_signals_agree, 3);
+        assert!(config.enable_orderbook);
+        assert!(config.enable_funding);
+        assert!(!config.enable_liq_ratio);
+    }
+
+    #[test]
+    fn test_composite_signal_config_enabled_count() {
+        let mut config = CompositeSignalConfig::default();
+
+        // None enabled
+        assert_eq!(config.enabled_signal_count(), 0);
+
+        // One enabled
+        config.enable_orderbook = true;
+        assert_eq!(config.enabled_signal_count(), 1);
+
+        // Two enabled
+        config.enable_funding = true;
+        assert_eq!(config.enabled_signal_count(), 2);
+
+        // All enabled
+        config.enable_liq_ratio = true;
+        assert_eq!(config.enabled_signal_count(), 3);
+    }
+
+    #[test]
+    fn test_composite_signal_config_min_signals_clamped() {
+        let mut args = sample_args();
+        args.min_signals_agree = 0; // Should be clamped to at least 1
+
+        let config = CompositeSignalConfig::from_args(&args);
+
+        assert_eq!(config.min_signals_agree, 1);
+    }
+
+    // =========================================================================
+    // create_composite_signal Tests
+    // =========================================================================
+
+    #[test]
+    fn test_create_composite_signal_empty() {
+        let config = CompositeSignalConfig::default();
+
+        let composite = create_composite_signal(&config);
+
+        assert_eq!(composite.generator_count(), 0);
+    }
+
+    #[test]
+    fn test_create_composite_signal_with_orderbook() {
+        let config = CompositeSignalConfig {
+            enabled: true,
+            min_signals_agree: 2,
+            enable_orderbook: true,
+            enable_funding: false,
+            enable_liq_ratio: false,
+        };
+
+        let composite = create_composite_signal(&config);
+
+        assert_eq!(composite.generator_count(), 1);
+    }
+
+    #[test]
+    fn test_create_composite_signal_with_all() {
+        let config = CompositeSignalConfig {
+            enabled: true,
+            min_signals_agree: 2,
+            enable_orderbook: true,
+            enable_funding: true,
+            enable_liq_ratio: true,
+        };
+
+        let composite = create_composite_signal(&config);
+
+        assert_eq!(composite.generator_count(), 3);
+    }
+
+    #[test]
+    fn test_create_composite_signal_name() {
+        let config = CompositeSignalConfig {
+            enabled: true,
+            min_signals_agree: 2,
+            enable_orderbook: true,
+            enable_funding: true,
+            enable_liq_ratio: false,
+        };
+
+        let composite = create_composite_signal(&config);
+
+        assert_eq!(composite.name(), "composite_multi_signal");
     }
 
     #[test]
@@ -1509,6 +2297,22 @@ mod tests {
 
         assert!(!decision.should_trade);
         assert!(decision.reason.contains("Edge"));
+    }
+
+    #[test]
+    fn test_decision_engine_evaluate_price_too_high() {
+        let config = sample_config(); // max_price = 0.55
+        let engine = DecisionEngine::new(config, dec!(10000));
+        let mut market = sample_market();
+        market.outcome_yes_price = dec!(0.80); // Price above max_price
+        let now = sample_timestamp();
+
+        // Even with strong signal, price is too high (poor odds)
+        let decision = engine.evaluate(&market, 0.85, true, now);
+
+        assert!(!decision.should_trade);
+        assert!(decision.reason.contains("Price"));
+        assert!(decision.reason.contains("exceeds max"));
     }
 
     #[test]
@@ -2030,6 +2834,7 @@ mod tests {
                 stake: 100.0,
                 kelly_fraction: 0.25,
                 min_edge: 0.02,
+                max_price: 0.55,
                 bankroll: 10000.0,
                 max_bet_fraction: 0.05,
                 fee_tier: "0".to_string(),
@@ -2051,6 +2856,16 @@ mod tests {
                 liquidation_window_mins: 10,
                 liquidation_symbol: "ETHUSDT".to_string(),
                 liquidation_exchange: "bybit".to_string(),
+                entry_cutoff_mins: 2,
+                // Composite signal config
+                enable_composite: false,
+                min_signals_agree: 2,
+                enable_orderbook_signal: false,
+                enable_funding_signal: false,
+                enable_liq_ratio_signal: false,
+                // Settlement config
+                polygon_rpc_url: None,
+                settlement_fee_rate: 0.02,
             };
 
             let config = SignalConfig::from_args(&args);
@@ -2073,6 +2888,7 @@ mod tests {
                 stake: 100.0,
                 kelly_fraction: 0.25,
                 min_edge: 0.02,
+                max_price: 0.55,
                 bankroll: 10000.0,
                 max_bet_fraction: 0.05,
                 fee_tier: "0".to_string(),
@@ -2094,6 +2910,16 @@ mod tests {
                 liquidation_window_mins: 5,
                 liquidation_symbol: "BTCUSDT".to_string(),
                 liquidation_exchange: "binance".to_string(),
+                entry_cutoff_mins: 2,
+                // Composite signal config
+                enable_composite: false,
+                min_signals_agree: 2,
+                enable_orderbook_signal: false,
+                enable_funding_signal: false,
+                enable_liq_ratio_signal: false,
+                // Settlement config
+                polygon_rpc_url: None,
+                settlement_fee_rate: 0.02,
             };
 
             let config = SignalConfig::from_args(&args);
@@ -2231,6 +3057,7 @@ mod tests {
                 stake: 100.0,
                 kelly_fraction: 0.25,
                 min_edge: 0.02,
+                max_price: 0.55,
                 bankroll: 10000.0,
                 max_bet_fraction: 0.05,
                 fee_tier: "0".to_string(),
@@ -2251,6 +3078,16 @@ mod tests {
                 liquidation_window_mins: 5,
                 liquidation_symbol: "BTCUSDT".to_string(),
                 liquidation_exchange: "binance".to_string(),
+                entry_cutoff_mins: 2,
+                // Composite signal config
+                enable_composite: false,
+                min_signals_agree: 2,
+                enable_orderbook_signal: false,
+                enable_funding_signal: false,
+                enable_liq_ratio_signal: false,
+                // Settlement config
+                polygon_rpc_url: None,
+                settlement_fee_rate: 0.02,
             };
 
             let config = DecisionEngineConfig::from_args(&args);

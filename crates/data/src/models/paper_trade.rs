@@ -114,6 +114,9 @@ pub struct PaperTradeRecord {
     pub settled_at: Option<DateTime<Utc>>,
     /// Session identifier for grouping trades.
     pub session_id: String,
+    /// Actual market end time from Polymarket for settlement timing.
+    #[sqlx(default)]
+    pub market_end_date: Option<DateTime<Utc>>,
 
     // =========================================================================
     // Entry Timing Fields
@@ -133,6 +136,19 @@ pub struct PaperTradeRecord {
     /// Whether the fallback entry was used (true if primary strategy conditions weren't met).
     #[sqlx(default)]
     pub used_fallback: bool,
+
+    // =========================================================================
+    // BTC Price Tracking Fields
+    // =========================================================================
+    /// BTC price at the start of the 15-min window (:00/:15/:30/:45).
+    #[sqlx(default)]
+    pub btc_price_window_start: Option<Decimal>,
+    /// BTC price at the moment the trade was placed.
+    #[sqlx(default)]
+    pub btc_price_at_entry: Option<Decimal>,
+    /// BTC price at window end (set during settlement).
+    #[sqlx(default)]
+    pub btc_price_window_end: Option<Decimal>,
 }
 
 impl PaperTradeRecord {
@@ -176,12 +192,17 @@ impl PaperTradeRecord {
             fees: None,
             settled_at: None,
             session_id,
+            market_end_date: None,
             // Entry timing fields default
             entry_strategy: "immediate".to_string(),
             entry_triggered_at: None,
             entry_offset_secs: None,
             edge_at_entry: None,
             used_fallback: false,
+            // BTC price tracking fields
+            btc_price_window_start: None,
+            btc_price_at_entry: None,
+            btc_price_window_end: None,
         }
     }
 
@@ -205,6 +226,13 @@ impl PaperTradeRecord {
     #[must_use]
     pub fn with_signals(mut self, signals: JsonValue) -> Self {
         self.signals_snapshot = Some(signals);
+        self
+    }
+
+    /// Sets the market end date for proper settlement timing.
+    #[must_use]
+    pub fn with_market_end_date(mut self, end_date: DateTime<Utc>) -> Self {
+        self.market_end_date = Some(end_date);
         self
     }
 
@@ -235,6 +263,73 @@ impl PaperTradeRecord {
         self.edge_at_entry = Some(edge);
         self.used_fallback = used_fallback;
         self
+    }
+
+    /// Sets the BTC price at entry time.
+    ///
+    /// # Arguments
+    /// * `window_start_price` - BTC price at the start of the 15-min window
+    /// * `entry_price` - BTC price at the moment of trade entry
+    #[must_use]
+    pub fn with_btc_prices(
+        mut self,
+        window_start_price: Decimal,
+        entry_price: Decimal,
+    ) -> Self {
+        self.btc_price_window_start = Some(window_start_price);
+        self.btc_price_at_entry = Some(entry_price);
+        self
+    }
+
+    /// Sets the BTC price at window end (during settlement).
+    #[must_use]
+    pub fn with_btc_price_window_end(mut self, price: Decimal) -> Self {
+        self.btc_price_window_end = Some(price);
+        self
+    }
+
+    /// Calculates the BTC price movement from window start to entry.
+    /// Positive = price went up before we entered.
+    #[must_use]
+    pub fn btc_pre_entry_move(&self) -> Option<Decimal> {
+        match (self.btc_price_at_entry, self.btc_price_window_start) {
+            (Some(entry), Some(start)) => Some(entry - start),
+            _ => None,
+        }
+    }
+
+    /// Calculates the BTC price movement from entry to window end.
+    /// Positive = price went up after we entered.
+    #[must_use]
+    pub fn btc_post_entry_move(&self) -> Option<Decimal> {
+        match (self.btc_price_window_end, self.btc_price_at_entry) {
+            (Some(end), Some(entry)) => Some(end - entry),
+            _ => None,
+        }
+    }
+
+    /// Calculates the total BTC price movement for the window.
+    #[must_use]
+    pub fn btc_total_move(&self) -> Option<Decimal> {
+        match (self.btc_price_window_end, self.btc_price_window_start) {
+            (Some(end), Some(start)) => Some(end - start),
+            _ => None,
+        }
+    }
+
+    /// Calculates what percentage of the total move we captured after entry.
+    /// Returns None if total move is zero or prices are missing.
+    #[must_use]
+    pub fn btc_move_captured_pct(&self) -> Option<Decimal> {
+        let total = self.btc_total_move()?;
+        let post = self.btc_post_entry_move()?;
+        if total == Decimal::ZERO {
+            return None;
+        }
+        // For a "yes" bet, we want price to go up
+        // For a "no" bet, we want price to go down
+        // This calculates absolute capture regardless of direction
+        Some((post / total) * Decimal::ONE_HUNDRED)
     }
 
     /// Settles the trade with the final outcome.

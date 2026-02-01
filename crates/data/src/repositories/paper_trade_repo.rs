@@ -32,8 +32,9 @@ impl PaperTradeRepository {
             INSERT INTO paper_trades
                 (timestamp, market_id, market_question, direction, shares, entry_price, stake,
                  estimated_prob, expected_value, kelly_fraction, signal_strength,
-                 signals_snapshot, status, outcome, pnl, fees, settled_at, session_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+                 signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                 market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
             RETURNING id
             "#,
         )
@@ -55,6 +56,10 @@ impl PaperTradeRepository {
         .bind(record.fees)
         .bind(record.settled_at)
         .bind(&record.session_id)
+        .bind(record.market_end_date)
+        .bind(record.btc_price_window_start)
+        .bind(record.btc_price_at_entry)
+        .bind(record.btc_price_window_end)
         .fetch_one(&self.pool)
         .await?;
 
@@ -91,6 +96,39 @@ impl PaperTradeRepository {
         Ok(())
     }
 
+    /// Updates a paper trade with settlement information including BTC price at window end.
+    ///
+    /// # Errors
+    /// Returns an error if the database operation fails.
+    pub async fn settle_with_btc_price(
+        &self,
+        id: i32,
+        outcome: &str,
+        pnl: Decimal,
+        fees: Decimal,
+        settled_at: DateTime<Utc>,
+        btc_price_window_end: Decimal,
+    ) -> Result<()> {
+        sqlx::query(
+            r#"
+            UPDATE paper_trades
+            SET status = 'settled', outcome = $2, pnl = $3, fees = $4, settled_at = $5,
+                btc_price_window_end = $6
+            WHERE id = $1
+            "#,
+        )
+        .bind(id)
+        .bind(outcome)
+        .bind(pnl)
+        .bind(fees)
+        .bind(settled_at)
+        .bind(btc_price_window_end)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
     /// Cancels a paper trade.
     ///
     /// # Errors
@@ -119,7 +157,8 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             WHERE id = $1
             "#,
@@ -140,7 +179,8 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             WHERE session_id = $1
             ORDER BY timestamp ASC
@@ -167,7 +207,8 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             WHERE market_id = $1
               AND timestamp >= $2 AND timestamp <= $3
@@ -196,7 +237,8 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             WHERE timestamp >= $1 AND timestamp <= $2
             ORDER BY timestamp ASC
@@ -219,7 +261,8 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             WHERE status = 'pending'
             ORDER BY timestamp ASC
@@ -243,7 +286,8 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             WHERE status = 'pending' AND session_id = $1
             ORDER BY timestamp ASC
@@ -269,7 +313,8 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             WHERE status = 'settled'
               AND timestamp >= $1 AND timestamp <= $2
@@ -347,13 +392,50 @@ impl PaperTradeRepository {
             r#"
             SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
                    estimated_prob, expected_value, kelly_fraction, signal_strength,
-                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
             FROM paper_trades
             ORDER BY timestamp DESC
             LIMIT $1
             "#,
         )
         .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(records)
+    }
+
+    /// Queries pending paper trades that are ready for settlement.
+    ///
+    /// Returns trades where the market has ended (`market_end_date <= NOW()`).
+    /// Falls back to `timestamp + window_minutes` for legacy trades without `market_end_date`.
+    ///
+    /// # Errors
+    /// Returns an error if the database query fails.
+    pub async fn query_pending_for_settlement(
+        &self,
+        window_minutes: i64,
+    ) -> Result<Vec<PaperTradeRecord>> {
+        let records = sqlx::query_as::<_, PaperTradeRecord>(
+            r#"
+            SELECT id, timestamp, market_id, market_question, direction, shares, entry_price, stake,
+                   estimated_prob, expected_value, kelly_fraction, signal_strength,
+                   signals_snapshot, status, outcome, pnl, fees, settled_at, session_id,
+                   market_end_date, btc_price_window_start, btc_price_at_entry, btc_price_window_end
+            FROM paper_trades
+            WHERE status = 'pending'
+              AND (
+                  -- Use market_end_date if available (preferred)
+                  (market_end_date IS NOT NULL AND market_end_date <= NOW())
+                  OR
+                  -- Fallback for legacy trades without market_end_date
+                  (market_end_date IS NULL AND timestamp + make_interval(mins => $1) <= NOW())
+              )
+            ORDER BY timestamp ASC
+            "#,
+        )
+        .bind(window_minutes as i32)
         .fetch_all(&self.pool)
         .await?;
 
