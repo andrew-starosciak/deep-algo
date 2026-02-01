@@ -18,6 +18,13 @@
 
 set -e
 
+# Load .env file if it exists
+if [ -f .env ]; then
+    set -a
+    source .env
+    set +a
+fi
+
 # Colors for output
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -30,12 +37,21 @@ DURATION="${DURATION:-24h}"
 SIGNAL_MODE="${SIGNAL_MODE:-cascade}"
 MIN_SIGNAL_STRENGTH="${MIN_SIGNAL_STRENGTH:-0.6}"
 MIN_EDGE="${MIN_EDGE:-0.03}"
+MAX_PRICE="${MAX_PRICE:-0.55}"  # Only buy at prices <= 0.55 for decent odds (1.82x+ payout)
 KELLY_FRACTION="${KELLY_FRACTION:-0.25}"
 ENTRY_STRATEGY="${ENTRY_STRATEGY:-edge_threshold}"
 ENTRY_THRESHOLD="${ENTRY_THRESHOLD:-0.05}"
 MIN_VOLUME_USD="${MIN_VOLUME_USD:-100000}"
 IMBALANCE_THRESHOLD="${IMBALANCE_THRESHOLD:-0.6}"
 BANKROLL="${BANKROLL:-10000}"
+SETTLEMENT_FEE_RATE="${SETTLEMENT_FEE_RATE:-0.02}"  # 2% settlement fee
+
+# Composite signal configuration (multiple signals must agree)
+ENABLE_COMPOSITE="${ENABLE_COMPOSITE:-false}"
+MIN_SIGNALS_AGREE="${MIN_SIGNALS_AGREE:-2}"
+ENABLE_ORDERBOOK="${ENABLE_ORDERBOOK:-false}"
+ENABLE_FUNDING="${ENABLE_FUNDING:-false}"
+ENABLE_LIQ_RATIO="${ENABLE_LIQ_RATIO:-false}"
 
 # Parse command line arguments
 while [[ $# -gt 0 ]]; do
@@ -54,6 +70,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --min-edge)
             MIN_EDGE="$2"
+            shift 2
+            ;;
+        --max-price)
+            MAX_PRICE="$2"
             shift 2
             ;;
         --kelly-fraction)
@@ -76,8 +96,32 @@ while [[ $# -gt 0 ]]; do
             BANKROLL="$2"
             shift 2
             ;;
+        --settlement-fee-rate)
+            SETTLEMENT_FEE_RATE="$2"
+            shift 2
+            ;;
         --simulated)
             USE_SIMULATED="--use-simulated-signals"
+            shift
+            ;;
+        --composite)
+            ENABLE_COMPOSITE="true"
+            shift
+            ;;
+        --min-signals-agree)
+            MIN_SIGNALS_AGREE="$2"
+            shift 2
+            ;;
+        --enable-orderbook)
+            ENABLE_ORDERBOOK="true"
+            shift
+            ;;
+        --enable-funding)
+            ENABLE_FUNDING="true"
+            shift
+            ;;
+        --enable-liq-ratio)
+            ENABLE_LIQ_RATIO="true"
             shift
             ;;
         --help)
@@ -88,12 +132,21 @@ while [[ $# -gt 0 ]]; do
             echo "  --signal-mode <mode>      cascade|exhaustion|combined (default: cascade)"
             echo "  --min-signal-strength <n> Minimum signal strength 0.0-1.0 (default: 0.6)"
             echo "  --min-edge <n>            Minimum edge threshold (default: 0.03)"
+            echo "  --max-price <n>           Max price for decent odds (default: 0.55)"
             echo "  --kelly-fraction <n>      Kelly fraction (default: 0.25)"
             echo "  --entry-strategy <s>      immediate|fixed_time|edge_threshold (default: edge_threshold)"
             echo "  --entry-threshold <n>     Edge threshold for entry (default: 0.05)"
             echo "  --min-volume-usd <n>      Min liquidation volume (default: 100000)"
             echo "  --bankroll <n>            Starting bankroll (default: 10000)"
+            echo "  --settlement-fee-rate <n> Settlement fee rate (default: 0.02)"
             echo "  --simulated               Use simulated signals (for testing)"
+            echo ""
+            echo "Composite signal options (require 2+ signals to agree):"
+            echo "  --composite               Enable composite multi-signal mode"
+            echo "  --min-signals-agree <n>   Min signals to agree (default: 2)"
+            echo "  --enable-orderbook        Include order book imbalance signal"
+            echo "  --enable-funding          Include funding rate percentile signal"
+            echo "  --enable-liq-ratio        Include 24h liquidation ratio signal"
             echo "  --help                    Show this help message"
             exit 0
             ;;
@@ -111,12 +164,10 @@ if [ -z "$DATABASE_URL" ]; then
     exit 1
 fi
 
-# Build if needed
+# Build if needed (always rebuild to pick up code changes)
 BINARY="./target/debug/algo-trade"
-if [ ! -f "$BINARY" ]; then
-    echo -e "${YELLOW}Building algo-trade CLI...${NC}"
-    cargo build -p algo-trade-cli
-fi
+echo -e "${YELLOW}Building algo-trade CLI...${NC}"
+cargo build -p algo-trade-cli
 
 # Create logs directory
 mkdir -p logs
@@ -155,15 +206,27 @@ echo -e "  Duration:          ${GREEN}$DURATION${NC}"
 echo -e "  Signal Mode:       ${GREEN}$SIGNAL_MODE${NC}"
 echo -e "  Min Signal:        ${GREEN}$MIN_SIGNAL_STRENGTH${NC}"
 echo -e "  Min Edge:          ${GREEN}$MIN_EDGE${NC}"
+echo -e "  Max Price:         ${GREEN}$MAX_PRICE${NC} (only buy at decent odds)"
 echo -e "  Kelly Fraction:    ${GREEN}$KELLY_FRACTION${NC}"
 echo -e "  Entry Strategy:    ${GREEN}$ENTRY_STRATEGY${NC}"
 echo -e "  Entry Threshold:   ${GREEN}$ENTRY_THRESHOLD${NC}"
 echo -e "  Min Volume USD:    ${GREEN}$MIN_VOLUME_USD${NC}"
 echo -e "  Bankroll:          ${GREEN}\$$BANKROLL${NC}"
+echo -e "  Settlement Fee:    ${GREEN}${SETTLEMENT_FEE_RATE}${NC} (via Chainlink BTC/USD)"
 if [ ! -z "$USE_SIMULATED" ]; then
     echo -e "  Signals:           ${YELLOW}SIMULATED (testing mode)${NC}"
 else
     echo -e "  Signals:           ${GREEN}REAL (liquidation cascade)${NC}"
+fi
+
+# Show composite mode configuration
+if [ "$ENABLE_COMPOSITE" = "true" ]; then
+    echo ""
+    echo -e "  ${BLUE}Composite Mode:${NC}"
+    echo -e "    Min Agree:       ${GREEN}$MIN_SIGNALS_AGREE signals${NC}"
+    echo -e "    Order Book:      ${GREEN}$ENABLE_ORDERBOOK${NC}"
+    echo -e "    Funding Rate:    ${GREEN}$ENABLE_FUNDING${NC}"
+    echo -e "    Liq Ratio:       ${GREEN}$ENABLE_LIQ_RATIO${NC}"
 fi
 echo ""
 
@@ -223,30 +286,51 @@ echo -e "${BLUE}  Paper Trading Active - Press Ctrl+C to stop${NC}"
 echo -e "${BLUE}=============================================${NC}"
 echo ""
 
-# Build the command
-PAPER_TRADE_CMD="$BINARY polymarket-paper-trade \
-    --duration $DURATION \
-    --signal-mode $SIGNAL_MODE \
-    --min-signal-strength $MIN_SIGNAL_STRENGTH \
-    --min-edge $MIN_EDGE \
-    --kelly-fraction $KELLY_FRACTION \
-    --entry-strategy $ENTRY_STRATEGY \
-    --entry-threshold $ENTRY_THRESHOLD \
-    --min-volume-usd $MIN_VOLUME_USD \
-    --imbalance-threshold $IMBALANCE_THRESHOLD \
-    --bankroll $BANKROLL \
-    --liquidation-window-mins 5 \
-    --liquidation-symbol BTCUSDT \
-    --liquidation-exchange binance"
+# Build the command using array for safety (prevents shell injection)
+PAPER_TRADE_ARGS=(
+    polymarket-paper-trade
+    --duration "$DURATION"
+    --signal-mode "$SIGNAL_MODE"
+    --min-signal-strength "$MIN_SIGNAL_STRENGTH"
+    --min-edge "$MIN_EDGE"
+    --max-price "$MAX_PRICE"
+    --kelly-fraction "$KELLY_FRACTION"
+    --entry-strategy "$ENTRY_STRATEGY"
+    --entry-threshold "$ENTRY_THRESHOLD"
+    --min-volume-usd "$MIN_VOLUME_USD"
+    --imbalance-threshold "$IMBALANCE_THRESHOLD"
+    --bankroll "$BANKROLL"
+    --liquidation-window-mins 5
+    --liquidation-symbol BTCUSDT
+    --liquidation-exchange binance
+    --settlement-fee-rate "$SETTLEMENT_FEE_RATE"
+)
 
-# Add simulated flag if requested
-if [ ! -z "$USE_SIMULATED" ]; then
-    PAPER_TRADE_CMD="$PAPER_TRADE_CMD --use-simulated-signals"
+# Add simulated flag if requested (default is real signals)
+if [ -n "$USE_SIMULATED" ]; then
+    PAPER_TRADE_ARGS+=(--use-simulated-signals)
+fi
+
+# Add composite signal flags if enabled
+if [ "$ENABLE_COMPOSITE" = "true" ]; then
+    PAPER_TRADE_ARGS+=(--enable-composite --min-signals-agree "$MIN_SIGNALS_AGREE")
+
+    if [ "$ENABLE_ORDERBOOK" = "true" ]; then
+        PAPER_TRADE_ARGS+=(--enable-orderbook-signal)
+    fi
+
+    if [ "$ENABLE_FUNDING" = "true" ]; then
+        PAPER_TRADE_ARGS+=(--enable-funding-signal)
+    fi
+
+    if [ "$ENABLE_LIQ_RATIO" = "true" ]; then
+        PAPER_TRADE_ARGS+=(--enable-liq-ratio-signal)
+    fi
 fi
 
 # Run paper trading in foreground with enhanced logging
 RUST_LOG=info,algo_trade_cli::commands::polymarket_paper_trade=debug \
-    $PAPER_TRADE_CMD 2>&1 | tee logs/paper-trade.log
+    "$BINARY" "${PAPER_TRADE_ARGS[@]}" 2>&1 | tee logs/paper-trade.log
 
 # Cleanup after paper trading exits
 cleanup

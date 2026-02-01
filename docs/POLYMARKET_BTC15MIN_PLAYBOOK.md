@@ -283,6 +283,23 @@ let signal = LiquidationCascadeSignal::default()
 
 ## Risk Management
 
+### Price Filter (Odds Quality)
+
+Per research: only buy shares priced at $0.55 or less for decent odds.
+
+| Price | Payout | Risk/Reward |
+|-------|--------|-------------|
+| $0.40 | 2.50x | Excellent |
+| $0.50 | 2.00x | Good |
+| $0.55 | 1.82x | Acceptable (default max) |
+| $0.60 | 1.67x | Marginal |
+| $0.80 | 1.25x | Poor - SKIP |
+
+```bash
+# Default: only trade when price <= 0.55
+--max-price 0.55
+```
+
 ### Kelly Criterion Settings
 
 | Parameter | Recommended | Description |
@@ -290,6 +307,7 @@ let signal = LiquidationCascadeSignal::default()
 | `--kelly-fraction` | 0.25 | Quarter Kelly (conservative) |
 | `--max-bet-fraction` | 0.05 | Max 5% of bankroll per bet |
 | `--min-edge` | 0.03 | Minimum 3% expected edge |
+| `--max-price` | 0.55 | Only buy at decent odds (1.82x+ payout) |
 | `--bankroll` | 10000 | Starting paper bankroll |
 
 ### Position Sizing Formula
