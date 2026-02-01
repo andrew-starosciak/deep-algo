@@ -298,10 +298,37 @@ async fn run_trading_system(config_path: &str) -> anyhow::Result<()> {
     let database =
         std::sync::Arc::new(algo_trade_bot_orchestrator::BotDatabase::new(&db_path).await?);
 
-    // Create bot registry with persistence
-    let registry = std::sync::Arc::new(algo_trade_bot_orchestrator::BotRegistry::with_database(
-        database,
-    ));
+    // Try to create PostgreSQL pool for microstructure orchestrator (optional)
+    let pg_pool = match std::env::var("DATABASE_URL") {
+        Ok(url) => {
+            tracing::info!(
+                "Found DATABASE_URL, creating PostgreSQL pool for microstructure signals"
+            );
+            match sqlx::PgPool::connect(&url).await {
+                Ok(pool) => {
+                    tracing::info!("PostgreSQL pool created successfully");
+                    Some(pool)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to create PostgreSQL pool: {}. Microstructure orchestrator will not be available.", e);
+                    None
+                }
+            }
+        }
+        Err(_) => {
+            tracing::info!(
+                "DATABASE_URL not set, microstructure orchestrator will not be available"
+            );
+            None
+        }
+    };
+
+    // Create bot registry with persistence (and optional PostgreSQL pool)
+    let registry = std::sync::Arc::new(if let Some(pool) = pg_pool {
+        algo_trade_bot_orchestrator::BotRegistry::with_database_and_pool(database, pool)
+    } else {
+        algo_trade_bot_orchestrator::BotRegistry::with_database(database)
+    });
 
     // Restore bots from database
     match registry.restore_from_db().await {

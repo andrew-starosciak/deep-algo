@@ -52,4 +52,4 @@ mod orchestrator;
 pub use cached_signals::{CachedMicroSignals, SharedMicroSignals};
 pub use enhanced_strategy::EnhancedStrategy;
 pub use filter::{FilterResult, MicrostructureFilter, MicrostructureFilterConfig};
-pub use orchestrator::{MicrostructureOrchestrator, OrchestratorCommand};
+pub use orchestrator::{MicrostructureOrchestrator, OrchestratorCommand, OrchestratorConfig};

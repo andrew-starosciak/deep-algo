@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 #[cfg(feature = "microstructure-bridge")]
 pub use algo_trade_signals::bridge::{
     CachedMicroSignals, EnhancedStrategy, MicrostructureFilter, MicrostructureFilterConfig,
-    MicrostructureOrchestrator, OrchestratorCommand, SharedMicroSignals,
+    MicrostructureOrchestrator, OrchestratorCommand, OrchestratorConfig, SharedMicroSignals,
 };
 
 /// Configuration for microstructure bridge integration
@@ -169,7 +169,8 @@ pub fn create_strategy_with_bridge(
             let base_strategy = MaCrossoverStrategy::new(symbol, fast, slow);
 
             if let Some(bridge) = bridge_config {
-                let enhanced = EnhancedStrategy::new(base_strategy, bridge.signals, bridge.filter_config);
+                let enhanced =
+                    EnhancedStrategy::new(base_strategy, bridge.signals, bridge.filter_config);
                 Ok(Arc::new(Mutex::new(enhanced)))
             } else {
                 Ok(Arc::new(Mutex::new(base_strategy)))
@@ -179,7 +180,8 @@ pub fn create_strategy_with_bridge(
             let base_strategy = parse_and_create_quad_ma(symbol, config)?;
 
             if let Some(bridge) = bridge_config {
-                let enhanced = EnhancedStrategy::new(base_strategy, bridge.signals, bridge.filter_config);
+                let enhanced =
+                    EnhancedStrategy::new(base_strategy, bridge.signals, bridge.filter_config);
                 Ok(Arc::new(Mutex::new(enhanced)))
             } else {
                 Ok(Arc::new(Mutex::new(base_strategy)))

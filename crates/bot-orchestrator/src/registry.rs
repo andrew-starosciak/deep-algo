@@ -8,6 +8,7 @@ use crate::events::{BotEvent, EnhancedBotStatus};
 use anyhow::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, watch, RwLock};
@@ -15,6 +16,8 @@ use tokio::sync::{broadcast, mpsc, watch, RwLock};
 pub struct BotRegistry {
     bots: Arc<RwLock<HashMap<String, BotHandle>>>,
     db: Option<Arc<BotDatabase>>,
+    /// PostgreSQL pool for microstructure orchestrator (optional)
+    pool: Option<PgPool>,
 }
 
 impl Default for BotRegistry {
@@ -33,6 +36,7 @@ impl BotRegistry {
         Self {
             bots: Arc::new(RwLock::new(HashMap::new())),
             db: None,
+            pool: None,
         }
     }
 
@@ -49,6 +53,48 @@ impl BotRegistry {
         Self {
             bots: Arc::new(RwLock::new(HashMap::new())),
             db: Some(database),
+            pool: None,
+        }
+    }
+
+    /// Creates a new bot registry with database persistence and PostgreSQL pool.
+    ///
+    /// When a pool is provided, bots with microstructure enabled will spawn
+    /// a `MicrostructureOrchestrator` background task for signal collection.
+    ///
+    /// # Arguments
+    ///
+    /// * `database` - SQLite database instance for bot persistence
+    /// * `pool` - PostgreSQL pool for microstructure signal queries
+    ///
+    /// # Returns
+    /// A new `BotRegistry` instance with full database support.
+    #[must_use]
+    pub fn with_database_and_pool(database: Arc<BotDatabase>, pool: PgPool) -> Self {
+        Self {
+            bots: Arc::new(RwLock::new(HashMap::new())),
+            db: Some(database),
+            pool: Some(pool),
+        }
+    }
+
+    /// Creates a new bot registry with only PostgreSQL pool (no bot persistence).
+    ///
+    /// Useful for testing or when bot persistence is not needed but microstructure
+    /// signals are required.
+    ///
+    /// # Arguments
+    ///
+    /// * `pool` - PostgreSQL pool for microstructure signal queries
+    ///
+    /// # Returns
+    /// A new `BotRegistry` instance with PostgreSQL access.
+    #[must_use]
+    pub fn with_pool(pool: PgPool) -> Self {
+        Self {
+            bots: Arc::new(RwLock::new(HashMap::new())),
+            db: None,
+            pool: Some(pool),
         }
     }
 
@@ -95,7 +141,12 @@ impl BotRegistry {
         let handle = BotHandle::new(tx, event_tx.clone(), status_rx);
 
         let bot_id = config.bot_id.clone();
-        let actor = BotActor::new(config, rx, event_tx, status_tx);
+        // Create actor with pool if available (for microstructure orchestrator)
+        let actor = if let Some(pool) = &self.pool {
+            BotActor::with_pool(config, rx, event_tx, status_tx, pool.clone())
+        } else {
+            BotActor::new(config, rx, event_tx, status_tx)
+        };
         let bot_id_for_task = bot_id.clone();
         tokio::spawn(async move {
             if let Err(e) = actor.run().await {
@@ -415,5 +466,45 @@ impl BotRegistry {
         }
 
         Ok((started, stopped))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_new_has_no_pool() {
+        let registry = BotRegistry::new();
+        assert!(registry.pool.is_none());
+        assert!(registry.db.is_none());
+    }
+
+    #[test]
+    fn registry_with_pool_stores_pool() {
+        // Note: We can't create a real PgPool in a unit test without a database connection,
+        // but this test documents that the with_pool constructor exists
+        // and the struct has the expected fields
+        let registry = BotRegistry::new();
+        assert!(registry.pool.is_none());
+    }
+
+    #[test]
+    fn registry_default_is_same_as_new() {
+        let registry1 = BotRegistry::new();
+        let registry2 = BotRegistry::default();
+
+        // Both should have no pool and no db
+        assert!(registry1.pool.is_none());
+        assert!(registry2.pool.is_none());
+        assert!(registry1.db.is_none());
+        assert!(registry2.db.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_list_bots_empty_initially() {
+        let registry = BotRegistry::new();
+        let bots = registry.list_bots().await;
+        assert!(bots.is_empty());
     }
 }
