@@ -1633,8 +1633,16 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
             }
 
             // Create pending entry - entry strategy will determine when to trade
-            let estimated_prob =
-                Decimal::from_f64_retain(0.5 + strength * 0.3).unwrap_or(dec!(0.55));
+            // estimated_prob is the probability of YES winning
+            // For Yes direction: high signal = high prob of Yes = 0.5 + strength * 0.3
+            // For No direction: high signal = LOW prob of Yes = 0.5 - strength * 0.3
+            let estimated_prob = if direction {
+                // Yes/Up signal: higher strength = higher P(Yes)
+                Decimal::from_f64_retain(0.5 + strength * 0.3).unwrap_or(dec!(0.55))
+            } else {
+                // No/Down signal: higher strength = LOWER P(Yes) = higher P(No)
+                Decimal::from_f64_retain(0.5 - strength * 0.3).unwrap_or(dec!(0.45))
+            };
 
             // Capture BTC price at signal detection (approximates window start price)
             let btc_price_at_signal = {
@@ -1680,9 +1688,12 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
 
             // Check if window expired
             if pending.is_expired(now) {
-                tracing::debug!(
+                tracing::info!(
                     window_start = %window_start.format("%H:%M"),
-                    "Pending entry expired without trading"
+                    window_end = %pending.window_end.format("%H:%M"),
+                    signal_strength = pending.signal_strength,
+                    direction = if pending.signal_direction { "Yes" } else { "No" },
+                    "Pending entry EXPIRED without trading - entry conditions not met"
                 );
                 entries_to_remove.push(*window_start);
                 continue;
@@ -1759,13 +1770,19 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
                     }
                 }
                 EntryDecision::NoEntry { reason } => {
-                    tracing::debug!(
-                        strategy = entry_strategy.name(),
-                        reason = reason,
-                        offset_mins = entry_ctx.current_offset.num_minutes(),
-                        edge = %entry_ctx.calculate_edge(),
-                        "Entry strategy waiting"
-                    );
+                    // Log at info level once per minute (every 6th iteration at 10s intervals)
+                    let offset_secs = entry_ctx.current_offset.num_seconds();
+                    if offset_secs % 60 < 10 {
+                        tracing::info!(
+                            strategy = entry_strategy.name(),
+                            reason = reason,
+                            offset_mins = entry_ctx.current_offset.num_minutes(),
+                            edge = %entry_ctx.calculate_edge(),
+                            signal_strength = pending.signal_strength,
+                            direction = if pending.signal_direction { "Yes" } else { "No" },
+                            "Entry strategy waiting - conditions not met"
+                        );
+                    }
                 }
             }
         }
