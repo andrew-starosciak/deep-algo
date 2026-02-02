@@ -26,9 +26,10 @@ pub use generator::{
 
 // Re-export collectors for convenience
 pub use collector::{
-    calculate_urgency, categorize_news, determine_sentiment, CollectorConfig, CollectorEvent,
-    CollectorStats, FundingCollector, LiquidationCollector, LiquidationCollectorConfig,
-    NewsCategory, NewsCollector, NewsCollectorConfig, OrderBookCollector, RollingWindows,
+    calculate_urgency, categorize_news, determine_sentiment, AggTradeEvent, AggTradeStreamWrapper,
+    CollectorConfig, CollectorEvent, CollectorStats, CvdAggregator, FundingCollector,
+    LiquidationCollector, LiquidationCollectorConfig, NewsCategory, NewsCollector,
+    NewsCollectorConfig, OrderBookCollector, RollingWindows, TradeTickCollector,
 };
 
 // Re-export registry

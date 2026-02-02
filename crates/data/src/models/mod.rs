@@ -3,6 +3,7 @@
 //! All models use `rust_decimal::Decimal` for financial precision.
 //! Models derive `sqlx::FromRow` for database compatibility.
 
+pub mod cvd_aggregate;
 pub mod funding;
 pub mod liquidation;
 pub mod news;
@@ -11,7 +12,11 @@ pub mod paper_trade;
 pub mod polymarket;
 pub mod signal_snapshot;
 pub mod trade;
+pub mod trade_tick;
 
+pub use cvd_aggregate::{
+    calculate_cumulative_cvd, calculate_rolling_cvd, extract_close_prices, CvdAggregateRecord,
+};
 pub use funding::{FundingBias, FundingRateRecord};
 pub use liquidation::{
     CascadeDirection, LiquidationAggregateRecord, LiquidationRecord, LiquidationSide,
@@ -24,6 +29,7 @@ pub use paper_trade::{
 pub use polymarket::PolymarketOddsRecord;
 pub use signal_snapshot::{SignalDirection, SignalSnapshotRecord};
 pub use trade::{BinaryTradeRecord, TradeDirection, TradeOutcome};
+pub use trade_tick::{TradeSide, TradeTickRecord};
 
 #[cfg(test)]
 mod tests {

@@ -14,6 +14,7 @@ services:
       - ./scripts/setup_timescale.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
       - ./scripts/migrations/V001__phase1_tables.sql:/docker-entrypoint-initdb.d/02-phase1.sql:ro
       - ./scripts/migrations/V002__signal_snapshots.sql:/docker-entrypoint-initdb.d/03-signal-snapshots.sql:ro
+      - ./scripts/migrations/V006__cvd_tables.sql:/docker-entrypoint-initdb.d/06-cvd-tables.sql:ro
     secrets:
       - db_password
     healthcheck:
@@ -186,7 +187,7 @@ services:
     depends_on:
       timescaledb:
         condition: service_healthy
-    command: ["collect-signals", "--duration", "${COLLECT_DURATION:-24h}", "--sources", "${COLLECT_SOURCES:-orderbook,funding,liquidations}"]
+    command: ["collect-signals", "--duration", "${COLLECT_DURATION:-24h}", "--sources", "${COLLECT_SOURCES:-orderbook,funding,liquidations,tradeticks}"]
     restart: unless-stopped
     stop_grace_period: 30s
     networks:

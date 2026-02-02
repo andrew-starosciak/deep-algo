@@ -4,6 +4,7 @@
 //! that produce trading signals based on market data analysis.
 
 mod composite;
+pub mod cvd_divergence;
 mod funding_rate;
 pub mod liquidation_cascade;
 pub mod liquidation_ratio;
@@ -14,6 +15,11 @@ mod orderbook_imbalance;
 pub use composite::{
     adjust_weights_for_multicollinearity, calculate_correlation_matrix, combine_bayesian,
     CombinationMethod, CompositeSignal, CorrelationMatrix,
+};
+pub use cvd_divergence::{
+    calculate_divergence_strength, detect_absorption, detect_bearish_divergence,
+    detect_bullish_divergence, detect_divergence, AbsorptionType, CvdDivergenceConfig,
+    CvdDivergenceSignal, DivergenceType,
 };
 pub use funding_rate::{
     detect_reversal, is_funding_extreme_30d, percentile_signal, FundingPercentileConfig,

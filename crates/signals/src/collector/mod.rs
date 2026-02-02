@@ -4,6 +4,7 @@
 //! - Order book snapshots (1/sec aggregation from 100ms updates)
 //! - Funding rates with rolling statistical context
 //! - Liquidation events with rolling window aggregates
+//! - Trade ticks for CVD (Cumulative Volume Delta) signals
 //! - News events with urgency scoring
 //! - OHLCV historical data backfill from Binance Futures
 //!
@@ -15,6 +16,7 @@ mod liquidation_collector;
 mod news_collector;
 mod ohlcv_collector;
 mod orderbook_collector;
+mod trade_tick_collector;
 mod types;
 
 pub use funding_collector::{FundingCollector, MarkPriceUpdate, RollingHistory};
@@ -32,5 +34,8 @@ pub use ohlcv_collector::{
 pub use orderbook_collector::{
     calculate_imbalance, calculate_mid_price, calculate_spread_bps, calculate_total_volume,
     parse_levels_to_json, DepthUpdate, OrderBookAggregator, OrderBookCollector, StreamWrapper,
+};
+pub use trade_tick_collector::{
+    AggTradeEvent, AggTradeStreamWrapper, CvdAggregator, TradeTickCollector,
 };
 pub use types::{CollectorConfig, CollectorEvent, CollectorStats};

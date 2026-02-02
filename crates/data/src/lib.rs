@@ -21,18 +21,19 @@ pub use parquet_storage::ParquetStorage;
 
 // Re-export models
 pub use models::{
-    BinaryTradeRecord, CascadeDirection, FundingBias, FundingRateRecord, KellyCriterion,
-    LiquidationAggregateRecord, LiquidationRecord, LiquidationSide, NewsEventRecord, NewsSentiment,
-    NewsSignalDirection, OrderBookSnapshotRecord, PaperTradeDirection, PaperTradeRecord,
-    PaperTradeStatus, PolymarketOddsRecord, SignalDirection, SignalSnapshotRecord, TradeDecision,
-    TradeDirection, TradeOutcome,
+    BinaryTradeRecord, CascadeDirection, CvdAggregateRecord, FundingBias, FundingRateRecord,
+    KellyCriterion, LiquidationAggregateRecord, LiquidationRecord, LiquidationSide,
+    NewsEventRecord, NewsSentiment, NewsSignalDirection, OrderBookSnapshotRecord,
+    PaperTradeDirection, PaperTradeRecord, PaperTradeStatus, PolymarketOddsRecord, SignalDirection,
+    SignalSnapshotRecord, TradeDecision, TradeDirection, TradeOutcome, TradeSide, TradeTickRecord,
 };
 
 // Re-export repositories
 pub use repositories::{
-    BinaryTradeRepository, FundingRateRepository, LiquidationRepository, NewsEventRepository,
-    OhlcvRepository, OrderBookRepository, PaperTradeRepository, PaperTradeStatistics,
-    PolymarketOddsRepository, Repositories, SignalSnapshotRepository, ValidationStats,
+    BinaryTradeRepository, CvdRepository, FundingRateRepository, LiquidationRepository,
+    NewsEventRepository, OhlcvRepository, OrderBookRepository, PaperTradeRepository,
+    PaperTradeStatistics, PolymarketOddsRepository, Repositories, SignalSnapshotRepository,
+    TradeTickRepository, ValidationStats,
 };
 
 // Re-export Chainlink price feed types

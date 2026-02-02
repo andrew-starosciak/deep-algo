@@ -16,6 +16,8 @@ pub enum Source {
     Funding,
     /// Liquidation events (Binance Futures)
     Liquidations,
+    /// Trade ticks for CVD (Binance Futures)
+    TradeTicks,
     /// Polymarket odds (CLOB API)
     Polymarket,
     /// News events (CryptoPanic)
@@ -29,6 +31,7 @@ impl Source {
             Source::OrderBook,
             Source::Funding,
             Source::Liquidations,
+            Source::TradeTicks,
             Source::Polymarket,
             Source::News,
         ]
@@ -40,6 +43,7 @@ impl Source {
             Source::OrderBook => "orderbook",
             Source::Funding => "funding",
             Source::Liquidations => "liquidations",
+            Source::TradeTicks => "tradeticks",
             Source::Polymarket => "polymarket",
             Source::News => "news",
         }
@@ -156,11 +160,12 @@ pub fn parse_sources(s: &str) -> Result<Vec<Source>> {
             "orderbook" => Source::OrderBook,
             "funding" => Source::Funding,
             "liquidations" => Source::Liquidations,
+            "tradeticks" => Source::TradeTicks,
             "polymarket" => Source::Polymarket,
             "news" => Source::News,
             _ => {
                 return Err(anyhow!(
-                    "Unknown source: '{}'. Valid sources: orderbook, funding, liquidations, polymarket, news",
+                    "Unknown source: '{}'. Valid sources: orderbook, funding, liquidations, tradeticks, polymarket, news",
                     source_name
                 ))
             }
@@ -273,14 +278,15 @@ impl HealthStats {
 /// Returns an error if database connection fails or collectors cannot start.
 pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
     use algo_trade_data::{
-        FundingRateRecord, FundingRateRepository, LiquidationAggregateRecord, LiquidationRecord,
-        LiquidationRepository, NewsEventRecord, NewsEventRepository, OrderBookRepository,
-        OrderBookSnapshotRecord, PolymarketOddsRecord, PolymarketOddsRepository,
+        CvdAggregateRecord, CvdRepository, FundingRateRecord, FundingRateRepository,
+        LiquidationAggregateRecord, LiquidationRecord, LiquidationRepository, NewsEventRecord,
+        NewsEventRepository, OrderBookRepository, OrderBookSnapshotRecord, PolymarketOddsRecord,
+        PolymarketOddsRepository, TradeTickRecord, TradeTickRepository,
     };
     use algo_trade_polymarket::{OddsCollector, OddsCollectorConfig, PolymarketClient};
     use algo_trade_signals::{
         CollectorConfig, FundingCollector, LiquidationCollector, LiquidationCollectorConfig,
-        NewsCollector, NewsCollectorConfig, OrderBookCollector,
+        NewsCollector, NewsCollectorConfig, OrderBookCollector, TradeTickCollector,
     };
     use sqlx::postgres::PgPoolOptions;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -315,6 +321,8 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
     let orderbook_repo = OrderBookRepository::new(pool.clone());
     let funding_repo = FundingRateRepository::new(pool.clone());
     let liquidation_repo = LiquidationRepository::new(pool.clone());
+    let trade_tick_repo = TradeTickRepository::new(pool.clone());
+    let cvd_repo = CvdRepository::new(pool.clone());
     let polymarket_repo = PolymarketOddsRepository::new(pool.clone());
     let news_repo = NewsEventRepository::new(pool.clone());
 
@@ -381,8 +389,7 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
 
             Source::Liquidations => {
                 let (tx, rx) = mpsc::channel::<LiquidationRecord>(CHANNEL_SIZE);
-                let (agg_tx, agg_rx) =
-                    mpsc::channel::<LiquidationAggregateRecord>(CHANNEL_SIZE);
+                let (agg_tx, agg_rx) = mpsc::channel::<LiquidationAggregateRecord>(CHANNEL_SIZE);
                 let config = LiquidationCollectorConfig::for_symbol(&args.symbol)
                     .with_aggregate_interval(Duration::from_secs(60)); // Emit aggregates every 60s
                 let shutdown = shutdown.clone();
@@ -391,8 +398,8 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
                 let health_agg = health_stats.clone();
 
                 // Spawn collector with aggregate channel
-                let mut collector = LiquidationCollector::new(config, tx)
-                    .with_aggregate_channel(agg_tx);
+                let mut collector =
+                    LiquidationCollector::new(config, tx).with_aggregate_channel(agg_tx);
                 handles.push(tokio::spawn(async move {
                     if let Err(e) = collector.run().await {
                         tracing::error!("Liquidation collector error: {}", e);
@@ -420,6 +427,49 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
 
                 tracing::info!(
                     "Started Liquidation collector for {} (with aggregate persistence)",
+                    args.symbol
+                );
+            }
+
+            Source::TradeTicks => {
+                let (tx, rx) = mpsc::channel::<TradeTickRecord>(CHANNEL_SIZE);
+                let (cvd_tx, cvd_rx) = mpsc::channel::<CvdAggregateRecord>(CHANNEL_SIZE);
+                let config = CollectorConfig::new(&args.symbol);
+                let shutdown = shutdown.clone();
+                let shutdown_cvd = shutdown.clone();
+                let health = health_stats.clone();
+                let health_cvd = health_stats.clone();
+
+                // Spawn collector with CVD aggregation (60-second windows)
+                let mut collector =
+                    TradeTickCollector::new(config, tx).with_cvd_channel(cvd_tx, 60);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = collector.run().await {
+                        tracing::error!("TradeTick collector error: {}", e);
+                    }
+                }));
+
+                // Spawn database writer for individual trade ticks
+                let repo = trade_tick_repo.clone();
+                handles.push(tokio::spawn(async move {
+                    run_database_writer(rx, repo, shutdown, health, Source::TradeTicks).await;
+                }));
+
+                // Spawn database writer for CVD aggregates
+                let repo_cvd = cvd_repo.clone();
+                handles.push(tokio::spawn(async move {
+                    run_database_writer(
+                        cvd_rx,
+                        repo_cvd,
+                        shutdown_cvd,
+                        health_cvd,
+                        Source::TradeTicks,
+                    )
+                    .await;
+                }));
+
+                tracing::info!(
+                    "Started TradeTick collector for {} (with CVD aggregation)",
                     args.symbol
                 );
             }
@@ -593,6 +643,20 @@ impl BatchInsert<algo_trade_data::PolymarketOddsRecord>
 #[async_trait::async_trait]
 impl BatchInsert<algo_trade_data::NewsEventRecord> for algo_trade_data::NewsEventRepository {
     async fn insert_batch(&self, records: &[algo_trade_data::NewsEventRecord]) -> Result<()> {
+        self.insert_batch(records).await
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchInsert<algo_trade_data::TradeTickRecord> for algo_trade_data::TradeTickRepository {
+    async fn insert_batch(&self, records: &[algo_trade_data::TradeTickRecord]) -> Result<()> {
+        self.insert_batch(records).await
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchInsert<algo_trade_data::CvdAggregateRecord> for algo_trade_data::CvdRepository {
+    async fn insert_batch(&self, records: &[algo_trade_data::CvdAggregateRecord]) -> Result<()> {
         self.insert_batch(records).await
     }
 }
@@ -791,20 +855,28 @@ mod tests {
 
     #[test]
     fn test_parse_sources_all() {
-        let sources = parse_sources("orderbook,funding,liquidations,polymarket,news").unwrap();
-        assert_eq!(sources.len(), 5);
+        let sources =
+            parse_sources("orderbook,funding,liquidations,tradeticks,polymarket,news").unwrap();
+        assert_eq!(sources.len(), 6);
     }
 
     #[test]
     fn test_parse_sources_empty_returns_all() {
         let sources = parse_sources("").unwrap();
-        assert_eq!(sources.len(), 5);
+        assert_eq!(sources.len(), 6);
     }
 
     #[test]
     fn test_parse_sources_all_keyword() {
         let sources = parse_sources("all").unwrap();
-        assert_eq!(sources.len(), 5);
+        assert_eq!(sources.len(), 6);
+    }
+
+    #[test]
+    fn test_parse_sources_tradeticks() {
+        let sources = parse_sources("tradeticks").unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0], Source::TradeTicks);
     }
 
     #[test]
@@ -846,10 +918,11 @@ mod tests {
     #[test]
     fn test_source_all() {
         let all = Source::all();
-        assert_eq!(all.len(), 5);
+        assert_eq!(all.len(), 6);
         assert!(all.contains(&Source::OrderBook));
         assert!(all.contains(&Source::Funding));
         assert!(all.contains(&Source::Liquidations));
+        assert!(all.contains(&Source::TradeTicks));
         assert!(all.contains(&Source::Polymarket));
         assert!(all.contains(&Source::News));
     }
@@ -859,8 +932,15 @@ mod tests {
         assert_eq!(Source::OrderBook.as_str(), "orderbook");
         assert_eq!(Source::Funding.as_str(), "funding");
         assert_eq!(Source::Liquidations.as_str(), "liquidations");
+        assert_eq!(Source::TradeTicks.as_str(), "tradeticks");
         assert_eq!(Source::Polymarket.as_str(), "polymarket");
         assert_eq!(Source::News.as_str(), "news");
+    }
+
+    #[test]
+    fn test_source_all_includes_tradeticks() {
+        let all = Source::all();
+        assert!(all.contains(&Source::TradeTicks));
     }
 
     // =====================================================================
