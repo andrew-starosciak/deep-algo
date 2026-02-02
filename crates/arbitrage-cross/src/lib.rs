@@ -1,4 +1,4 @@
-//! Cross-exchange arbitrage detection and orchestration.
+//! Cross-exchange arbitrage detection, execution, and reconciliation.
 //!
 //! This crate provides tools for detecting and executing arbitrage opportunities
 //! between Kalshi and Polymarket prediction markets.
@@ -26,13 +26,17 @@
 //! - [`fees`]: Fee calculations for both exchanges
 //! - [`matcher`]: Match equivalent markets across exchanges
 //! - [`detector`]: Detect arbitrage opportunities
+//! - [`executor`]: Coordinated cross-exchange execution
+//! - [`reconciler`]: Settlement tracking and P&L reconciliation
 //!
 //! # Example
 //!
 //! ```ignore
 //! use algo_trade_arbitrage_cross::{
 //!     CrossExchangeDetector, DetectorConfig,
+//!     CrossExecutorConfig,
 //!     MarketMatcher, MatchConfig,
+//!     SettlementReconciler,
 //!     FeeCalculator,
 //! };
 //!
@@ -58,6 +62,13 @@
 //!             opp.net_edge_pct,
 //!             opp.expected_profit
 //!         );
+//!
+//!         // Execute the opportunity
+//!         let result = executor.execute(&opp).await;
+//!         if result.is_success() {
+//!             // Track for settlement
+//!             reconciler.add_position(/* ... */);
+//!         }
 //!     }
 //! }
 //! ```
@@ -74,8 +85,10 @@
 //! Mismatched settlement criteria can turn guaranteed arbitrage into a gamble.
 
 pub mod detector;
+pub mod executor;
 pub mod fees;
 pub mod matcher;
+pub mod reconciler;
 pub mod types;
 
 // Re-export main types for convenience
@@ -83,8 +96,16 @@ pub use detector::{
     CrossExchangeDetector, CrossExchangeOpportunity, DetectionSummary, DetectorConfig,
     OpportunitySummary,
 };
+pub use executor::{
+    CrossCircuitBreaker, CrossCircuitBreakerState, CrossExecutionResult, CrossExecutorConfig,
+    CrossPosition, CrossPositionStatus, PolymarketHardLimits, UnwindResult,
+};
 pub use fees::{ArbitrageFees, FeeCalculator, FeeConfig};
 pub use matcher::{MarketMatcher, MatchConfig, ParsedKalshiMarket, ParsedPolymarketMarket};
+pub use reconciler::{
+    PositionStatus, ReconcilerSummary, ReconciliationResult, SettlementEvent, SettlementOutcome,
+    SettlementReconciler, TrackedPosition,
+};
 pub use types::{
     Comparison, Exchange, MatchedMarket, PriceSource, SettlementCriteria, SettlementVerification,
     Side,

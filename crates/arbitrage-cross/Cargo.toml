@@ -21,6 +21,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 uuid = { version = "1", features = ["v4", "serde"] }
+parking_lot = "0.12"
+async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
