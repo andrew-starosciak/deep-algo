@@ -5,6 +5,7 @@ members = [
     "crates/exchange-hyperliquid",
     "crates/exchange-polymarket",
     "crates/exchange-kalshi",
+    "crates/arbitrage-cross",
     "crates/data",
     "crates/strategy",
     "crates/execution",
