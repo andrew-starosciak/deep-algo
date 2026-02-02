@@ -8,8 +8,8 @@ mod tui_live_bot;
 use commands::{
     ArbitrageBotArgs, BackfillFundingArgs, BackfillOhlcvArgs, BackfillSignalsArgs,
     BinaryBacktestArgs, CalculateReturnsArgs, CollectPolymarketArgs, CollectSignalsArgs,
-    CrossArbitrageArgs, DataStatusArgs, EntryStrategySimArgs, Phase1ArbitrageArgs,
-    PolymarketPaperTradeArgs, ValidateSignalsArgs,
+    CrossArbitrageArgs, DataStatusArgs, EntryStrategySimArgs, LatencyMonitorArgs,
+    Phase1ArbitrageArgs, PolymarketPaperTradeArgs, ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -137,6 +137,8 @@ enum Commands {
     Phase1Arbitrage(Phase1ArbitrageArgs),
     /// Run cross-exchange arbitrage between Kalshi and Polymarket
     CrossArbitrage(CrossArbitrageArgs),
+    /// Monitor for latency arbitrage opportunities (gabagool strategy)
+    LatencyMonitor(LatencyMonitorArgs),
 }
 
 #[tokio::main]
@@ -262,6 +264,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::CrossArbitrage(args) => {
             commands::run_cross_arbitrage(args).await?;
+        }
+        Commands::LatencyMonitor(args) => {
+            commands::run_latency_monitor(args).await?;
         }
     }
 

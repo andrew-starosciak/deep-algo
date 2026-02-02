@@ -69,7 +69,10 @@ pub mod circuit_breaker;
 pub mod detector;
 pub mod dual_leg_executor;
 pub mod execution;
+pub mod latency_detector;
+pub mod latency_runner;
 pub mod live_executor;
+pub mod spot_feed;
 pub mod metrics;
 pub mod orderbook;
 pub mod paper_executor;
@@ -131,3 +134,17 @@ pub use sdk_client::{ClobClient, ClobClientConfig, ClobError};
 
 // Real-time order book feed
 pub use book_feed::{BookFeed, BookFeedConfig, BookFeedError, BookFeedManager};
+
+// Latency arbitrage detection
+pub use latency_detector::{
+    LatencyConfig, LatencyDetector, LatencyDirection, LatencySignal, SpotPriceTracker,
+};
+
+// Binance spot price feed
+pub use spot_feed::{SpotFeedError, SpotFeedStats, SpotPriceFeed, SpotPriceFeedConfig};
+
+// Integrated latency arbitrage runner
+pub use latency_runner::{
+    run_latency_monitor, LatencyRunner, LatencyRunnerConfig, LatencyRunnerError,
+    LatencyRunnerStats,
+};
