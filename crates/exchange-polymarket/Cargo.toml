@@ -29,6 +29,8 @@ rand = "0.8"
 parking_lot = "0.12"
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
+secrecy = "0.10"
+zeroize = "1.7"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

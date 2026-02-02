@@ -66,9 +66,12 @@
 
 pub mod detector;
 pub mod execution;
+pub mod live_executor;
 pub mod metrics;
 pub mod orderbook;
 pub mod paper_executor;
+pub mod rate_limiter;
+pub mod signer;
 pub mod types;
 
 // Re-export main types for convenience
@@ -90,3 +93,12 @@ pub use execution::{
 
 // Paper trading executor
 pub use paper_executor::{PaperExecutor, PaperExecutorConfig};
+
+// Live trading executor
+pub use live_executor::{HardLimits, LiveExecutor, LiveExecutorConfig, POLYMARKET_MAINNET_URL, POLYMARKET_TESTNET_URL};
+
+// Rate limiting
+pub use rate_limiter::{ClobRateLimiter, RateLimiterConfig};
+
+// Secure wallet for order signing
+pub use signer::{Wallet, WalletConfig, WalletError};
