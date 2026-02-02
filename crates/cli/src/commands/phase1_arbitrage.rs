@@ -37,11 +37,12 @@ use tracing::{error, info, warn};
 
 use crate::commands::collect_signals::parse_duration;
 use algo_trade_polymarket::arbitrage::{
-    ArbitrageDetector, ArbitrageSession, DualLegExecutor, DualLegResult, HardLimits, L2OrderBook,
-    LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig, Phase1Config,
-    PolymarketExecutor, Recommendation, TradingMode,
+    ArbitrageDetector, ArbitrageSession, BookFeed, BookFeedConfig, DualLegExecutor, DualLegResult,
+    HardLimits, L2OrderBook, LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig,
+    Phase1Config, PolymarketExecutor, Recommendation, TradingMode,
 };
 use algo_trade_polymarket::GammaClient;
+use std::collections::HashMap;
 
 /// Arguments for the phase1-arbitrage command.
 #[derive(Args, Debug, Clone)]
@@ -108,6 +109,16 @@ pub struct Phase1ArbitrageArgs {
     /// Use with caution - this will execute real trades immediately.
     #[arg(long)]
     pub skip_confirmation: bool,
+
+    /// Use real order books from Polymarket WebSocket instead of simulated data.
+    /// This is REQUIRED for meaningful testing - simulated books are useless.
+    /// Enabled by default. Use --no-real-books to disable (not recommended).
+    #[arg(long, default_value = "true")]
+    pub real_books: bool,
+
+    /// Timeout in seconds to wait for WebSocket order book snapshots.
+    #[arg(long, default_value = "30")]
+    pub book_timeout_secs: u64,
 }
 
 impl Phase1ArbitrageArgs {
@@ -212,11 +223,24 @@ async fn run_paper_mode(
 
     let poll_interval = Duration::from_millis(args.poll_interval_ms);
 
+    // Track active book feeds by condition_id
+    let mut book_feeds: HashMap<String, BookFeed> = HashMap::new();
+
+    if args.real_books {
+        info!("============================================");
+        info!("   USING REAL ORDER BOOKS (WebSocket)");
+        info!("============================================");
+    } else {
+        warn!("============================================");
+        warn!("   ⚠️  USING SIMULATED ORDER BOOKS ⚠️");
+        warn!("   Results are MEANINGLESS for validation!");
+        warn!("============================================");
+    }
+
     info!("Starting Phase 1 paper trading...");
     info!("Press Ctrl+C to stop.");
 
     while running.load(Ordering::SeqCst) {
-
         // Check time limit
         if let Some(end) = end_time {
             if std::time::Instant::now() >= end {
@@ -243,17 +267,106 @@ async fn run_paper_mode(
         // Limit to first 10 markets
         let markets: Vec<_> = markets.into_iter().take(10).collect();
 
+        // Connect to WebSocket for new markets (if using real books)
+        if args.real_books {
+            for market in &markets {
+                if !book_feeds.contains_key(&market.condition_id) {
+                    // Get token IDs
+                    let yes_token = market.up_token().map(|t| t.token_id.clone());
+                    let no_token = market.down_token().map(|t| t.token_id.clone());
+
+                    if let (Some(yes_id), Some(no_id)) = (yes_token, no_token) {
+                        info!(
+                            condition_id = %market.condition_id,
+                            "Connecting to WebSocket for real order books..."
+                        );
+
+                        match BookFeed::connect(
+                            yes_id,
+                            no_id,
+                            BookFeedConfig {
+                                ready_timeout: Duration::from_secs(args.book_timeout_secs),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        {
+                            Ok(feed) => {
+                                // Wait for initial snapshots
+                                let timeout = Duration::from_secs(args.book_timeout_secs);
+                                match feed.wait_for_ready(timeout).await {
+                                    Ok(()) => {
+                                        info!(
+                                            condition_id = %market.condition_id,
+                                            "Book feed ready with real data!"
+                                        );
+                                        book_feeds.insert(market.condition_id.clone(), feed);
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            condition_id = %market.condition_id,
+                                            error = %e,
+                                            "Book feed timeout, skipping market"
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    condition_id = %market.condition_id,
+                                    error = %e,
+                                    "Failed to connect book feed"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Process each market
         for market in &markets {
             if !running.load(Ordering::SeqCst) {
                 break;
             }
 
-            // Fetch order books (simulated for paper trading)
-            let (yes_book, no_book) = create_simulated_orderbooks(&market.condition_id);
+            // Get order books (real or simulated)
+            let (yes_book, no_book) = if args.real_books {
+                match book_feeds.get(&market.condition_id) {
+                    Some(feed) => match feed.get_books() {
+                        Ok(books) => books,
+                        Err(e) => {
+                            warn!(
+                                condition_id = %market.condition_id,
+                                error = %e,
+                                "Failed to get books, skipping"
+                            );
+                            continue;
+                        }
+                    },
+                    None => {
+                        // No feed for this market yet
+                        continue;
+                    }
+                }
+            } else {
+                create_simulated_orderbooks(&market.condition_id)
+            };
+
+            // Log real book state periodically
+            if args.real_books && session.total_executions() % 10 == 0 {
+                if let (Some(yes_ask), Some(no_ask)) = (yes_book.best_ask(), no_book.best_ask()) {
+                    info!(
+                        condition_id = %market.condition_id,
+                        yes_ask = %yes_ask,
+                        no_ask = %no_ask,
+                        pair_cost = %(yes_ask + no_ask),
+                        "Real book state"
+                    );
+                }
+            }
 
             // Detect opportunity
-            // Use user-specified max position or default from config
             let max_pos = args.max_position.min(config.max_position_value());
             let order_size = max_pos / config.max_pair_cost();
             let opportunity = match detector.detect(
@@ -282,6 +395,7 @@ async fn run_paper_mode(
                 market_id = %market.condition_id,
                 pair_cost = %opportunity.pair_cost,
                 net_edge = %config.net_edge(opportunity.pair_cost),
+                real_books = args.real_books,
                 "Found valid opportunity, executing..."
             );
 
@@ -302,6 +416,12 @@ async fn run_paper_mode(
         }
 
         tokio::time::sleep(poll_interval).await;
+    }
+
+    // Shutdown book feeds
+    for (condition_id, feed) in &book_feeds {
+        info!(condition_id = %condition_id, "Shutting down book feed");
+        feed.shutdown().await;
     }
 
     Ok(())
@@ -402,8 +522,21 @@ async fn run_live_mode(
     let dual_executor = DualLegExecutor::new(executor);
     let poll_interval = Duration::from_millis(args.poll_interval_ms);
 
+    // Track active book feeds by condition_id
+    let mut book_feeds: HashMap<String, BookFeed> = HashMap::new();
+
+    // LIVE MODE REQUIRES REAL BOOKS
+    if !args.real_books {
+        error!("============================================");
+        error!("   ❌ LIVE MODE REQUIRES REAL ORDER BOOKS");
+        error!("   Cannot trade live with simulated data!");
+        error!("   Remove --no-real-books flag.");
+        error!("============================================");
+        return Err(anyhow::anyhow!("Live mode requires real order books"));
+    }
+
     info!("============================================");
-    info!("   LIVE TRADING STARTED");
+    info!("   LIVE TRADING STARTED (REAL BOOKS)");
     info!("============================================");
     info!("Press Ctrl+C to stop.");
 
@@ -443,6 +576,59 @@ async fn run_live_mode(
         // Limit to first 5 markets in live mode (more conservative)
         let markets: Vec<_> = markets.into_iter().take(5).collect();
 
+        // Connect to WebSocket for new markets
+        for market in &markets {
+            if !book_feeds.contains_key(&market.condition_id) {
+                let yes_token = market.up_token().map(|t| t.token_id.clone());
+                let no_token = market.down_token().map(|t| t.token_id.clone());
+
+                if let (Some(yes_id), Some(no_id)) = (yes_token, no_token) {
+                    info!(
+                        condition_id = %market.condition_id,
+                        "LIVE: Connecting to WebSocket for real order books..."
+                    );
+
+                    match BookFeed::connect(
+                        yes_id,
+                        no_id,
+                        BookFeedConfig {
+                            ready_timeout: Duration::from_secs(args.book_timeout_secs),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    {
+                        Ok(feed) => {
+                            let timeout = Duration::from_secs(args.book_timeout_secs);
+                            match feed.wait_for_ready(timeout).await {
+                                Ok(()) => {
+                                    info!(
+                                        condition_id = %market.condition_id,
+                                        "LIVE: Book feed ready!"
+                                    );
+                                    book_feeds.insert(market.condition_id.clone(), feed);
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        condition_id = %market.condition_id,
+                                        error = %e,
+                                        "LIVE: Book feed timeout, skipping market"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                condition_id = %market.condition_id,
+                                error = %e,
+                                "LIVE: Failed to connect book feed"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Process each market
         for market in &markets {
             if !running.load(Ordering::SeqCst) {
@@ -454,10 +640,35 @@ async fn run_live_mode(
                 break;
             }
 
-            // TODO: Fetch real order books via WebSocket
-            // For now, use simulated books for opportunity detection
-            // Real execution will validate against live book at submission time
-            let (yes_book, no_book) = create_simulated_orderbooks(&market.condition_id);
+            // Get REAL order books from WebSocket
+            let (yes_book, no_book) = match book_feeds.get(&market.condition_id) {
+                Some(feed) => match feed.get_books() {
+                    Ok(books) => books,
+                    Err(e) => {
+                        warn!(
+                            condition_id = %market.condition_id,
+                            error = %e,
+                            "LIVE: Failed to get books, skipping"
+                        );
+                        continue;
+                    }
+                },
+                None => {
+                    // No feed for this market yet
+                    continue;
+                }
+            };
+
+            // Log real book state
+            if let (Some(yes_ask), Some(no_ask)) = (yes_book.best_ask(), no_book.best_ask()) {
+                info!(
+                    condition_id = %market.condition_id,
+                    yes_ask = %yes_ask,
+                    no_ask = %no_ask,
+                    pair_cost = %(yes_ask + no_ask),
+                    "LIVE: Real book state"
+                );
+            }
 
             // Detect opportunity
             let max_pos = args.max_position.min(config.max_position_value());
@@ -482,7 +693,7 @@ async fn run_live_mode(
                 market_id = %market.condition_id,
                 pair_cost = %opportunity.pair_cost,
                 net_edge = %config.net_edge(opportunity.pair_cost),
-                "LIVE: Found valid opportunity, executing..."
+                "LIVE: Found valid opportunity with REAL prices, executing..."
             );
 
             // Execute trade
@@ -513,6 +724,12 @@ async fn run_live_mode(
         }
 
         tokio::time::sleep(poll_interval).await;
+    }
+
+    // Shutdown book feeds
+    for (condition_id, feed) in &book_feeds {
+        info!(condition_id = %condition_id, "Shutting down book feed");
+        feed.shutdown().await;
     }
 
     info!("============================================");
@@ -814,7 +1031,15 @@ mod tests {
             min_balance_reserve: dec!(50),
             micro_testing: false,
             skip_confirmation: true,
+            real_books: true,  // Default to real books
+            book_timeout_secs: 30,
         }
+    }
+
+    #[test]
+    fn test_real_books_default_true() {
+        let args = test_args("paper");
+        assert!(args.real_books, "real_books should default to true");
     }
 
     #[test]

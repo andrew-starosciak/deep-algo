@@ -64,6 +64,7 @@
 //! - **Timing**: Opportunities may disappear before execution
 //! - **Imbalance**: Partial fills create directional exposure
 
+pub mod book_feed;
 pub mod circuit_breaker;
 pub mod detector;
 pub mod dual_leg_executor;
@@ -127,3 +128,6 @@ pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerEr
 
 // CLOB API client
 pub use sdk_client::{ClobClient, ClobClientConfig, ClobError};
+
+// Real-time order book feed
+pub use book_feed::{BookFeed, BookFeedConfig, BookFeedError, BookFeedManager};
