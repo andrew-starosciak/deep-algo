@@ -225,8 +225,9 @@ impl ArbitrageDetector {
             recommended_size: size,
             total_investment,
             guaranteed_payout,
-            yes_depth: yes_fill.filled,
-            no_depth: no_fill.filled,
+            // Use total available book depth for liquidity validation, not filled amount
+            yes_depth: yes_book.total_ask_depth(),
+            no_depth: no_book.total_ask_depth(),
             risk_score,
             detected_at: Utc::now(),
         })
@@ -725,8 +726,8 @@ mod tests {
         assert_eq!(opp.no_token_id, "no-token");
         assert_eq!(opp.total_investment, opp.recommended_size * opp.pair_cost);
         assert_eq!(opp.guaranteed_payout, opp.recommended_size);
-        assert_eq!(opp.yes_depth, dec!(100)); // Filled amount
-        assert_eq!(opp.no_depth, dec!(100));
+        assert_eq!(opp.yes_depth, dec!(500)); // Total book depth
+        assert_eq!(opp.no_depth, dec!(500));
         assert!(opp.detected_at <= Utc::now());
     }
 }

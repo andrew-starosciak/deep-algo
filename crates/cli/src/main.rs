@@ -8,7 +8,8 @@ mod tui_live_bot;
 use commands::{
     ArbitrageBotArgs, BackfillFundingArgs, BackfillOhlcvArgs, BackfillSignalsArgs,
     BinaryBacktestArgs, CalculateReturnsArgs, CollectPolymarketArgs, CollectSignalsArgs,
-    DataStatusArgs, EntryStrategySimArgs, PolymarketPaperTradeArgs, ValidateSignalsArgs,
+    DataStatusArgs, EntryStrategySimArgs, Phase1ArbitrageArgs, PolymarketPaperTradeArgs,
+    ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -132,6 +133,8 @@ enum Commands {
     PolymarketPaperTrade(PolymarketPaperTradeArgs),
     /// Run arbitrage bot for Polymarket BTC 15-minute binary markets
     ArbitrageBot(ArbitrageBotArgs),
+    /// Run Phase 1 pure arbitrage validation (hardcoded conservative parameters)
+    Phase1Arbitrage(Phase1ArbitrageArgs),
 }
 
 #[tokio::main]
@@ -251,6 +254,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::ArbitrageBot(args) => {
             commands::run_arbitrage_bot(args).await?;
+        }
+        Commands::Phase1Arbitrage(args) => {
+            commands::run_phase1_arbitrage(args).await?;
         }
     }
 

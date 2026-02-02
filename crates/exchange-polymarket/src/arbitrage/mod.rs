@@ -64,13 +64,18 @@
 //! - **Timing**: Opportunities may disappear before execution
 //! - **Imbalance**: Partial fills create directional exposure
 
+pub mod circuit_breaker;
 pub mod detector;
+pub mod dual_leg_executor;
 pub mod execution;
 pub mod live_executor;
 pub mod metrics;
 pub mod orderbook;
 pub mod paper_executor;
+pub mod phase1_config;
 pub mod rate_limiter;
+pub mod sdk_client;
+pub mod session;
 pub mod signer;
 pub mod types;
 
@@ -95,10 +100,30 @@ pub use execution::{
 pub use paper_executor::{PaperExecutor, PaperExecutorConfig};
 
 // Live trading executor
-pub use live_executor::{HardLimits, LiveExecutor, LiveExecutorConfig, POLYMARKET_MAINNET_URL, POLYMARKET_TESTNET_URL};
+pub use live_executor::{
+    HardLimits, LiveExecutor, LiveExecutorConfig, POLYMARKET_MAINNET_URL, POLYMARKET_TESTNET_URL,
+};
 
 // Rate limiting
 pub use rate_limiter::{ClobRateLimiter, RateLimiterConfig};
 
 // Secure wallet for order signing
 pub use signer::{Wallet, WalletConfig, WalletError};
+
+// Phase 1 arbitrage configuration
+pub use phase1_config::{
+    Phase1Config, ValidationReason, ValidationResult, MAX_PAIR_COST, MAX_POSITION_VALUE,
+    MIN_EDGE_AFTER_FEES, MIN_LIQUIDITY, MIN_VALIDATION_TRADES,
+};
+
+// Dual-leg executor for simultaneous YES+NO execution
+pub use dual_leg_executor::{DualLegExecutor, DualLegResult, SlippageMetrics, UnwindResult};
+
+// Session state and Go/No-Go tracking
+pub use session::{ArbitrageSession, ExecutionRecord, Recommendation, SessionSummary, TradingMode};
+
+// Circuit breaker for trading safety
+pub use circuit_breaker::{CircuitBreaker, CircuitBreakerConfig, CircuitBreakerError};
+
+// CLOB API client
+pub use sdk_client::{ClobClient, ClobClientConfig, ClobError};

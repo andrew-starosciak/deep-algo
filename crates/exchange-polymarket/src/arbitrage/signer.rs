@@ -286,58 +286,46 @@ impl Wallet {
 
     /// Derives the Ethereum address from a private key.
     ///
-    /// This is a placeholder implementation. In production, this would use
-    /// secp256k1 to derive the public key and keccak256 to hash it.
+    /// Uses secp256k1 to derive the public key and keccak256 to hash it,
+    /// producing a standard Ethereum address with EIP-55 checksum.
     fn derive_address(key_hex: &str) -> Result<String, WalletError> {
-        // Placeholder: In production, derive address using:
+        use k256::ecdsa::SigningKey;
+        use sha3::{Digest, Keccak256};
+
         // 1. Parse hex to 32-byte private key
-        // 2. Use secp256k1 to derive public key
-        // 3. Keccak256 hash of public key (without 0x04 prefix)
-        // 4. Take last 20 bytes as address
-        // 5. Apply EIP-55 checksum
+        let key_bytes = hex::decode(key_hex).map_err(|e| {
+            WalletError::InvalidPrivateKey(format!("Invalid hex encoding: {}", e))
+        })?;
 
-        // For now, create a deterministic "address" from the key
-        // This ensures different keys produce different addresses
-        // SECURITY: This does NOT expose the private key
-
-        // Parse hex to bytes
-        let bytes: Vec<u8> = (0..key_hex.len())
-            .step_by(2)
-            .filter_map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16).ok())
-            .collect();
-
-        if bytes.len() != 32 {
-            return Err(WalletError::InvalidPrivateKey(
-                "Failed to parse key bytes".to_string(),
-            ));
+        if key_bytes.len() != 32 {
+            return Err(WalletError::InvalidPrivateKey(format!(
+                "Key must be 32 bytes, got {}",
+                key_bytes.len()
+            )));
         }
 
-        // Create a pseudo-hash by mixing bytes in a non-symmetric way
-        // This ensures different keys produce different addresses
-        // Uses a simple but effective mixing function
-        let mut address_bytes = [0u8; 20];
-        for i in 0..20 {
-            // Mix multiple byte positions with rotations to break symmetry
-            let a = bytes[i];
-            let b = bytes[31 - i];
-            let c = bytes[(i + 11) % 32];
-            let d = bytes[(i * 3) % 32];
+        // 2. Create signing key from bytes
+        let signing_key = SigningKey::from_slice(&key_bytes).map_err(|e| {
+            WalletError::InvalidPrivateKey(format!("Invalid secp256k1 key: {}", e))
+        })?;
 
-            // Combine with rotations and additions to ensure asymmetry
-            address_bytes[i] = a
-                .wrapping_add(b.rotate_left(3))
-                .wrapping_add(c.rotate_right(5))
-                ^ d;
-        }
+        // 3. Get uncompressed public key (65 bytes: 0x04 || x || y)
+        let verifying_key = signing_key.verifying_key();
+        let public_key_bytes = verifying_key.to_encoded_point(false);
+        let public_key_bytes = public_key_bytes.as_bytes();
 
-        // Format as checksummed address (simplified - just lowercase for now)
-        let address = format!(
-            "0x{}",
-            address_bytes
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect::<String>()
-        );
+        // 4. Keccak256 hash of public key (skip the 0x04 prefix, hash 64 bytes)
+        let mut hasher = Keccak256::new();
+        hasher.update(&public_key_bytes[1..]); // Skip 0x04 prefix
+        let hash = hasher.finalize();
+
+        // 5. Take last 20 bytes as address
+        let address_bytes: [u8; 20] = hash[12..32]
+            .try_into()
+            .expect("hash slice should be 20 bytes");
+
+        // 6. Apply EIP-55 checksum
+        let address = eip55_checksum(&address_bytes);
 
         Ok(address)
     }
@@ -364,6 +352,43 @@ impl Wallet {
     pub(crate) fn expose_private_key(&self) -> &str {
         self.private_key.expose_secret()
     }
+}
+
+/// Applies EIP-55 mixed-case checksum to an Ethereum address.
+///
+/// This function takes 20 raw address bytes and returns a checksummed
+/// address string with "0x" prefix.
+fn eip55_checksum(address_bytes: &[u8; 20]) -> String {
+    use sha3::{Digest, Keccak256};
+
+    // Convert to lowercase hex (without 0x prefix)
+    let hex_address: String = address_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+
+    // Hash the lowercase address
+    let mut hasher = Keccak256::new();
+    hasher.update(hex_address.as_bytes());
+    let hash = hasher.finalize();
+
+    // Apply checksum: uppercase if corresponding hash nibble >= 8
+    let mut checksummed = String::with_capacity(42);
+    checksummed.push_str("0x");
+
+    for (i, c) in hex_address.chars().enumerate() {
+        let hash_byte = hash[i / 2];
+        let hash_nibble = if i % 2 == 0 {
+            hash_byte >> 4
+        } else {
+            hash_byte & 0x0f
+        };
+
+        if hash_nibble >= 8 {
+            checksummed.push(c.to_ascii_uppercase());
+        } else {
+            checksummed.push(c);
+        }
+    }
+
+    checksummed
 }
 
 // Custom Debug implementation that NEVER exposes the private key
@@ -635,6 +660,36 @@ mod tests {
         assert!(address.starts_with("0x"));
         // All characters after 0x should be hex
         assert!(address[2..].chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_address_derivation_known_vector() {
+        // Known test vector from Foundry's default account 0
+        // This verifies our secp256k1 + keccak256 derivation is correct
+        let private_key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let expected_address = "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266";
+
+        let wallet = Wallet::from_private_key(private_key, POLYGON_MAINNET_CHAIN_ID).unwrap();
+
+        assert_eq!(
+            wallet.address(),
+            expected_address,
+            "Address derivation should match known test vector"
+        );
+    }
+
+    #[test]
+    fn test_eip55_checksum_applied() {
+        // The address should have mixed case due to EIP-55 checksum
+        // Known vector: this key produces an address with mixed case
+        let private_key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let wallet = Wallet::from_private_key(private_key, POLYGON_MAINNET_CHAIN_ID).unwrap();
+        let address = wallet.address();
+
+        // Should have both uppercase and lowercase letters (EIP-55 checksum)
+        let has_upper = address[2..].chars().any(|c| c.is_ascii_uppercase());
+        let has_lower = address[2..].chars().any(|c| c.is_ascii_lowercase());
+        assert!(has_upper && has_lower, "EIP-55 checksum should produce mixed case");
     }
 
     #[test]

@@ -17,19 +17,15 @@
 //!
 //! ```
 //! use algo_trade_polymarket::arbitrage::paper_executor::{PaperExecutor, PaperExecutorConfig};
+//! use algo_trade_polymarket::arbitrage::PolymarketExecutor;
 //! use rust_decimal_macros::dec;
 //!
 //! #[tokio::main]
 //! async fn main() {
-//!     let config = PaperExecutorConfig {
-//!         initial_balance: dec!(1000),
-//!         fill_rate: 0.85,
-//!         partial_fill_rate: 0.10,
-//!         simulate_latency_ms: 50,
-//!     };
-//!
-//!     let executor = PaperExecutor::new(config);
-//!     println!("Paper trading with {} balance", executor.get_balance().await.unwrap());
+//!     // Create executor with default config ($1000 balance, 85% fill rate)
+//!     let executor = PaperExecutor::new(PaperExecutorConfig::default());
+//!     let balance = executor.get_balance().await.unwrap();
+//!     println!("Paper trading with {} balance", balance);
 //! }
 //! ```
 
