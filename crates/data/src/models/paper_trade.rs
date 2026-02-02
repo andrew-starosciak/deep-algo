@@ -271,11 +271,7 @@ impl PaperTradeRecord {
     /// * `window_start_price` - BTC price at the start of the 15-min window
     /// * `entry_price` - BTC price at the moment of trade entry
     #[must_use]
-    pub fn with_btc_prices(
-        mut self,
-        window_start_price: Decimal,
-        entry_price: Decimal,
-    ) -> Self {
+    pub fn with_btc_prices(mut self, window_start_price: Decimal, entry_price: Decimal) -> Self {
         self.btc_price_window_start = Some(window_start_price);
         self.btc_price_at_entry = Some(entry_price);
         self

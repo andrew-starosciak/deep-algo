@@ -307,7 +307,11 @@ impl OddsCollector {
                     up_price,
                     down_price,
                 )
-                .with_metadata(market.volume_24h, market.liquidity, market.end_date);
+                .with_metadata(
+                    market.volume_24h,
+                    market.liquidity,
+                    market.end_date,
+                );
 
                 if self.tx.send(record).await.is_err() {
                     tracing::warn!("Odds record channel closed");

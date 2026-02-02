@@ -28,16 +28,24 @@
 //! ```
 
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use clap::{Args, ValueEnum};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::commands::collect_signals::parse_duration;
 use algo_trade_arbitrage_cross::{
-    CrossExchangeDetector, CrossExecutorConfig, DetectorConfig, SettlementReconciler,
+    Comparison, CrossExchangeDetector, CrossExecutorConfig, DetectorConfig, MarketMatcher,
+    MatchConfig, ParsedKalshiMarket, ParsedPolymarketMarket, SettlementReconciler,
 };
+use algo_trade_kalshi::{Orderbook as KalshiOrderbook, PriceLevel};
+use algo_trade_polymarket::arbitrage::types::L2OrderBook;
+use algo_trade_polymarket::gamma::GammaClient;
+use algo_trade_polymarket::models::Coin;
 
 /// Trading mode for the cross-arbitrage bot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
@@ -260,7 +268,7 @@ pub async fn run_cross_arbitrage(args: CrossArbitrageArgs) -> Result<()> {
     config_summary.log();
 
     // Initialize detector
-    let _detector = CrossExchangeDetector::with_config(detector_config);
+    let detector = CrossExchangeDetector::with_config(detector_config);
     let reconciler = SettlementReconciler::new();
 
     // Initialize stats
@@ -281,10 +289,49 @@ pub async fn run_cross_arbitrage(args: CrossArbitrageArgs) -> Result<()> {
     // Discover and match markets
     tracing::info!("Discovering markets on Kalshi and Polymarket...");
 
-    // TODO: Implement market discovery and matching
-    // For now, we log placeholder
-    tracing::info!("Market discovery is not yet implemented");
-    tracing::info!("This CLI scaffolds the cross-arbitrage workflow");
+    // Discover Polymarket BTC markets via Gamma API
+    let gamma_client = GammaClient::new();
+    let poly_markets = discover_polymarket_markets(&gamma_client).await;
+    stats.polymarket_markets_matched = poly_markets.len();
+    tracing::info!("Found {} Polymarket BTC markets", poly_markets.len());
+
+    // For Kalshi, we need API credentials - create mock markets for monitor mode
+    let kalshi_markets = discover_kalshi_markets_mock();
+    stats.kalshi_markets_matched = kalshi_markets.len();
+    tracing::info!("Found {} Kalshi BTC markets (mock data for demo)", kalshi_markets.len());
+
+    // Match markets across exchanges
+    let matcher = MarketMatcher::with_config(MatchConfig::relaxed());
+    let matched_markets = matcher.find_btc_matches(&kalshi_markets, &poly_markets);
+    tracing::info!("Matched {} cross-exchange market pairs", matched_markets.len());
+
+    if matched_markets.is_empty() {
+        tracing::warn!("No matched markets found - detection loop will be idle");
+        tracing::info!(
+            "Note: Full market matching requires Kalshi API credentials"
+        );
+    } else {
+        for matched in &matched_markets {
+            tracing::info!(
+                "  Matched: {} <-> {} (confidence: {:.2}%)",
+                matched.kalshi_ticker,
+                &matched.polymarket_condition_id[..20.min(matched.polymarket_condition_id.len())],
+                matched.match_confidence * 100.0
+            );
+        }
+    }
+
+    // Create mock orderbooks for demonstration
+    let mut poly_yes_books: HashMap<String, L2OrderBook> = HashMap::new();
+    let mut poly_no_books: HashMap<String, L2OrderBook> = HashMap::new();
+
+    // Initialize mock orderbooks for matched markets
+    for matched in &matched_markets {
+        let yes_book = create_mock_polymarket_book(&matched.polymarket_yes_token);
+        let no_book = create_mock_polymarket_book(&matched.polymarket_no_token);
+        poly_yes_books.insert(matched.polymarket_condition_id.clone(), yes_book);
+        poly_no_books.insert(matched.polymarket_condition_id.clone(), no_book);
+    }
 
     // Main loop
     let poll_interval = Duration::from_millis(args.poll_interval_ms);
@@ -329,20 +376,69 @@ pub async fn run_cross_arbitrage(args: CrossArbitrageArgs) -> Result<()> {
 
         if stats.polls_completed % 10 == 0 {
             tracing::debug!(
-                "Poll #{}: Checking matched markets for opportunities...",
-                stats.polls_completed
+                "Poll #{}: Checking {} matched markets for opportunities...",
+                stats.polls_completed,
+                matched_markets.len()
             );
         }
 
-        // TODO: Implement actual market polling and detection
-        // For now, this is a placeholder loop
-        //
-        // The implementation would:
-        // 1. Fetch Kalshi order books via KalshiClient
-        // 2. Fetch Polymarket order books via ClobClient
-        // 3. Run detector.detect() on matched markets
-        // 4. Execute opportunities in paper/live mode
-        // 5. Track positions with reconciler
+        // Check each matched market for arbitrage opportunities
+        for matched in &matched_markets {
+            // Get orderbooks (in real implementation, these would be fetched live)
+            let kalshi_book = create_mock_kalshi_book(&matched.kalshi_ticker);
+
+            let poly_yes_book = poly_yes_books
+                .get(&matched.polymarket_condition_id)
+                .cloned()
+                .unwrap_or_else(|| L2OrderBook::new(matched.polymarket_yes_token.clone()));
+
+            let poly_no_book = poly_no_books
+                .get(&matched.polymarket_condition_id)
+                .cloned()
+                .unwrap_or_else(|| L2OrderBook::new(matched.polymarket_no_token.clone()));
+
+            // Run detection
+            if let Some(opportunity) = detector.detect(
+                matched,
+                &kalshi_book,
+                &poly_yes_book,
+                &poly_no_book,
+            ) {
+                stats.opportunities_detected += 1;
+
+                tracing::info!(
+                    "OPPORTUNITY: {} | Kalshi {} @ {} + Poly {} @ {} = {} cost | Net edge: {}% | Profit: ${}",
+                    matched.kalshi_ticker,
+                    opportunity.kalshi_side,
+                    opportunity.kalshi_price,
+                    opportunity.polymarket_side,
+                    opportunity.polymarket_price,
+                    opportunity.combined_cost,
+                    opportunity.net_edge_pct,
+                    opportunity.expected_profit
+                );
+
+                // In paper/live mode, execute the opportunity
+                match args.mode {
+                    CrossTradingMode::Monitor => {
+                        // Just log, don't execute
+                    }
+                    CrossTradingMode::Paper | CrossTradingMode::Live => {
+                        // TODO: Execute via CrossExchangeExecutor
+                        tracing::info!("Execution would happen here in {} mode", args.mode);
+                        stats.opportunities_executed += 1;
+                    }
+                }
+            }
+        }
+
+        // Randomize mock orderbooks slightly for next poll (simulate market movement)
+        for book in poly_yes_books.values_mut() {
+            simulate_book_movement(book);
+        }
+        for book in poly_no_books.values_mut() {
+            simulate_book_movement(book);
+        }
 
         // Sleep before next poll
         tokio::time::sleep(poll_interval).await;
@@ -362,6 +458,163 @@ pub async fn run_cross_arbitrage(args: CrossArbitrageArgs) -> Result<()> {
 
     tracing::info!("Cross-arbitrage bot stopped");
     Ok(())
+}
+
+// =============================================================================
+// Market Discovery Helpers
+// =============================================================================
+
+/// Discovers Polymarket BTC markets via Gamma API.
+async fn discover_polymarket_markets(gamma: &GammaClient) -> Vec<ParsedPolymarketMarket> {
+    let mut markets = Vec::new();
+
+    // Get current 15-minute BTC market
+    match gamma.get_current_15min_market(Coin::Btc).await {
+        Ok(market) => {
+            let settlement_time = market.end_date;
+            let yes_token_id = market
+                .up_token()
+                .map(|t| t.token_id.clone())
+                .unwrap_or_default();
+            let no_token_id = market
+                .down_token()
+                .map(|t| t.token_id.clone())
+                .unwrap_or_default();
+
+            let parsed = ParsedPolymarketMarket {
+                condition_id: market.condition_id.clone(),
+                yes_token_id,
+                no_token_id,
+                underlying: Some("BTC".to_string()),
+                strike_price: None, // 15-min markets don't have fixed strike
+                settlement_time,
+            };
+            tracing::debug!(
+                "Discovered Polymarket BTC 15-min market: {} (settles {:?})",
+                market.condition_id,
+                settlement_time
+            );
+            markets.push(parsed);
+        }
+        Err(e) => {
+            tracing::warn!("Failed to fetch BTC 15-min market: {}", e);
+        }
+    }
+
+    markets
+}
+
+/// Creates mock Kalshi markets for demonstration.
+///
+/// In production, this would call KalshiClient::get_tradeable_btc_markets().
+fn discover_kalshi_markets_mock() -> Vec<(ParsedKalshiMarket, chrono::DateTime<Utc>)> {
+    let now = Utc::now();
+    let settlement_time = now + chrono::Duration::minutes(15);
+
+    vec![
+        (
+            ParsedKalshiMarket {
+                ticker: "KXBTC-26FEB02-B100000".to_string(),
+                underlying: "BTC".to_string(),
+                strike_price: dec!(100000),
+                direction: Comparison::Above,
+                settlement_hint: Some(settlement_time),
+            },
+            settlement_time,
+        ),
+        (
+            ParsedKalshiMarket {
+                ticker: "KXBTC-26FEB02-B95000".to_string(),
+                underlying: "BTC".to_string(),
+                strike_price: dec!(95000),
+                direction: Comparison::Above,
+                settlement_hint: Some(settlement_time),
+            },
+            settlement_time,
+        ),
+        (
+            ParsedKalshiMarket {
+                ticker: "KXBTC-26FEB02-B105000".to_string(),
+                underlying: "BTC".to_string(),
+                strike_price: dec!(105000),
+                direction: Comparison::Above,
+                settlement_hint: Some(settlement_time),
+            },
+            settlement_time,
+        ),
+    ]
+}
+
+/// Creates a mock Polymarket L2 orderbook for testing.
+fn create_mock_polymarket_book(token_id: &str) -> L2OrderBook {
+    use std::cmp::Reverse;
+    use std::collections::BTreeMap;
+
+    let mut book = L2OrderBook::new(token_id.to_string());
+
+    // Create realistic bid/ask spread
+    let mut bids = BTreeMap::new();
+    let mut asks = BTreeMap::new();
+
+    // Bids: 0.48, 0.47, 0.46
+    bids.insert(Reverse(dec!(0.48)), dec!(500));
+    bids.insert(Reverse(dec!(0.47)), dec!(1000));
+    bids.insert(Reverse(dec!(0.46)), dec!(1500));
+
+    // Asks: 0.52, 0.53, 0.54
+    asks.insert(dec!(0.52), dec!(500));
+    asks.insert(dec!(0.53), dec!(1000));
+    asks.insert(dec!(0.54), dec!(1500));
+
+    book.bids = bids;
+    book.asks = asks;
+    book
+}
+
+/// Creates a mock Kalshi orderbook for testing.
+fn create_mock_kalshi_book(ticker: &str) -> KalshiOrderbook {
+    KalshiOrderbook {
+        ticker: ticker.to_string(),
+        yes_bids: vec![
+            PriceLevel { price: 47, count: 500 },
+            PriceLevel { price: 46, count: 1000 },
+            PriceLevel { price: 45, count: 1500 },
+        ],
+        yes_asks: vec![
+            PriceLevel { price: 53, count: 500 },
+            PriceLevel { price: 54, count: 1000 },
+            PriceLevel { price: 55, count: 1500 },
+        ],
+        timestamp: Utc::now(),
+    }
+}
+
+/// Simulates market movement by slightly adjusting orderbook levels.
+///
+/// Uses a simple deterministic pattern based on timestamp to avoid external dependencies.
+fn simulate_book_movement(book: &mut L2OrderBook) {
+    use std::cmp::Reverse;
+
+    // Use timestamp-based pseudo-randomness (deterministic but varies per call)
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i32)
+        .unwrap_or(0);
+    let delta = ((tick % 3) - 1) as i64; // -1, 0, or 1
+
+    // Adjust best bid
+    if let Some((&Reverse(best_bid), &size)) = book.bids.iter().next() {
+        let new_bid = (best_bid + Decimal::from(delta) / dec!(100)).max(dec!(0.01)).min(dec!(0.98));
+        book.bids.remove(&Reverse(best_bid));
+        book.bids.insert(Reverse(new_bid), size);
+    }
+
+    // Adjust best ask
+    if let Some((&best_ask, &size)) = book.asks.iter().next() {
+        let new_ask = (best_ask + Decimal::from(delta) / dec!(100)).max(dec!(0.02)).min(dec!(0.99));
+        book.asks.remove(&best_ask);
+        book.asks.insert(new_ask, size);
+    }
 }
 
 #[cfg(test)]

@@ -1594,7 +1594,15 @@ async fn run_trading_loop(ctx: TradingLoopContext) {
             }
         } else if let Some(ref mut signal) = liq_signal {
             // Use real liquidation signal
-            match compute_real_signal(&liq_repo, signal, &signal_config, now, max_aggregate_age_mins).await {
+            match compute_real_signal(
+                &liq_repo,
+                signal,
+                &signal_config,
+                now,
+                max_aggregate_age_mins,
+            )
+            .await
+            {
                 Ok(result) => {
                     // Log signal computation
                     if result.is_directional {

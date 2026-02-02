@@ -21,12 +21,12 @@ pub struct LatencyMonitorArgs {
     #[arg(short, long, default_value = "15")]
     pub duration_mins: u64,
 
-    /// Minimum spot price change threshold (percent, e.g., 0.3).
-    #[arg(long, default_value = "0.3")]
+    /// Minimum spot price change threshold (percent, e.g., 0.2).
+    #[arg(long, default_value = "0.2")]
     pub min_spot_change_pct: f64,
 
-    /// Maximum entry price for signals (e.g., 0.35).
-    #[arg(long, default_value = "0.35")]
+    /// Maximum entry price for signals (e.g., 0.45).
+    #[arg(long, default_value = "0.45")]
     pub max_entry_price: f64,
 
     /// Lookback period for spot change in minutes.

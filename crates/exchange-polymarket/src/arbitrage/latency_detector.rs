@@ -178,8 +178,8 @@ pub struct LatencyConfig {
 impl Default for LatencyConfig {
     fn default() -> Self {
         Self {
-            min_spot_change: 0.003, // 0.3%
-            max_entry_price: dec!(0.35),
+            min_spot_change: 0.002, // 0.2% (gabagool observed threshold)
+            max_entry_price: dec!(0.45), // $0.45 (gabagool enters at $0.41)
             lookback_ms: 300_000, // 5 minutes
             min_staleness_ms: 1_000, // 1 second
         }
@@ -191,8 +191,8 @@ impl LatencyConfig {
     #[must_use]
     pub fn aggressive() -> Self {
         Self {
-            min_spot_change: 0.002, // 0.2%
-            max_entry_price: dec!(0.40),
+            min_spot_change: 0.001, // 0.1%
+            max_entry_price: dec!(0.48), // Almost any mispricing
             lookback_ms: 60_000, // 1 minute
             min_staleness_ms: 500,
         }
@@ -202,8 +202,8 @@ impl LatencyConfig {
     #[must_use]
     pub fn conservative() -> Self {
         Self {
-            min_spot_change: 0.005, // 0.5%
-            max_entry_price: dec!(0.30),
+            min_spot_change: 0.003, // 0.3%
+            max_entry_price: dec!(0.40),
             lookback_ms: 300_000, // 5 minutes
             min_staleness_ms: 2_000,
         }
@@ -519,23 +519,23 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = LatencyConfig::default();
-        assert!((config.min_spot_change - 0.003).abs() < 0.0001);
-        assert_eq!(config.max_entry_price, dec!(0.35));
+        assert!((config.min_spot_change - 0.002).abs() < 0.0001); // 0.2%
+        assert_eq!(config.max_entry_price, dec!(0.45));
         assert_eq!(config.lookback_ms, 300_000);
     }
 
     #[test]
     fn test_config_aggressive() {
         let config = LatencyConfig::aggressive();
-        assert!((config.min_spot_change - 0.002).abs() < 0.0001);
-        assert_eq!(config.max_entry_price, dec!(0.40));
+        assert!((config.min_spot_change - 0.001).abs() < 0.0001); // 0.1%
+        assert_eq!(config.max_entry_price, dec!(0.48));
     }
 
     #[test]
     fn test_config_conservative() {
         let config = LatencyConfig::conservative();
-        assert!((config.min_spot_change - 0.005).abs() < 0.0001);
-        assert_eq!(config.max_entry_price, dec!(0.30));
+        assert!((config.min_spot_change - 0.003).abs() < 0.0001); // 0.3%
+        assert_eq!(config.max_entry_price, dec!(0.40));
     }
 
     // =========================================================================
@@ -730,12 +730,12 @@ mod tests {
         let mut detector = LatencyDetector::new(LatencyConfig::default());
         let mut tracker = SpotPriceTracker::new();
 
-        // BTC moved exactly 0.3% (the threshold)
+        // BTC moved exactly 0.2% (the threshold)
         tracker.update(100_000.0, 0);
-        tracker.update(100_300.0, 60_000);
+        tracker.update(100_200.0, 60_000);
 
-        // YES at exactly $0.35 (the max entry price)
-        let signal = detector.check(&tracker, dec!(0.35), dec!(0.65), 60_000);
+        // YES at exactly $0.45 (the max entry price)
+        let signal = detector.check(&tracker, dec!(0.45), dec!(0.55), 60_000);
 
         assert!(signal.is_some());
     }
@@ -745,9 +745,9 @@ mod tests {
         let mut detector = LatencyDetector::new(LatencyConfig::default());
         let mut tracker = SpotPriceTracker::new();
 
-        // BTC moved 0.29% (just below 0.3% threshold)
+        // BTC moved 0.19% (just below 0.2% threshold)
         tracker.update(100_000.0, 0);
-        tracker.update(100_290.0, 60_000);
+        tracker.update(100_190.0, 60_000);
 
         let signal = detector.check(&tracker, dec!(0.30), dec!(0.70), 60_000);
 
