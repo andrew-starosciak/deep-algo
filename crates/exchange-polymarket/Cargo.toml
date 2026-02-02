@@ -16,11 +16,19 @@ reqwest = { version = "0.12", features = ["json"] }
 governor = "0.6"
 anyhow = { workspace = true }
 tracing = { workspace = true }
+thiserror = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 rust_decimal = "1.38"
 async-trait = "0.1"
 nonzero_ext = "0.3"
 urlencoding = "2.1"
+libm = "0.2"
+rust_decimal_macros = "1.38"
+uuid = { version = "1", features = ["v4", "serde"] }
+rand = "0.8"
+parking_lot = "0.12"
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+futures-util = "0.3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

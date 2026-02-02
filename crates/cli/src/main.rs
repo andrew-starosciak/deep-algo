@@ -6,9 +6,9 @@ mod tui_backtest_manager;
 mod tui_live_bot;
 
 use commands::{
-    BackfillFundingArgs, BackfillOhlcvArgs, BackfillSignalsArgs, BinaryBacktestArgs,
-    CalculateReturnsArgs, CollectPolymarketArgs, CollectSignalsArgs, DataStatusArgs,
-    EntryStrategySimArgs, PolymarketPaperTradeArgs, ValidateSignalsArgs,
+    ArbitrageBotArgs, BackfillFundingArgs, BackfillOhlcvArgs, BackfillSignalsArgs,
+    BinaryBacktestArgs, CalculateReturnsArgs, CollectPolymarketArgs, CollectSignalsArgs,
+    DataStatusArgs, EntryStrategySimArgs, PolymarketPaperTradeArgs, ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -130,6 +130,8 @@ enum Commands {
     CollectPolymarket(CollectPolymarketArgs),
     /// Paper trade on Polymarket using signal-based decisions
     PolymarketPaperTrade(PolymarketPaperTradeArgs),
+    /// Run arbitrage bot for Polymarket BTC 15-minute binary markets
+    ArbitrageBot(ArbitrageBotArgs),
 }
 
 #[tokio::main]
@@ -246,6 +248,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::PolymarketPaperTrade(args) => {
             commands::run_polymarket_paper_trade(args).await?;
+        }
+        Commands::ArbitrageBot(args) => {
+            commands::run_arbitrage_bot(args).await?;
         }
     }
 

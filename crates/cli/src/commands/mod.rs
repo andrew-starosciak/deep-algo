@@ -1,5 +1,6 @@
 //! CLI commands for the statistical trading engine.
 
+pub mod arbitrage_bot;
 pub mod backfill_funding;
 pub mod backfill_ohlcv;
 pub mod backfill_signals;
@@ -13,6 +14,7 @@ pub mod polymarket_paper_trade;
 pub mod validate_signals;
 pub mod window_timing;
 
+pub use arbitrage_bot::{run_arbitrage_bot, ArbitrageBotArgs};
 pub use backfill_funding::{run_backfill_funding, BackfillFundingArgs};
 pub use backfill_ohlcv::{run_backfill_ohlcv, BackfillOhlcvArgs};
 pub use backfill_signals::{run_backfill_signals, BackfillSignalsArgs};

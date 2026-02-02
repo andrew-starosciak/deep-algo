@@ -5,6 +5,7 @@
 //! - Gamma API client for 15-minute market discovery
 //! - Models for markets, tokens, and prices
 //! - Odds polling collector for BTC-related binary markets
+//! - Arbitrage execution layer for paired YES/NO trading
 //!
 //! # Example
 //!
@@ -34,10 +35,12 @@
 //! }
 //! ```
 
+pub mod arbitrage;
 pub mod client;
 pub mod gamma;
 pub mod models;
 pub mod odds_collector;
+pub mod websocket;
 
 // Re-export main types
 pub use client::PolymarketClient;
@@ -47,3 +50,4 @@ pub use odds_collector::{
     deduplicate_markets, filter_btc_markets, OddsCollector, OddsCollectorConfig,
     OddsCollectorEvent, OddsCollectorStats,
 };
+pub use websocket::{BookEvent, PolymarketWebSocket, WebSocketConfig, WebSocketError};
