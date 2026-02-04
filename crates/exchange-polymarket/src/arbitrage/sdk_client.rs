@@ -44,6 +44,9 @@ pub const CLOB_API_MAINNET: &str = "https://clob.polymarket.com";
 /// Polymarket CLOB API base URL (testnet/Mumbai - deprecated, use Amoy)
 pub const CLOB_API_TESTNET: &str = "https://clob.polymarket.com";
 
+/// Polymarket Data API base URL (for positions, trades, activity)
+pub const DATA_API_URL: &str = "https://data-api.polymarket.com";
+
 /// Default request timeout
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -333,6 +336,41 @@ pub struct BalanceResponse {
     pub collateral: Option<String>,
 }
 
+/// Wallet position from Data API.
+///
+/// Represents a token position held by the wallet.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletPosition {
+    /// Token ID (asset)
+    pub asset: String,
+    /// Condition ID for the market
+    pub condition_id: String,
+    /// Position size (number of shares)
+    pub size: String,
+    /// Average entry price
+    pub avg_price: String,
+    /// Initial value when position was opened
+    pub initial_value: String,
+    /// Current value of position
+    pub current_value: String,
+    /// Cash P&L
+    pub cash_pnl: String,
+    /// Percent P&L
+    pub percent_pnl: String,
+    /// Current price of token (1.0 = won, 0.0 = lost for resolved markets)
+    pub cur_price: String,
+    /// Whether position can be redeemed (market resolved)
+    pub redeemable: bool,
+    /// Market title
+    pub title: String,
+    /// Outcome name (Yes/No/Up/Down)
+    pub outcome: String,
+    /// Outcome index (0 or 1)
+    #[serde(default)]
+    pub outcome_index: Option<i32>,
+}
+
 // =============================================================================
 // CLOB Client
 // =============================================================================
@@ -460,6 +498,92 @@ impl ClobClient {
         balance_str.parse::<Decimal>().map_err(|e| {
             ClobError::Parse(format!("Failed to parse balance value '{}': {}", balance_str, e))
         })
+    }
+
+    /// Gets all positions for the authenticated wallet from the Data API.
+    ///
+    /// This queries Polymarket's data-api which provides the source of truth
+    /// for wallet positions, including resolved markets where tokens are
+    /// redeemable.
+    ///
+    /// # Returns
+    ///
+    /// A vector of wallet positions. For resolved markets:
+    /// - `cur_price` = "1" means the position won
+    /// - `cur_price` = "0" means the position lost
+    /// - `redeemable` = true means the market has resolved
+    pub async fn get_positions(&self) -> Result<Vec<WalletPosition>, ClobError> {
+        let url = format!(
+            "{}/positions?user={}&sizeThreshold=0",
+            DATA_API_URL,
+            self.wallet.address()
+        );
+
+        debug!(url = %url, "Fetching wallet positions from Data API");
+
+        let response = self.http.get(&url).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ClobError::Api {
+                status,
+                message: format!("Data API positions error: {}", body),
+            });
+        }
+
+        let positions: Vec<WalletPosition> = response.json().await.map_err(|e| {
+            ClobError::Parse(format!("Failed to parse positions response: {}", e))
+        })?;
+
+        debug!(count = positions.len(), "Fetched wallet positions");
+
+        Ok(positions)
+    }
+
+    /// Gets positions for specific token IDs.
+    ///
+    /// This is a convenience method that filters positions by token ID,
+    /// useful for checking the status of specific trades.
+    pub async fn get_positions_for_tokens(
+        &self,
+        token_ids: &[&str],
+    ) -> Result<Vec<WalletPosition>, ClobError> {
+        let all_positions = self.get_positions().await?;
+
+        let filtered: Vec<WalletPosition> = all_positions
+            .into_iter()
+            .filter(|p| token_ids.contains(&p.asset.as_str()))
+            .collect();
+
+        Ok(filtered)
+    }
+
+    /// Checks if a position has resolved and returns win/loss status.
+    ///
+    /// # Returns
+    ///
+    /// - `Some(true)` if the position won (cur_price >= 0.95)
+    /// - `Some(false)` if the position lost (cur_price <= 0.05)
+    /// - `None` if the market hasn't resolved yet or position not found
+    pub async fn check_position_outcome(
+        &self,
+        token_id: &str,
+    ) -> Result<Option<bool>, ClobError> {
+        let positions = self.get_positions_for_tokens(&[token_id]).await?;
+
+        if let Some(pos) = positions.first() {
+            // Parse current price
+            let cur_price: Decimal = pos.cur_price.parse().unwrap_or_default();
+
+            // Check if resolved (redeemable or price at extremes)
+            if pos.redeemable || cur_price >= dec!(0.95) || cur_price <= dec!(0.05) {
+                // Won if price >= 0.95
+                return Ok(Some(cur_price >= dec!(0.95)));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Submits an order to the CLOB.
@@ -888,6 +1012,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         assert!(client.validate_order_params(&params).is_ok());
@@ -905,6 +1030,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let result = client.validate_order_params(&params);
@@ -923,6 +1049,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let result = client.validate_order_params(&params);
@@ -941,6 +1068,7 @@ mod tests {
             size: dec!(0),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let result = client.validate_order_params(&params);
@@ -959,6 +1087,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let result = client.validate_order_params(&params);
@@ -979,6 +1108,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let request = client.create_order_request(&params).unwrap();
@@ -1006,6 +1136,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let response = CreateOrderResponse {
@@ -1035,6 +1166,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let response = CreateOrderResponse {
@@ -1086,6 +1218,7 @@ mod tests {
             size: dec!(100),
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let result = client.submit_order(&params).await;

@@ -925,9 +925,35 @@ impl PolymarketExecutor for LiveExecutor {
         // Wait for rate limit
         self.wait_for_read().await;
 
-        // Note: Polymarket CLOB doesn't have a direct positions endpoint
-        // Positions are tracked locally via order fills
-        Ok(Vec::new())
+        // Query wallet positions from Polymarket Data API
+        let wallet_positions = self
+            .client
+            .get_positions()
+            .await
+            .map_err(|e| self.handle_clob_error(e, false))?;
+
+        // Convert WalletPosition to Position
+        let positions: Vec<Position> = wallet_positions
+            .into_iter()
+            .filter_map(|wp| {
+                let size: Decimal = wp.size.parse().ok()?;
+                let avg_price: Decimal = wp.avg_price.parse().ok()?;
+                let current_price: Option<Decimal> = wp.cur_price.parse().ok();
+                let unrealized_pnl = current_price.map(|cp| (cp - avg_price) * size);
+
+                Some(Position {
+                    token_id: wp.asset,
+                    size,
+                    avg_price,
+                    current_price,
+                    unrealized_pnl,
+                })
+            })
+            .collect();
+
+        tracing::debug!(count = positions.len(), "Fetched wallet positions");
+
+        Ok(positions)
     }
 
     async fn get_balance(&self) -> Result<Decimal, ExecutionError> {

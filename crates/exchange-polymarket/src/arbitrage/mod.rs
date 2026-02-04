@@ -64,23 +64,35 @@
 //! - **Timing**: Opportunities may disappear before execution
 //! - **Imbalance**: Partial fills create directional exposure
 
+pub mod auto_executor;
 pub mod book_feed;
+pub mod cross_market_auto_executor;
 pub mod circuit_breaker;
+pub mod cross_market_detector;
+pub mod cross_market_runner;
+pub mod cross_market_settlement;
+pub mod cross_market_types;
 pub mod detector;
 pub mod dual_leg_executor;
 pub mod execution;
+pub mod gabagool_detector;
+pub mod gabagool_runner;
 pub mod latency_detector;
 pub mod latency_runner;
 pub mod live_executor;
-pub mod spot_feed;
 pub mod metrics;
 pub mod orderbook;
 pub mod paper_executor;
 pub mod phase1_config;
+pub mod position_persistence;
+pub mod presigned_orders;
 pub mod rate_limiter;
+pub mod reference_tracker;
 pub mod sdk_client;
 pub mod session;
+pub mod settlement;
 pub mod signer;
+pub mod spot_feed;
 pub mod types;
 
 // Re-export main types for convenience
@@ -94,7 +106,7 @@ pub use types::{
 // Execution layer re-exports (Phase 3)
 pub use execution::{
     ArbitragePositionSnapshot, ExecutionError, ExecutionResult, ExecutorConfig, OrderParams,
-    OrderResult, OrderStatus, PolymarketExecutor, Position, RiskLimit,
+    OrderResult, OrderStatus, PolymarketExecutor, Position, PresignedData, RiskLimit,
 };
 // Note: execution::Side and execution::OrderType are intentionally not re-exported
 // to avoid conflicts with types::Side and types::OrderType. Use the full path
@@ -147,4 +159,61 @@ pub use spot_feed::{SpotFeedError, SpotFeedStats, SpotPriceFeed, SpotPriceFeedCo
 pub use latency_runner::{
     run_latency_monitor, LatencyRunner, LatencyRunnerConfig, LatencyRunnerError,
     LatencyRunnerStats,
+};
+
+// Reference price tracking for windows
+pub use reference_tracker::{
+    ReferenceConfidence, ReferenceSource, ReferenceTracker, ReferenceTrackerConfig,
+    WindowReference, WINDOW_DURATION_MS,
+};
+
+// Gabagool-style hybrid arbitrage detector
+pub use gabagool_detector::{
+    GabagoolConfig, GabagoolDetector, GabagoolDirection, GabagoolSignal, GabagoolSignalType,
+    MarketSnapshot, OpenPosition, SignalConfidence,
+};
+
+// Gabagool-style hybrid arbitrage runner
+pub use gabagool_runner::{
+    run_gabagool_monitor, GabagoolRunner, GabagoolRunnerConfig, GabagoolRunnerError,
+    GabagoolRunnerStats, SignalRecord,
+};
+
+// Automated execution bridge
+pub use auto_executor::{
+    AutoExecutor, AutoExecutorConfig, AutoExecutorError, AutoExecutorStats, KellySizer,
+    TradeRecord, WindowPositionTracker,
+};
+
+// Position persistence for restart recovery
+pub use position_persistence::{PersistedPosition, PersistenceError, PositionPersistence};
+
+// Settlement handler for window outcomes
+pub use settlement::{SettlementConfig, SettlementHandler, SettlementResult, WindowOutcome};
+
+// Pre-signed order pool for low-latency execution
+pub use presigned_orders::{
+    MockSigner, OrderSigner, PreSignedError, PreSignedOrder, PreSignedOrderPool,
+    PreSignedPoolConfig, PreSignedPoolManager, PreSignedPoolStats,
+};
+
+// Cross-market correlation arbitrage
+pub use cross_market_detector::CrossMarketDetector;
+pub use cross_market_runner::{
+    run_cross_market_scanner, CrossMarketRunner, CrossMarketRunnerConfig,
+    CrossMarketRunnerError, CrossMarketRunnerStats,
+};
+pub use cross_market_settlement::{
+    CrossMarketSettlementConfig, CrossMarketSettlementHandler, SettlementMode, SettlementStats,
+};
+pub use cross_market_types::{
+    CoinMarketSnapshot, CoinPair, CrossMarketCombination, CrossMarketConfig,
+    CrossMarketOpportunity, CrossMarketStats, TokenDepth,
+};
+
+// Cross-market auto executor
+pub use cross_market_auto_executor::{
+    CrossMarketAutoExecutor, CrossMarketAutoExecutorConfig, CrossMarketAutoExecutorError,
+    CrossMarketAutoExecutorStats, CrossMarketExecutionResult, CrossMarketKellySizer,
+    CrossMarketTradeRecord, CrossMarketWindowTracker,
 };
