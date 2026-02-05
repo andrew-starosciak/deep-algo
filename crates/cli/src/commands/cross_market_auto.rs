@@ -437,37 +437,15 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
     let _ = tokio::time::timeout(Duration::from_secs(5), executor_handle).await;
 
     // Print final summary
-    if !verbose {
-        // Move cursor below dashboard
-        print!("\x1b[20B\n");
-    }
     print_summary(&runner_stats, &auto_stats).await;
 
     Ok(())
 }
 
 /// Prints the launch banner (shown once at startup).
-fn print_launch_banner(config: &DashboardConfig) {
-    // Clear screen and move to top
+fn print_launch_banner(_config: &DashboardConfig) {
+    // Clear screen
     print!("\x1b[2J\x1b[H");
-
-    let mode_color = if config.mode == ExecutionMode::Live { "\x1b[91m" } else { "\x1b[93m" };
-    let reset = "\x1b[0m";
-    let green = "\x1b[92m";
-    let cyan = "\x1b[96m";
-    let dim = "\x1b[2m";
-
-    println!("{cyan}╔══════════════════════════════════════════════════════════════════╗{reset}");
-    println!("{cyan}║{reset}       {green}CROSS-MARKET CORRELATION ARBITRAGE{reset}                        {cyan}║{reset}");
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
-    println!("{cyan}║{reset}  Mode: {mode_color}{:6}{reset}  │  Pair: {:8}  │  Strategy: {:12} {cyan}║{reset}",
-        config.mode, config.pair, config.combination);
-    println!("{cyan}║{reset}  Bet:  {:6}  │  Spread: ${:.2}    │  Balance: ${:14} {cyan}║{reset}",
-        config.bet_size, config.min_spread, config.balance);
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
-    println!("{cyan}║{reset}  {dim}Starting systems...{reset}                                            {cyan}║{reset}");
-    println!("{cyan}╚══════════════════════════════════════════════════════════════════╝{reset}");
-    println!();
     let _ = stdout().flush();
 }
 
@@ -493,13 +471,14 @@ async fn print_dashboard(
     let cyan = "\x1b[96m";
     let dim = "\x1b[2m";
     let bold = "\x1b[1m";
+    let clear_line = "\x1b[2K";
 
     let mode_color = if config.mode == ExecutionMode::Live { red } else { yellow };
 
     // Status indicators
-    let scanner_status = if scanner_ready { format!("{green}●{reset}") } else { format!("{dim}○{reset}") };
-    let executor_status = if executor_ready { format!("{green}●{reset}") } else { format!("{dim}○{reset}") };
-    let ws_status = if runner.scans_performed > 0 { format!("{green}●{reset}") } else { format!("{yellow}○{reset}") };
+    let scanner_dot = if scanner_ready { green } else { dim };
+    let executor_dot = if executor_ready { green } else { dim };
+    let ws_dot = if runner.scans_performed > 0 { green } else { yellow };
 
     // Calculate progress
     let progress_pct = (elapsed.as_secs_f64() / total_duration.as_secs_f64() * 100.0).min(100.0);
@@ -523,58 +502,60 @@ async fn print_dashboard(
         reset
     };
 
-    // Move cursor to top and redraw
+    // Latency display
+    let latency_str = if auto.latency_samples > 0 {
+        format!("{}ms (avg {}ms)", auto.last_latency_ms, auto.avg_latency_ms)
+    } else {
+        "-".to_string()
+    };
+
+    // Move cursor to top
     print!("\x1b[H");
 
-    println!("{cyan}╔══════════════════════════════════════════════════════════════════╗{reset}");
-    println!("{cyan}║{reset}       {green}CROSS-MARKET CORRELATION ARBITRAGE{reset}                        {cyan}║{reset}");
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
-    println!("{cyan}║{reset}  Mode: {mode_color}{:6}{reset}  │  Pair: {:8}  │  Strategy: {:12} {cyan}║{reset}",
+    // Clear and print each line
+    println!("{clear_line}");
+    println!("{clear_line}{bold}{cyan}  CROSS-MARKET CORRELATION ARBITRAGE{reset}");
+    println!("{clear_line}");
+
+    // Config line
+    println!("{clear_line}  {dim}Mode:{reset} {mode_color}{:6}{reset}   {dim}Pair:{reset} {:8}   {dim}Strategy:{reset} {}",
         config.mode, config.pair, config.combination);
-    println!("{cyan}║{reset}  Bet:  {:6}  │  Spread: ${:.2}    │  Balance: ${:14} {cyan}║{reset}",
+    println!("{clear_line}  {dim}Bet:{reset}  {:7}  {dim}Spread:{reset} ${:.2}       {dim}Balance:{reset} ${:.2}",
         config.bet_size, config.min_spread, config.balance);
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
+    println!("{clear_line}");
 
     // Systems status
-    let status_msg = if shutting_down {
-        format!("{yellow}Shutting down...{reset}")
-    } else {
-        format!("{green}Running{reset}")
-    };
-    println!("{cyan}║{reset}  {bold}SYSTEMS{reset}   {scanner_status} Scanner   {executor_status} Executor   {ws_status} WebSocket   {status_msg:16} {cyan}║{reset}");
-
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
+    let status_text = if shutting_down { format!("{yellow}Stopping{reset}") } else { format!("{green}Running{reset}") };
+    println!("{clear_line}  {bold}Systems{reset}  {scanner_dot}●{reset} Scanner  {executor_dot}●{reset} Executor  {ws_dot}●{reset} WebSocket  [{status_text}]");
+    println!("{clear_line}  {dim}Latency:{reset} {latency_str}");
+    println!("{clear_line}");
 
     // Trading stats
-    println!("{cyan}║{reset}  {bold}TRADING{reset}                                                         {cyan}║{reset}");
-    println!("{cyan}║{reset}    Scans: {:6}   Opportunities: {:6}   Executed: {:6}       {cyan}║{reset}",
+    println!("{clear_line}  {bold}Trading{reset}");
+    println!("{clear_line}    Scans: {:<6}  Opportunities: {:<6}  Executed: {}",
         runner.scans_performed, runner.opportunities_detected, auto.both_filled);
-    println!("{cyan}║{reset}    Pending: {:4}   Settled: {:4}   Skipped: {:4}   Rejected: {:4} {cyan}║{reset}",
+    println!("{clear_line}    Pending: {:<4}  Settled: {:<4}  Skipped: {:<4}  Rejected: {}",
         auto.pending_settlement, total_settled, auto.opportunities_skipped, auto.both_rejected);
-
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
+    println!("{clear_line}");
 
     // Performance
-    println!("{cyan}║{reset}  {bold}PERFORMANCE{reset}                                                     {cyan}║{reset}");
-    println!("{cyan}║{reset}    Wins: {green}{:4}{reset}   Losses: {red}{:4}{reset}   Win Rate: {:5.1}%                   {cyan}║{reset}",
+    println!("{clear_line}  {bold}Performance{reset}");
+    println!("{clear_line}    Wins: {green}{}{reset}  Losses: {red}{}{reset}  Win Rate: {:.1}%",
         auto.settled_wins, auto.settled_losses, win_rate);
-    println!("{cyan}║{reset}    P&L: {pnl_color}${:12}{reset}   Volume: ${:12}                {cyan}║{reset}",
+    println!("{clear_line}    P&L: {pnl_color}${:.2}{reset}  Volume: ${:.2}",
         auto.realized_pnl, auto.total_volume);
-
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
+    println!("{clear_line}");
 
     // Progress bar
-    let bar_width = 40;
+    let bar_width = 30;
     let filled = (progress_pct / 100.0 * bar_width as f64) as usize;
     let empty = bar_width - filled;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
 
-    println!("{cyan}║{reset}  {dim}Progress:{reset} [{cyan}{}{reset}] {:5.1}%  Remaining: {:8} {cyan}║{reset}",
-        bar, progress_pct, remaining_str);
-    println!("{cyan}║{reset}  {dim}Time: {}{reset}   {dim}Press Ctrl+C to stop{reset}                          {cyan}║{reset}",
+    println!("{clear_line}  [{cyan}{bar}{reset}] {:.1}%  {dim}Remaining:{reset} {remaining_str}", progress_pct);
+    println!("{clear_line}");
+    println!("{clear_line}  {dim}Time: {}  |  Ctrl+C to stop  |  Logs: /tmp/cross_market_auto.log{reset}",
         Local::now().format("%H:%M:%S"));
-    println!("{cyan}║{reset}  {dim}Logs: /tmp/cross_market_auto.log (or use --verbose){reset}             {cyan}║{reset}");
-    println!("{cyan}╚══════════════════════════════════════════════════════════════════╝{reset}");
 
     let _ = stdout().flush();
 }
@@ -625,45 +606,45 @@ async fn print_summary(
     let cyan = "\x1b[96m";
     let reset = "\x1b[0m";
     let bold = "\x1b[1m";
+    let dim = "\x1b[2m";
+
+    // Clear screen and print summary
+    print!("\x1b[2J\x1b[H");
 
     println!();
-    println!("{cyan}╔══════════════════════════════════════════════════════════════════╗{reset}");
-    println!("{cyan}║{reset}                      {bold}FINAL SUMMARY{reset}                              {cyan}║{reset}");
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
-    println!("{cyan}║{reset}  {bold}Scanner{reset}                                                        {cyan}║{reset}");
-    println!("{cyan}║{reset}    Scans performed: {:8}                                     {cyan}║{reset}", runner.scans_performed);
-    println!("{cyan}║{reset}    Opportunities detected: {:8}                             {cyan}║{reset}", runner.opportunities_detected);
+    println!("  {bold}{cyan}SESSION COMPLETE{reset}");
+    println!();
+    println!("  {bold}Scanner{reset}");
+    println!("    Scans: {}  Opportunities: {}", runner.scans_performed, runner.opportunities_detected);
     if let Some(best) = runner.best_spread {
-        println!("{cyan}║{reset}    Best spread seen: ${:.4}                                     {cyan}║{reset}", best);
+        println!("    Best spread: ${:.4}", best);
     }
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
-    println!("{cyan}║{reset}  {bold}Executor{reset}                                                       {cyan}║{reset}");
-    println!("{cyan}║{reset}    Opportunities received: {:8}                             {cyan}║{reset}", auto.opportunities_received);
-    println!("{cyan}║{reset}    Opportunities skipped: {:8}                              {cyan}║{reset}", auto.opportunities_skipped);
-    println!("{cyan}║{reset}    Both legs filled: {:8}                                   {cyan}║{reset}", auto.both_filled);
-    println!("{cyan}║{reset}    Partial fills: {:8}                                      {cyan}║{reset}", auto.partial_fills);
-    println!("{cyan}║{reset}    Both rejected: {:8}                                      {cyan}║{reset}", auto.both_rejected);
-    println!("{cyan}║{reset}    Total volume: ${:12}                                  {cyan}║{reset}", auto.total_volume);
-
+    println!();
+    println!("  {bold}Executor{reset}");
+    println!("    Received: {}  Skipped: {}  Executed: {}",
+        auto.opportunities_received, auto.opportunities_skipped, auto.both_filled);
+    println!("    Partial: {}  Rejected: {}  Volume: ${:.2}",
+        auto.partial_fills, auto.both_rejected, auto.total_volume);
     if auto.executions_attempted > 0 {
         let fill_rate = auto.both_filled as f64 / auto.executions_attempted as f64 * 100.0;
-        println!("{cyan}║{reset}    Fill rate: {:5.1}%                                            {cyan}║{reset}", fill_rate);
+        println!("    Fill rate: {:.1}%", fill_rate);
     }
-
-    println!("{cyan}╠══════════════════════════════════════════════════════════════════╣{reset}");
-    println!("{cyan}║{reset}  {bold}Settlement{reset}                                                     {cyan}║{reset}");
-    println!("{cyan}║{reset}    Pending: {:8}                                            {cyan}║{reset}", auto.pending_settlement);
-    println!("{cyan}║{reset}    Wins: {green}{:8}{reset}   Losses: {red}{:8}{reset}   Double Wins: {:8}   {cyan}║{reset}",
-        auto.settled_wins, auto.settled_losses, auto.double_wins);
+    if auto.latency_samples > 0 {
+        println!("    Avg latency: {}ms ({} samples)", auto.avg_latency_ms, auto.latency_samples);
+    }
+    println!();
+    println!("  {bold}Settlement{reset}");
+    println!("    Pending: {}  Wins: {green}{}{reset}  Losses: {red}{}{reset}  Double: {}",
+        auto.pending_settlement, auto.settled_wins, auto.settled_losses, auto.double_wins);
 
     let pnl_color = if auto.realized_pnl > Decimal::ZERO { green } else if auto.realized_pnl < Decimal::ZERO { red } else { reset };
-    println!("{cyan}║{reset}    Realized P&L: {pnl_color}${:12}{reset}                                 {cyan}║{reset}", auto.realized_pnl);
+    println!("    {bold}P&L: {pnl_color}${:.2}{reset}", auto.realized_pnl);
 
     if auto.settled_wins + auto.settled_losses > 0 {
         let win_rate = auto.settled_wins as f64 / (auto.settled_wins + auto.settled_losses) as f64 * 100.0;
-        println!("{cyan}║{reset}    Win Rate: {:5.1}%                                             {cyan}║{reset}", win_rate);
+        println!("    Win Rate: {:.1}%", win_rate);
     }
-
-    println!("{cyan}╚══════════════════════════════════════════════════════════════════╝{reset}");
+    println!();
+    println!("  {dim}Full logs: /tmp/cross_market_auto.log{reset}");
     println!();
 }

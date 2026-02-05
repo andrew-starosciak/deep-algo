@@ -329,6 +329,16 @@ pub struct CrossMarketAutoExecutorStats {
     /// Trades settled as losses.
     pub settled_losses: u64,
 
+    // === Latency Stats ===
+    /// Last API latency in milliseconds.
+    pub last_latency_ms: u64,
+
+    /// Average API latency in milliseconds.
+    pub avg_latency_ms: u64,
+
+    /// Total latency samples.
+    pub latency_samples: u64,
+
     /// Double wins (both legs won - rare but possible).
     pub double_wins: u64,
 
@@ -897,11 +907,22 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             "Executing cross-market trade"
         );
 
-        // Submit both orders
+        // Submit both orders (with latency tracking)
+        let start = std::time::Instant::now();
         let results = self
             .executor
             .submit_orders_batch(vec![leg1_order, leg2_order])
             .await?;
+        let latency_ms = start.elapsed().as_millis() as u64;
+
+        // Update latency stats
+        {
+            let mut stats = self.stats.write().await;
+            stats.last_latency_ms = latency_ms;
+            stats.latency_samples += 1;
+            // Running average
+            stats.avg_latency_ms = ((stats.avg_latency_ms * (stats.latency_samples - 1)) + latency_ms) / stats.latency_samples;
+        }
 
         if results.len() != 2 {
             return Err(CrossMarketAutoExecutorError::Execution(
