@@ -11,7 +11,7 @@ use commands::{
     CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs, CrossMarketBacktestArgs,
     CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
     EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs, LatencyMonitorArgs,
-    Phase1ArbitrageArgs, PolymarketPaperTradeArgs, ValidateSignalsArgs,
+    Phase1ArbitrageArgs, PolymarketPaperTradeArgs, PreflightArgs, ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -155,6 +155,8 @@ enum Commands {
     CrossMarketAuto(CrossMarketAutoArgs),
     /// Check order book depth for 15-minute crypto markets
     CheckDepth(CheckDepthArgs),
+    /// Preflight validation before going live (wallet, balance, API connectivity)
+    Preflight(PreflightArgs),
 }
 
 #[tokio::main]
@@ -304,6 +306,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::CheckDepth(args) => {
             commands::run_check_depth(args).await?;
+        }
+        Commands::Preflight(args) => {
+            commands::run_preflight(args).await?;
         }
     }
 

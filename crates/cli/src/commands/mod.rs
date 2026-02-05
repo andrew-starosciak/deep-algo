@@ -21,6 +21,7 @@ pub mod gabagool_monitor;
 pub mod latency_monitor;
 pub mod phase1_arbitrage;
 pub mod polymarket_paper_trade;
+pub mod preflight;
 pub mod validate_signals;
 pub mod window_timing;
 
@@ -45,4 +46,5 @@ pub use gabagool_monitor::{run as run_gabagool_monitor, GabagoolMonitorArgs};
 pub use latency_monitor::{run as run_latency_monitor, LatencyMonitorArgs};
 pub use phase1_arbitrage::{run_phase1_arbitrage, Phase1ArbitrageArgs};
 pub use polymarket_paper_trade::{run_polymarket_paper_trade, PolymarketPaperTradeArgs};
+pub use preflight::{run as run_preflight, PreflightArgs};
 pub use validate_signals::{run_validate_signals, ValidateSignalsArgs};
