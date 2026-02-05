@@ -147,12 +147,16 @@ if [[ -n "$PERSIST" && -z "$DATABASE_URL" ]]; then
     exit 1
 fi
 
+# Default max position (allow ~10 trades per window with $50 bet)
+MAX_POSITION="${MAX_POSITION:-500}"
+
 # Build the command
 CMD="cargo run -p algo-trade-cli -- cross-market-auto"
 CMD="$CMD --pair $PAIR"
 CMD="$CMD --combination $COMBINATION"
 CMD="$CMD --mode $MODE"
 CMD="$CMD --bet-size $BET_SIZE"
+CMD="$CMD --max-position $MAX_POSITION"
 CMD="$CMD --duration $DURATION"
 [[ -n "$PERSIST" ]] && CMD="$CMD $PERSIST"
 [[ -n "$SESSION_ID" ]] && CMD="$CMD $SESSION_ID"
@@ -176,6 +180,7 @@ echo -e "  ${DIM}Duration:${NC}      $DURATION"
 echo -e "  ${DIM}Pair:${NC}          ${PAIR^^}"
 echo -e "  ${DIM}Combination:${NC}   $COMBINATION"
 echo -e "  ${DIM}Bet Size:${NC}      \$$BET_SIZE"
+echo -e "  ${DIM}Max/Window:${NC}   \$$MAX_POSITION"
 echo -e "  ${DIM}Persistence:${NC}   $([ -n "$PERSIST" ] && echo "ENABLED" || echo "disabled")"
 echo -e "  ${DIM}Session:${NC}       $SESSION_DISPLAY"
 echo ""

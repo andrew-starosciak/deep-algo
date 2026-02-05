@@ -567,6 +567,12 @@ impl PolymarketExecutor for PaperExecutor {
         let state = self.state.read();
         Ok(state.balance)
     }
+
+    async fn credit_balance(&self, amount: Decimal) -> Result<(), ExecutionError> {
+        let mut state = self.state.write();
+        state.balance += amount;
+        Ok(())
+    }
 }
 
 // =============================================================================

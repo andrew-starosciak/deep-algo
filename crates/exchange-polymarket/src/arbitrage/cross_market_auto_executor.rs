@@ -305,6 +305,15 @@ pub struct CrossMarketAutoExecutorStats {
     /// Only one leg filled (partial).
     pub partial_fills: u64,
 
+    /// Incomplete trades awaiting completion.
+    pub incomplete_trades: u64,
+
+    /// Incomplete trades successfully completed.
+    pub incomplete_recovered: u64,
+
+    /// Incomplete trades that expired (window closed).
+    pub incomplete_expired: u64,
+
     /// Both legs rejected.
     pub both_rejected: u64,
 
@@ -415,6 +424,92 @@ pub struct PendingPaperSettlement {
     pub window_end: DateTime<Utc>,
     /// When the trade was executed.
     pub executed_at: DateTime<Utc>,
+}
+
+// =============================================================================
+// Incomplete Trade (Partial Fill Recovery)
+// =============================================================================
+
+/// Which leg was filled in a partial fill scenario.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FilledLeg {
+    /// Leg 1 (coin 1) was filled.
+    Leg1,
+    /// Leg 2 (coin 2) was filled.
+    Leg2,
+}
+
+/// An incomplete trade where one leg filled but the other didn't.
+///
+/// This tracks partial fills so we can attempt to complete the missing leg
+/// when market conditions become favorable again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncompleteTrade {
+    /// Unique ID for this incomplete trade.
+    pub trade_id: String,
+
+    /// Which leg was successfully filled.
+    pub filled_leg: FilledLeg,
+
+    /// Coin 1 symbol (e.g., "btc").
+    pub coin1: String,
+
+    /// Coin 2 symbol (e.g., "eth").
+    pub coin2: String,
+
+    /// The filled leg's direction ("UP" or "DOWN").
+    pub filled_direction: String,
+
+    /// The filled leg's token ID.
+    pub filled_token_id: String,
+
+    /// Price at which the filled leg executed.
+    pub filled_price: Decimal,
+
+    /// Number of shares filled.
+    pub shares: Decimal,
+
+    /// The missing leg's direction ("UP" or "DOWN").
+    pub missing_direction: String,
+
+    /// The missing leg's token ID.
+    pub missing_token_id: String,
+
+    /// Maximum price we're willing to pay for the missing leg.
+    /// Calculated as: target_pair_cost - filled_price
+    pub max_missing_price: Decimal,
+
+    /// Window end time (must complete before this).
+    pub window_end: DateTime<Utc>,
+
+    /// When the partial fill occurred.
+    pub created_at: DateTime<Utc>,
+
+    /// Number of retry attempts.
+    pub retry_count: u32,
+
+    /// Combination type for this trade.
+    pub combination: CrossMarketCombination,
+}
+
+impl IncompleteTrade {
+    /// Returns true if the window has expired.
+    pub fn is_expired(&self) -> bool {
+        Utc::now() > self.window_end
+    }
+
+    /// Returns true if the given price is acceptable for completing the trade.
+    pub fn is_price_acceptable(&self, current_price: Decimal) -> bool {
+        current_price <= self.max_missing_price
+    }
+
+    /// Returns the coin symbol for the missing leg.
+    pub fn missing_coin(&self) -> &str {
+        match self.filled_leg {
+            FilledLeg::Leg1 => &self.coin2,
+            FilledLeg::Leg2 => &self.coin1,
+        }
+    }
 }
 
 // =============================================================================
@@ -577,6 +672,9 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
     /// Pending settlements (paper trading).
     pending_settlements: Arc<RwLock<Vec<PendingPaperSettlement>>>,
 
+    /// Incomplete trades awaiting completion (partial fills).
+    incomplete_trades: Arc<RwLock<Vec<IncompleteTrade>>>,
+
     /// HTTP client for settlement price checks.
     http_client: reqwest::Client,
 
@@ -618,6 +716,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             stats: Arc::new(RwLock::new(CrossMarketAutoExecutorStats::default())),
             history: Arc::new(RwLock::new(VecDeque::new())),
             pending_settlements: Arc::new(RwLock::new(Vec::new())),
+            incomplete_trades: Arc::new(RwLock::new(Vec::new())),
             http_client: reqwest::Client::new(),
             gamma_client: GammaClient::new(),
             fee_rate: dec!(0.02), // 2% fee
@@ -652,6 +751,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             stats: Arc::new(RwLock::new(CrossMarketAutoExecutorStats::default())),
             history: Arc::new(RwLock::new(VecDeque::new())),
             pending_settlements: Arc::new(RwLock::new(Vec::new())),
+            incomplete_trades: Arc::new(RwLock::new(Vec::new())),
             http_client: reqwest::Client::new(),
             gamma_client: GammaClient::new(),
             fee_rate: dec!(0.02), // 2% fee
@@ -715,10 +815,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
             // Always check settlement if interval has passed (before waiting for opportunities)
             if last_settlement_check.elapsed() >= settlement_check_interval {
-                info!("Running periodic settlement check...");
+                debug!("Running periodic settlement check...");
                 if let Err(e) = self.check_pending_settlements().await {
                     warn!(error = %e, "Settlement check error");
                 }
+
+                // Also try to complete any incomplete trades (partial fill recovery)
+                if let Err(e) = self.try_complete_incomplete_trades().await {
+                    warn!(error = %e, "Incomplete trade recovery error");
+                }
+
                 last_settlement_check = std::time::Instant::now();
             }
 
@@ -747,6 +853,18 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         info!("Running final settlement check...");
         if let Err(e) = self.check_pending_settlements().await {
             warn!(error = %e, "Final settlement check error");
+        }
+
+        // Log any remaining incomplete trades
+        {
+            let incomplete = self.incomplete_trades.read().await;
+            if !incomplete.is_empty() {
+                warn!(
+                    count = incomplete.len(),
+                    "Stopping with {} incomplete trades still pending",
+                    incomplete.len()
+                );
+            }
         }
 
         Ok(())
@@ -840,7 +958,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
-        // Update stats
+        // Update stats and handle partial fills
         {
             let mut stats = self.stats.write().await;
             stats.executions_attempted += 1;
@@ -850,10 +968,35 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     stats.total_volume += *total_cost;
                     stats.last_trade_time = Some(Utc::now());
                 }
-                CrossMarketExecutionResult::Leg1OnlyFilled { .. }
-                | CrossMarketExecutionResult::Leg2OnlyFilled { .. } => {
+                CrossMarketExecutionResult::Leg1OnlyFilled { leg1_result, .. } => {
                     stats.partial_fills += 1;
-                    warn!("Partial fill - directional exposure created!");
+                    stats.incomplete_trades += 1;
+                    warn!("Partial fill - leg 1 only. Adding to recovery queue.");
+
+                    // Create incomplete trade for recovery
+                    let incomplete = self.create_incomplete_trade(
+                        &opp,
+                        FilledLeg::Leg1,
+                        leg1_result.avg_fill_price.unwrap_or(opp.leg1_price),
+                        shares,
+                    );
+                    drop(stats); // Release lock before acquiring another
+                    self.incomplete_trades.write().await.push(incomplete);
+                }
+                CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
+                    stats.partial_fills += 1;
+                    stats.incomplete_trades += 1;
+                    warn!("Partial fill - leg 2 only. Adding to recovery queue.");
+
+                    // Create incomplete trade for recovery
+                    let incomplete = self.create_incomplete_trade(
+                        &opp,
+                        FilledLeg::Leg2,
+                        leg2_result.avg_fill_price.unwrap_or(opp.leg2_price),
+                        shares,
+                    );
+                    drop(stats); // Release lock before acquiring another
+                    self.incomplete_trades.write().await.push(incomplete);
                 }
                 CrossMarketExecutionResult::BothRejected { .. } => {
                     stats.both_rejected += 1;
@@ -862,6 +1005,300 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         Ok(())
+    }
+
+    /// Creates an IncompleteTrade from a partial fill.
+    fn create_incomplete_trade(
+        &self,
+        opp: &CrossMarketOpportunity,
+        filled_leg: FilledLeg,
+        filled_price: Decimal,
+        shares: Decimal,
+    ) -> IncompleteTrade {
+        // Calculate window end time
+        let window_end = {
+            let ts = opp.detected_at.timestamp();
+            let window_secs = 900; // 15 minutes
+            let window_start = (ts / window_secs) * window_secs;
+            let window_end_ts = window_start + window_secs;
+            DateTime::from_timestamp(window_end_ts, 0).unwrap_or(opp.detected_at)
+        };
+
+        // Target pair cost with some buffer (allow slightly worse price)
+        // Use 0.97 as max pair cost (giving at least $0.03 spread)
+        let target_pair_cost = dec!(0.97);
+        let max_missing_price = target_pair_cost - filled_price;
+
+        match filled_leg {
+            FilledLeg::Leg1 => IncompleteTrade {
+                trade_id: format!(
+                    "incomplete-{}-{}-{}",
+                    opp.coin1, opp.coin2, opp.detected_at.timestamp_millis()
+                ),
+                filled_leg,
+                coin1: opp.coin1.clone(),
+                coin2: opp.coin2.clone(),
+                filled_direction: opp.leg1_direction.clone(),
+                filled_token_id: opp.leg1_token_id.clone(),
+                filled_price,
+                shares,
+                missing_direction: opp.leg2_direction.clone(),
+                missing_token_id: opp.leg2_token_id.clone(),
+                max_missing_price,
+                window_end,
+                created_at: Utc::now(),
+                retry_count: 0,
+                combination: opp.combination,
+            },
+            FilledLeg::Leg2 => IncompleteTrade {
+                trade_id: format!(
+                    "incomplete-{}-{}-{}",
+                    opp.coin1, opp.coin2, opp.detected_at.timestamp_millis()
+                ),
+                filled_leg,
+                coin1: opp.coin1.clone(),
+                coin2: opp.coin2.clone(),
+                filled_direction: opp.leg2_direction.clone(),
+                filled_token_id: opp.leg2_token_id.clone(),
+                filled_price,
+                shares,
+                missing_direction: opp.leg1_direction.clone(),
+                missing_token_id: opp.leg1_token_id.clone(),
+                max_missing_price,
+                window_end,
+                created_at: Utc::now(),
+                retry_count: 0,
+                combination: opp.combination,
+            },
+        }
+    }
+
+    /// Attempts to complete incomplete trades (partial fill recovery).
+    ///
+    /// This method:
+    /// 1. Removes expired incomplete trades (window closed)
+    /// 2. Checks if the missing leg can be filled at an acceptable price
+    /// 3. Attempts to fill the missing leg
+    /// 4. On success, creates a full trade for settlement
+    pub async fn try_complete_incomplete_trades(
+        &self,
+    ) -> Result<u64, CrossMarketAutoExecutorError> {
+        let mut completed_count = 0u64;
+        let mut expired_count = 0u64;
+
+        // Get current live prices for checking
+        let live_prices = {
+            let stats = self.stats.read().await;
+            stats.live_prices.clone()
+        };
+
+        if live_prices.is_empty() {
+            debug!("No live prices available for incomplete trade recovery");
+            return Ok(0);
+        }
+
+        // Get incomplete trades to process
+        let trades_to_check: Vec<IncompleteTrade> = {
+            let incomplete = self.incomplete_trades.read().await;
+            incomplete.clone()
+        };
+
+        if trades_to_check.is_empty() {
+            return Ok(0);
+        }
+
+        info!(
+            count = trades_to_check.len(),
+            "Checking {} incomplete trades for recovery",
+            trades_to_check.len()
+        );
+
+        for trade in trades_to_check {
+            // Check if expired
+            if trade.is_expired() {
+                warn!(
+                    trade_id = %trade.trade_id,
+                    "Incomplete trade expired - window closed"
+                );
+                expired_count += 1;
+
+                // Remove from list and update stats
+                {
+                    let mut incomplete = self.incomplete_trades.write().await;
+                    incomplete.retain(|t| t.trade_id != trade.trade_id);
+                }
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.incomplete_expired += 1;
+                    stats.incomplete_trades = stats.incomplete_trades.saturating_sub(1);
+                }
+                continue;
+            }
+
+            // Get current price for the missing leg's coin
+            let missing_coin = trade.missing_coin().to_uppercase();
+            let current_price = match live_prices.get(&missing_coin) {
+                Some(&(up_price, down_price)) => {
+                    // Get the price for the direction we need
+                    if trade.missing_direction == "UP" {
+                        up_price
+                    } else {
+                        down_price
+                    }
+                }
+                None => {
+                    debug!(
+                        trade_id = %trade.trade_id,
+                        missing_coin = %missing_coin,
+                        "No price available for missing leg"
+                    );
+                    continue;
+                }
+            };
+
+            // Check if price is acceptable
+            if !trade.is_price_acceptable(current_price) {
+                debug!(
+                    trade_id = %trade.trade_id,
+                    current_price = %current_price,
+                    max_price = %trade.max_missing_price,
+                    "Price not acceptable for recovery"
+                );
+                continue;
+            }
+
+            info!(
+                trade_id = %trade.trade_id,
+                missing_coin = %missing_coin,
+                missing_direction = %trade.missing_direction,
+                current_price = %current_price,
+                max_price = %trade.max_missing_price,
+                filled_price = %trade.filled_price,
+                "Attempting to complete incomplete trade"
+            );
+
+            // Try to fill the missing leg
+            let order = OrderParams {
+                token_id: trade.missing_token_id.clone(),
+                side: Side::Buy,
+                price: current_price,
+                size: trade.shares,
+                order_type: OrderType::Fok,
+                neg_risk: true,
+                presigned: None,
+            };
+
+            let results = match self.executor.submit_orders_batch(vec![order]).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        trade_id = %trade.trade_id,
+                        error = %e,
+                        "Failed to submit recovery order"
+                    );
+                    // Increment retry count
+                    {
+                        let mut incomplete = self.incomplete_trades.write().await;
+                        if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
+                            t.retry_count += 1;
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            if results.is_empty() || results[0].status != OrderStatus::Filled {
+                debug!(
+                    trade_id = %trade.trade_id,
+                    "Recovery order not filled"
+                );
+                // Increment retry count
+                {
+                    let mut incomplete = self.incomplete_trades.write().await;
+                    if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
+                        t.retry_count += 1;
+                    }
+                }
+                continue;
+            }
+
+            // Successfully completed!
+            let missing_fill_price = results[0].avg_fill_price.unwrap_or(current_price);
+            let total_cost = (trade.filled_price + missing_fill_price) * trade.shares;
+
+            info!(
+                trade_id = %trade.trade_id,
+                filled_leg_price = %trade.filled_price,
+                missing_leg_price = %missing_fill_price,
+                total_cost = %total_cost,
+                "Successfully recovered incomplete trade!"
+            );
+
+            // Remove from incomplete list
+            {
+                let mut incomplete = self.incomplete_trades.write().await;
+                incomplete.retain(|t| t.trade_id != trade.trade_id);
+            }
+
+            // Update stats
+            {
+                let mut stats = self.stats.write().await;
+                stats.incomplete_recovered += 1;
+                stats.incomplete_trades = stats.incomplete_trades.saturating_sub(1);
+                stats.both_filled += 1;
+                stats.total_volume += total_cost;
+            }
+
+            // Add to pending settlements for paper trading
+            let settlement = PendingPaperSettlement {
+                trade_id: format!("recovered-{}", trade.trade_id),
+                coin1: trade.coin1.clone(),
+                coin2: trade.coin2.clone(),
+                leg1_direction: if trade.filled_leg == FilledLeg::Leg1 {
+                    trade.filled_direction.clone()
+                } else {
+                    trade.missing_direction.clone()
+                },
+                leg2_direction: if trade.filled_leg == FilledLeg::Leg2 {
+                    trade.filled_direction.clone()
+                } else {
+                    trade.missing_direction.clone()
+                },
+                leg1_token_id: if trade.filled_leg == FilledLeg::Leg1 {
+                    trade.filled_token_id.clone()
+                } else {
+                    trade.missing_token_id.clone()
+                },
+                leg2_token_id: if trade.filled_leg == FilledLeg::Leg2 {
+                    trade.filled_token_id.clone()
+                } else {
+                    trade.missing_token_id.clone()
+                },
+                total_cost,
+                shares: trade.shares,
+                window_end: trade.window_end,
+                executed_at: Utc::now(),
+            };
+
+            {
+                let mut pending = self.pending_settlements.write().await;
+                pending.push(settlement);
+            }
+
+            completed_count += 1;
+        }
+
+        if completed_count > 0 || expired_count > 0 {
+            info!(
+                completed = completed_count,
+                expired = expired_count,
+                "Incomplete trade recovery: {} completed, {} expired",
+                completed_count,
+                expired_count
+            );
+        }
+
+        Ok(completed_count)
     }
 
     /// Parses a coin string to Coin enum.
@@ -1739,6 +2176,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
             // Update paper balance tracking
             stats.paper_balance += net_payout;
+        }
+
+        // Credit the executor's balance back (essential for paper trading)
+        // In live mode, this is a no-op (balance comes from chain)
+        if let Err(e) = self.executor.credit_balance(net_payout).await {
+            warn!(error = %e, "Failed to credit executor balance");
         }
 
         // Update database status if persistence is enabled

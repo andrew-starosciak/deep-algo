@@ -715,6 +715,10 @@ async fn print_summary(
         auto.opportunities_received, auto.opportunities_skipped, auto.both_filled);
     println!("    Partial: {}  Rejected: {}  Volume: ${:.2}",
         auto.partial_fills, auto.both_rejected, auto.total_volume);
+    if auto.incomplete_trades > 0 || auto.incomplete_recovered > 0 {
+        println!("    Incomplete: {} pending, {} recovered, {} expired",
+            auto.incomplete_trades, auto.incomplete_recovered, auto.incomplete_expired);
+    }
     if auto.executions_attempted > 0 {
         let fill_rate = auto.both_filled as f64 / auto.executions_attempted as f64 * 100.0;
         println!("    Fill rate: {:.1}%", fill_rate);

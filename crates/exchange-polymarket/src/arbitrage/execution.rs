@@ -595,6 +595,21 @@ pub trait PolymarketExecutor: Send + Sync {
     /// # Returns
     /// Available balance for trading.
     async fn get_balance(&self) -> Result<Decimal, ExecutionError>;
+
+    /// Credits an amount back to the executor's balance.
+    ///
+    /// This is a no-op for live executors (balance comes from chain),
+    /// but essential for paper trading where we track balance internally.
+    ///
+    /// # Arguments
+    /// * `amount` - Amount to credit back to the balance.
+    ///
+    /// # Returns
+    /// Ok(()) on success.
+    async fn credit_balance(&self, _amount: Decimal) -> Result<(), ExecutionError> {
+        // Default no-op for live executors
+        Ok(())
+    }
 }
 
 // =============================================================================
