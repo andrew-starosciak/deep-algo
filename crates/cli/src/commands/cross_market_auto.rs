@@ -412,6 +412,13 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
         }
 
         if last_stats.elapsed() >= stats_interval {
+            // Copy live prices from runner to executor for settlement
+            {
+                let runner = runner_stats.read().await;
+                let mut auto = auto_stats.write().await;
+                auto.live_prices = runner.current_prices.clone();
+            }
+
             if verbose {
                 print_stats_log(&runner_stats, &auto_stats).await;
             } else {

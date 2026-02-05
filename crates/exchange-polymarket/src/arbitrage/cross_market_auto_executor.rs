@@ -355,6 +355,11 @@ pub struct CrossMarketAutoExecutorStats {
 
     /// Pending settlements for display.
     pub pending_trades: Vec<PendingTradeDisplay>,
+
+    // === Live prices from WebSocket (for settlement) ===
+    /// Current prices from WebSocket feed: coin -> (up_price, down_price).
+    /// Updated by the CLI from runner stats, used for fast settlement.
+    pub live_prices: std::collections::HashMap<String, (Decimal, Decimal)>,
 }
 
 /// Simplified trade info for dashboard display.
@@ -1252,15 +1257,17 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         });
     }
 
-    /// Tries fast settlement by fetching CLOB prices directly.
+    /// Tries fast settlement using live WebSocket prices first, then CLOB.
     ///
-    /// For trades where the window has closed, fetches current token prices
-    /// and settles if they're decisive (>$0.75 = winner, <$0.25 = loser).
+    /// For trades where the window has closed:
+    /// 1. Try using live_prices from WebSocket (most reliable)
+    /// 2. Fall back to fetching CLOB prices directly
+    ///
+    /// If UP price > 0.70, coin went UP. If DOWN price > 0.70, coin went DOWN.
     async fn try_fast_settle_via_clob(&self) -> Result<u64, CrossMarketAutoExecutorError> {
         let now = Utc::now();
-        // Lowered thresholds - prices should be very skewed after resolution
-        let threshold_high = dec!(0.75);
-        let threshold_low = dec!(0.25);
+        // If price > 0.70, that outcome won (lowered from 0.75 for faster settlement)
+        let threshold = dec!(0.70);
 
         // Find trades with closed windows
         let trades_to_check: Vec<PendingPaperSettlement> = {
@@ -1275,8 +1282,15 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             return Ok(0);
         }
 
+        // Get live prices from stats (updated by CLI from runner)
+        let live_prices = {
+            let stats = self.stats.read().await;
+            stats.live_prices.clone()
+        };
+
         info!(
             count = trades_to_check.len(),
+            live_prices_available = !live_prices.is_empty(),
             "Checking {} pending trades for fast settlement",
             trades_to_check.len()
         );
@@ -1286,7 +1300,93 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         for settlement in trades_to_check {
             let secs_since_close = (now - settlement.window_end).num_seconds();
 
-            // Fetch current prices for the tokens
+            // Try to settle using live WebSocket prices first
+            let c1_upper = settlement.coin1.to_uppercase();
+            let c2_upper = settlement.coin2.to_uppercase();
+
+            if let (Some(&(c1_up, c1_down)), Some(&(c2_up, c2_down))) =
+                (live_prices.get(&c1_upper), live_prices.get(&c2_upper))
+            {
+                // Determine outcomes from live prices
+                // If UP price > threshold, coin went UP; if DOWN price > threshold, coin went DOWN
+                let c1_outcome = if c1_up > threshold {
+                    Some("UP")
+                } else if c1_down > threshold {
+                    Some("DOWN")
+                } else {
+                    None
+                };
+
+                let c2_outcome = if c2_up > threshold {
+                    Some("UP")
+                } else if c2_down > threshold {
+                    Some("DOWN")
+                } else {
+                    None
+                };
+
+                info!(
+                    trade_id = %settlement.trade_id,
+                    secs_since_close = secs_since_close,
+                    c1 = %c1_upper,
+                    c1_up = %c1_up,
+                    c1_down = %c1_down,
+                    c1_outcome = ?c1_outcome,
+                    c2 = %c2_upper,
+                    c2_up = %c2_up,
+                    c2_down = %c2_down,
+                    c2_outcome = ?c2_outcome,
+                    "Checking live WebSocket prices for settlement"
+                );
+
+                if let (Some(c1_out), Some(c2_out)) = (c1_outcome, c2_outcome) {
+                    // We can determine the outcome!
+                    let leg1_won = settlement.leg1_direction == c1_out;
+                    let leg2_won = settlement.leg2_direction == c2_out;
+
+                    info!(
+                        trade_id = %settlement.trade_id,
+                        leg1_dir = %settlement.leg1_direction,
+                        leg2_dir = %settlement.leg2_direction,
+                        c1_outcome = %c1_out,
+                        c2_outcome = %c2_out,
+                        leg1_won = leg1_won,
+                        leg2_won = leg2_won,
+                        "SETTLING via live WebSocket prices"
+                    );
+
+                    // Finalize
+                    self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
+
+                    // Remove from pending
+                    {
+                        let mut pending = self.pending_settlements.write().await;
+                        pending.retain(|s| s.trade_id != settlement.trade_id);
+
+                        let mut stats = self.stats.write().await;
+                        stats.pending_settlement = pending.len() as u64;
+                        stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
+                    }
+
+                    settled_count += 1;
+                    continue; // Move to next trade
+                } else {
+                    info!(
+                        trade_id = %settlement.trade_id,
+                        "Live prices not decisive (need one side > 0.70), trying CLOB API"
+                    );
+                }
+            } else {
+                info!(
+                    trade_id = %settlement.trade_id,
+                    c1 = %c1_upper,
+                    c2 = %c2_upper,
+                    available_coins = ?live_prices.keys().collect::<Vec<_>>(),
+                    "No live prices for coins, trying CLOB API"
+                );
+            }
+
+            // Fall back to CLOB API if live prices not available or not decisive
             let token_ids = vec![
                 settlement.leg1_token_id.clone(),
                 settlement.leg2_token_id.clone(),
@@ -1295,12 +1395,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             let url = format!(
                 "https://clob.polymarket.com/prices?token_ids={}",
                 token_ids.join(",")
-            );
-
-            info!(
-                trade_id = %settlement.trade_id,
-                secs_since_close = secs_since_close,
-                "Fetching CLOB prices for settlement"
             );
 
             let response = match self.http_client.get(&url)
@@ -1320,7 +1414,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 warn!(
                     status = %status,
                     trade_id = %settlement.trade_id,
-                    "CLOB API returned error status"
+                    "CLOB API returned error - tokens may be expired"
                 );
                 continue;
             }
@@ -1346,44 +1440,37 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
             };
 
-            // Parse prices
+            // Parse prices - these are the specific token prices
             let leg1_price = prices.get(&settlement.leg1_token_id)
                 .and_then(|p| Decimal::from_str(&p.price).ok());
             let leg2_price = prices.get(&settlement.leg2_token_id)
                 .and_then(|p| Decimal::from_str(&p.price).ok());
 
-            info!(
-                trade_id = %settlement.trade_id,
-                leg1_price = ?leg1_price,
-                leg2_price = ?leg2_price,
-                leg1_token = %settlement.leg1_token_id,
-                leg2_token = %settlement.leg2_token_id,
-                "CLOB prices fetched"
-            );
-
             if let (Some(p1), Some(p2)) = (leg1_price, leg2_price) {
-                // Determine if prices are decisive
-                let leg1_decisive = p1 > threshold_high || p1 < threshold_low;
-                let leg2_decisive = p2 > threshold_high || p2 < threshold_low;
+                info!(
+                    trade_id = %settlement.trade_id,
+                    leg1_token_price = %p1,
+                    leg2_token_price = %p2,
+                    "CLOB token prices fetched"
+                );
+
+                // For token prices: if > 0.70, that token won
+                let leg1_decisive = p1 > threshold || p1 < (Decimal::ONE - threshold);
+                let leg2_decisive = p2 > threshold || p2 < (Decimal::ONE - threshold);
 
                 if leg1_decisive && leg2_decisive {
-                    // Prices are decisive - we can settle
-                    let leg1_won = p1 > threshold_high;
-                    let leg2_won = p2 > threshold_high;
+                    let leg1_won = p1 > threshold;
+                    let leg2_won = p2 > threshold;
 
                     info!(
                         trade_id = %settlement.trade_id,
-                        leg1_price = %p1,
-                        leg2_price = %p2,
                         leg1_won = leg1_won,
                         leg2_won = leg2_won,
-                        "Fast settlement via CLOB prices - SETTLING"
+                        "SETTLING via CLOB token prices"
                     );
 
-                    // Finalize
                     self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
 
-                    // Remove from pending
                     {
                         let mut pending = self.pending_settlements.write().await;
                         pending.retain(|s| s.trade_id != settlement.trade_id);
@@ -1399,16 +1486,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         trade_id = %settlement.trade_id,
                         leg1_price = %p1,
                         leg2_price = %p2,
-                        leg1_decisive = leg1_decisive,
-                        leg2_decisive = leg2_decisive,
-                        "Prices not decisive yet (need >0.75 or <0.25)"
+                        "CLOB prices not decisive (need > 0.70 or < 0.30)"
                     );
                 }
-            } else {
-                warn!(
-                    trade_id = %settlement.trade_id,
-                    "Could not parse prices from CLOB response"
-                );
             }
         }
 
