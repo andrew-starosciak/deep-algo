@@ -578,13 +578,22 @@ async fn print_dashboard(
         auto.realized_pnl, auto.total_volume);
     println!("{clear_line}");
 
-    // Progress bar
-    let bar_width = 30;
+    // Window progress (15-minute market window)
+    let (window_pct, window_remaining) = get_window_progress();
+    let window_bar_width = 15;
+    let window_filled = (window_pct / 100.0 * window_bar_width as f64) as usize;
+    let window_empty = window_bar_width - window_filled;
+    let window_bar = format!("{}{}", "█".repeat(window_filled), "░".repeat(window_empty));
+    let window_mins = window_remaining / 60;
+    let window_secs = window_remaining % 60;
+
+    // Session progress bar
+    let bar_width = 20;
     let filled = (progress_pct / 100.0 * bar_width as f64) as usize;
     let empty = bar_width - filled;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
 
-    println!("{clear_line}  [{cyan}{bar}{reset}] {:.1}%  {dim}Remaining:{reset} {remaining_str}", progress_pct);
+    println!("{clear_line}  {dim}Window:{reset}  [{yellow}{window_bar}{reset}] {window_mins}:{window_secs:02} left   {dim}Session:{reset} [{cyan}{bar}{reset}] {remaining_str} left");
     println!("{clear_line}");
     println!("{clear_line}  {dim}Time: {}  |  Ctrl+C to stop  |  Logs: /tmp/cross_market_auto.log{reset}",
         Local::now().format("%H:%M:%S"));
@@ -603,6 +612,17 @@ fn format_duration(d: Duration) -> String {
     } else {
         format!("{:02}:{:02}", mins, secs)
     }
+}
+
+/// Calculate the current 15-minute window progress.
+/// Returns (progress_percent, seconds_remaining).
+fn get_window_progress() -> (f64, u64) {
+    let now = chrono::Utc::now().timestamp();
+    let window_start = (now / 900) * 900;
+    let elapsed_in_window = now - window_start;
+    let progress = elapsed_in_window as f64 / 900.0 * 100.0;
+    let remaining = 900 - elapsed_in_window as u64;
+    (progress, remaining)
 }
 
 /// Prints stats as log lines (verbose mode).
