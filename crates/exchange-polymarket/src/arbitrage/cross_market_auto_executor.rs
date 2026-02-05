@@ -1166,22 +1166,44 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         // Collect trades ready for settlement
         let mut to_settle = Vec::new();
+        let mut waiting_count = 0;
         {
             let pending = self.pending_settlements.read().await;
             for settlement in pending.iter() {
-                if now > settlement.window_end + settlement_delay {
+                let ready_at = settlement.window_end + settlement_delay;
+                if now > ready_at {
                     to_settle.push(settlement.clone());
+                } else {
+                    waiting_count += 1;
+                    let wait_secs = (ready_at - now).num_seconds();
+                    debug!(
+                        trade_id = %settlement.trade_id,
+                        window_end = %settlement.window_end,
+                        ready_at = %ready_at,
+                        wait_secs = wait_secs,
+                        "Trade not yet ready for settlement"
+                    );
                 }
             }
         }
 
         if to_settle.is_empty() {
+            if waiting_count > 0 {
+                debug!(waiting = waiting_count, "No trades ready, {} still waiting", waiting_count);
+            }
             return Ok(());
         }
 
-        debug!(count = to_settle.len(), "Checking settlements for ready trades");
+        info!(ready = to_settle.len(), waiting = waiting_count, "Settling ready trades");
 
         for settlement in to_settle {
+            info!(
+                trade_id = %settlement.trade_id,
+                pair = %format!("{}/{}", settlement.coin1, settlement.coin2),
+                window_end = %settlement.window_end,
+                "Attempting settlement"
+            );
+
             match self.settle_paper_trade(&settlement).await {
                 Ok(()) => {
                     // Remove from pending
@@ -1193,7 +1215,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
                 Err(e) => {
                     // Keep in pending for retry
-                    debug!(trade_id = %settlement.trade_id, error = %e, "Settlement not ready yet");
+                    warn!(
+                        trade_id = %settlement.trade_id,
+                        error = %e,
+                        "Settlement failed, will retry"
+                    );
                 }
             }
         }
@@ -1219,9 +1245,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     ) -> Result<(), CrossMarketAutoExecutorError> {
         // Try to get outcomes - CLOB first, then Binance fallback
         let (leg1_won, leg2_won) = match self.try_settle_via_clob(settlement).await {
-            Ok(result) => result,
+            Ok(result) => {
+                debug!(trade_id = %settlement.trade_id, "Settled via CLOB prices");
+                result
+            }
             Err(e) => {
-                debug!(
+                info!(
                     trade_id = %settlement.trade_id,
                     error = %e,
                     "CLOB settlement failed, trying Binance fallback"
@@ -1324,7 +1353,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         Ok(())
     }
 
-    /// Fetches coin outcome (UP or DOWN) from Binance.
+    /// Fetches coin outcome (UP or DOWN) from Binance using 1m candles.
+    ///
+    /// Uses 1m candles instead of 15m because Binance candles don't align with
+    /// Polymarket's ET-based windows. We fetch candles for the entire window
+    /// and compare the open of the first candle to the close of the last.
     async fn get_coin_outcome(
         &self,
         coin: &str,
@@ -1347,9 +1380,18 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let start_ms = window_start.timestamp_millis();
         let end_ms = window_end.timestamp_millis();
 
+        // Use 1m candles to get precise window boundaries
         let url = format!(
-            "https://api.binance.com/api/v3/klines?symbol={}&interval=15m&startTime={}&endTime={}&limit=1",
+            "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&endTime={}&limit=20",
             symbol, start_ms, end_ms
+        );
+
+        debug!(
+            symbol = symbol,
+            window_start = %window_start,
+            window_end = %window_end,
+            url = %url,
+            "Fetching Binance candles for settlement"
         );
 
         let response = self
@@ -1363,12 +1405,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             ))?;
 
         if !response.status().is_success() {
+            let status = response.status();
+            warn!(symbol = symbol, status = %status, "Binance API error");
             return Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("Binance API error: {}", response.status())),
+                ExecutionError::rejected(format!("Binance API error: {}", status)),
             ));
         }
 
-        // Parse kline: [open_time, open, high, low, close, volume, close_time, ...]
+        // Parse klines: [open_time, open, high, low, close, volume, close_time, ...]
         let klines: Vec<Vec<serde_json::Value>> = response
             .json()
             .await
@@ -1377,13 +1421,23 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             ))?;
 
         if klines.is_empty() {
+            warn!(symbol = symbol, "No candles returned from Binance");
             return Ok(None);
         }
 
-        let kline = &klines[0];
+        // Get the first candle's open price
+        let first_kline = &klines[0];
+        let open_str = first_kline.get(1)
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| CrossMarketAutoExecutorError::Execution(
+                ExecutionError::rejected("Invalid first kline open price".to_string()),
+            ))?;
 
-        // Check if kline is closed
-        let close_time_ms = kline.get(6)
+        // Get the last candle's close price
+        let last_kline = &klines[klines.len() - 1];
+
+        // Check if the last kline is closed (close_time < now)
+        let close_time_ms = last_kline.get(6)
             .and_then(|v| v.as_i64())
             .ok_or_else(|| CrossMarketAutoExecutorError::Execution(
                 ExecutionError::rejected("Invalid kline close_time".to_string()),
@@ -1391,19 +1445,19 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         let now_ms = Utc::now().timestamp_millis();
         if close_time_ms > now_ms {
-            return Ok(None); // Kline not yet closed
+            debug!(
+                symbol = symbol,
+                close_time_ms = close_time_ms,
+                now_ms = now_ms,
+                "Last candle not yet closed"
+            );
+            return Ok(None); // Window not fully closed yet
         }
 
-        // Parse open and close prices
-        let open_str = kline.get(1)
+        let close_str = last_kline.get(4)
             .and_then(|v| v.as_str())
             .ok_or_else(|| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Invalid kline open price".to_string()),
-            ))?;
-        let close_str = kline.get(4)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Invalid kline close price".to_string()),
+                ExecutionError::rejected("Invalid last kline close price".to_string()),
             ))?;
 
         let open: f64 = open_str.parse().map_err(|_| {
@@ -1420,12 +1474,13 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // UP if close > open, DOWN otherwise
         let outcome = if close > open { "UP" } else { "DOWN" };
 
-        debug!(
+        info!(
             symbol = symbol,
             open = open,
             close = close,
+            candle_count = klines.len(),
             outcome = outcome,
-            "Determined coin outcome"
+            "Determined coin outcome from Binance"
         );
 
         Ok(Some(outcome.to_string()))
