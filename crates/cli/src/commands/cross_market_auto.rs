@@ -509,6 +509,11 @@ async fn print_dashboard(
         "-".to_string()
     };
 
+    // Get current prices for the pair
+    let (coin1, coin2) = config.pair.split_once('/').unwrap_or(("BTC", "ETH"));
+    let c1_prices = runner.current_prices.get(coin1);
+    let c2_prices = runner.current_prices.get(coin2);
+
     // Move cursor to top
     print!("\x1b[H");
 
@@ -528,6 +533,33 @@ async fn print_dashboard(
     let status_text = if shutting_down { format!("{yellow}Stopping{reset}") } else { format!("{green}Running{reset}") };
     println!("{clear_line}  {bold}Systems{reset}  {scanner_dot}●{reset} Scanner  {executor_dot}●{reset} Executor  {ws_dot}●{reset} WebSocket  [{status_text}]");
     println!("{clear_line}  {dim}Latency:{reset} {latency_str}");
+    println!("{clear_line}");
+
+    // Live prices
+    println!("{clear_line}  {bold}Live Prices{reset}");
+    if let Some((up, down)) = c1_prices {
+        println!("{clear_line}    {coin1}:  {green}UP ${:.2}{reset}  {red}DOWN ${:.2}{reset}", up, down);
+    } else {
+        println!("{clear_line}    {coin1}:  {dim}waiting...{reset}");
+    }
+    if let Some((up, down)) = c2_prices {
+        println!("{clear_line}    {coin2}:  {green}UP ${:.2}{reset}  {red}DOWN ${:.2}{reset}", up, down);
+    } else {
+        println!("{clear_line}    {coin2}:  {dim}waiting...{reset}");
+    }
+    // Show combined cost for the strategy based on combination
+    let strategy_cost = match config.combination.as_str() {
+        "Coin1↓ Coin2↑" => c1_prices.zip(c2_prices).map(|((_, c1_down), (c2_up, _))| (c1_down + c2_up, format!("{coin1}↓ + {coin2}↑"))),
+        "Coin1↑ Coin2↓" => c1_prices.zip(c2_prices).map(|((c1_up, _), (_, c2_down))| (c1_up + c2_down, format!("{coin1}↑ + {coin2}↓"))),
+        "Both↑" => c1_prices.zip(c2_prices).map(|((c1_up, _), (c2_up, _))| (c1_up + c2_up, format!("{coin1}↑ + {coin2}↑"))),
+        "Both↓" => c1_prices.zip(c2_prices).map(|((_, c1_down), (_, c2_down))| (c1_down + c2_down, format!("{coin1}↓ + {coin2}↓"))),
+        _ => c1_prices.zip(c2_prices).map(|((_, c1_down), (c2_up, _))| (c1_down + c2_up, format!("{coin1}↓ + {coin2}↑"))),
+    };
+    if let Some((total, combo_str)) = strategy_cost {
+        let spread = Decimal::ONE - total;
+        let spread_color = if spread >= Decimal::from_str("0.03").unwrap_or_default() { green } else { yellow };
+        println!("{clear_line}    {dim}Strategy:{reset} {combo_str} = ${:.2}  {dim}Spread:{reset} {spread_color}${:.2}{reset}", total, spread);
+    }
     println!("{clear_line}");
 
     // Trading stats
