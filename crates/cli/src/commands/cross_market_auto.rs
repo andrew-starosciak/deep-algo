@@ -573,6 +573,7 @@ async fn print_dashboard(
         bar, progress_pct, remaining_str);
     println!("{cyan}║{reset}  {dim}Time: {}{reset}   {dim}Press Ctrl+C to stop{reset}                          {cyan}║{reset}",
         Local::now().format("%H:%M:%S"));
+    println!("{cyan}║{reset}  {dim}Logs: /tmp/cross_market_auto.log (or use --verbose){reset}             {cyan}║{reset}");
     println!("{cyan}╚══════════════════════════════════════════════════════════════════╝{reset}");
 
     let _ = stdout().flush();

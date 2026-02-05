@@ -163,7 +163,7 @@ enum Commands {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Initialize logging (disabled for TUI to prevent screen corruption, unless log_file is provided)
+    // Initialize logging (disabled for TUI/dashboard to prevent screen corruption, unless log_file is provided)
     match &cli.command {
         Commands::LiveBotTui {
             log_file: Some(path),
@@ -188,6 +188,24 @@ async fn main() -> anyhow::Result<()> {
         | Commands::LiveBotTui { .. }
         | Commands::BacktestManagerTui { .. } => {
             // No logging for TUI (prevents screen corruption)
+        }
+        Commands::CrossMarketAuto(args) if !args.verbose => {
+            // Dashboard mode - redirect logs to file to prevent screen corruption
+            let log_path = std::env::var("CROSS_MARKET_LOG")
+                .unwrap_or_else(|_| "/tmp/cross_market_auto.log".to_string());
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
         }
         _ => {
             // Normal stderr logging for non-TUI commands
