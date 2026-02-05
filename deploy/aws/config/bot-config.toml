@@ -1,0 +1,58 @@
+# Trading Bot Configuration
+# Copy to /opt/trading-bot/config.toml and customize
+
+[trading]
+# Trading mode: "paper" or "live"
+mode = "paper"
+
+# Kelly fraction (0.0-1.0, recommend 0.25 for quarter Kelly)
+kelly_fraction = 0.25
+
+# Bet size limits (USDC)
+min_bet_size = 1.0
+max_bet_size = 10.0
+fixed_bet_size = 5.0  # Optional: override Kelly
+
+# Minimum edge to execute (as decimal, 0.02 = 2%)
+min_edge = 0.02
+
+# Maximum position per window (USDC)
+max_position_per_window = 50.0
+
+[tokens]
+# BTC 15-minute market token IDs
+# These change daily - update via the bot's market lookup
+yes_token_id = ""
+no_token_id = ""
+
+[signals]
+# Enable/disable signal types
+execute_entries = true
+execute_hedges = true
+execute_scratches = true
+
+[persistence]
+# State persistence for restart recovery
+persistence_path = "/opt/trading-bot/positions/state.json"
+history_path = "/opt/trading-bot/data/trades.json"
+
+[presigned]
+# Pre-signed order pool configuration
+enabled = true
+min_price = 0.25
+max_price = 0.50
+price_step = 0.01
+expiration_secs = 300
+refresh_threshold_secs = 60
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Log to file in addition to stdout
+file = "/opt/trading-bot/logs/bot.log"
+
+[monitoring]
+# CloudWatch metrics namespace
+cloudwatch_namespace = "TradingBot"
+# Metrics interval (seconds)
+metrics_interval = 60

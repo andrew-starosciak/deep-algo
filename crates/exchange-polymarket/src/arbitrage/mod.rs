@@ -215,5 +215,5 @@ pub use cross_market_types::{
 pub use cross_market_auto_executor::{
     CrossMarketAutoExecutor, CrossMarketAutoExecutorConfig, CrossMarketAutoExecutorError,
     CrossMarketAutoExecutorStats, CrossMarketExecutionResult, CrossMarketKellySizer,
-    CrossMarketTradeRecord, CrossMarketWindowTracker,
+    CrossMarketTradeRecord, CrossMarketWindowTracker, PendingTradeDisplay, RecentTradeDisplay,
 };

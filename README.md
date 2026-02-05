@@ -234,6 +234,139 @@ Entry strategy triggered - executing trade: edge=0.058
 Paper trade stored: market_id=btc-15min, entry_offset_mins=7
 ```
 
+### Cross-Market Correlation Arbitrage
+
+Scan for arbitrage opportunities across BTC, ETH, SOL, and XRP 15-minute binary options on Polymarket. The strategy exploits the ~85% correlation between crypto assets - when buying cheap sides on two different coins totaling < $1.00, you profit if at least one wins.
+
+#### Strategy Overview
+
+```
+Buy: ETH UP @ $0.05 + BTC DOWN @ $0.91 = $0.96 total
+
+Outcomes (with 85% correlation):
+- Both DOWN (44%): BTC DOWN wins → $1.00 payout → +$0.04 profit
+- Both UP (44%):   ETH UP wins   → $1.00 payout → +$0.04 profit
+- ETH↑ BTC↓ (4%):  Both win!    → $2.00 payout → +$1.04 profit
+- ETH↓ BTC↑ (8%):  Both lose    → $0.00 payout → -$0.96 loss
+
+Expected win rate: ~92% (loss scenario is rare due to correlation)
+```
+
+#### Data Collection
+
+Start the scanner to collect opportunities with order book depth tracking:
+
+```bash
+# Quick start (12 hours, with depth tracking)
+./scripts/run_cross_market.sh scan
+
+# Custom duration (1 hour)
+DURATION_MINS=60 ./scripts/run_cross_market.sh scan
+
+# Run scanner + settlement handler together
+./scripts/run_cross_market.sh both
+
+# More restrictive thresholds
+MAX_COST=0.80 MIN_SPREAD=0.20 ./scripts/run_cross_market.sh scan
+```
+
+The scanner captures:
+- All coin pair combinations (BTC/ETH, BTC/SOL, BTC/XRP, ETH/SOL, ETH/XRP, SOL/XRP)
+- All direction combinations (Coin1Up+Coin2Down, Coin1Down+Coin2Up, BothUp, BothDown)
+- Order book depth at detection time (bid/ask depth, spread in bps)
+- Settlement outcomes (tracked by settlement handler)
+
+#### Analyzing Collected Data
+
+After collecting data, run the backtest to analyze performance:
+
+```bash
+./scripts/run_cross_market.sh backtest
+```
+
+This produces:
+- **Trade-level stats**: Win rate by combination type, average P&L
+- **Window-level stats**: Best entry per 15-min window (deduplicated)
+- **Kelly analysis**: Optimal bet sizing based on observed win rates
+- **Bankroll requirements**: Ruin probability at various bankroll levels
+- **Depth analysis**: Liquidity available at detection time
+
+#### SQL Queries for Analysis
+
+```sql
+-- Win rate by combination type
+SELECT
+    combination,
+    COUNT(*) as trades,
+    COUNT(*) FILTER (WHERE trade_result IN ('WIN', 'DOUBLE_WIN')) as wins,
+    ROUND(COUNT(*) FILTER (WHERE trade_result IN ('WIN', 'DOUBLE_WIN'))::decimal / COUNT(*) * 100, 1) as win_rate
+FROM cross_market_opportunities
+WHERE status = 'settled'
+GROUP BY combination
+ORDER BY win_rate DESC;
+
+-- Best performing pairs
+SELECT
+    coin1 || '/' || coin2 as pair,
+    combination,
+    COUNT(*) as trades,
+    ROUND(AVG(actual_pnl), 4) as avg_pnl,
+    SUM(actual_pnl) as total_pnl
+FROM cross_market_opportunities
+WHERE status = 'settled'
+GROUP BY coin1, coin2, combination
+ORDER BY avg_pnl DESC;
+
+-- Depth analysis (fill probability)
+SELECT
+    CASE
+        WHEN LEAST(leg1_bid_depth, leg2_bid_depth) < 1000 THEN '<1K shares'
+        WHEN LEAST(leg1_bid_depth, leg2_bid_depth) < 5000 THEN '1-5K shares'
+        ELSE '5K+ shares'
+    END as depth_bucket,
+    COUNT(*) as opportunities,
+    ROUND(AVG(actual_pnl), 4) as avg_pnl
+FROM cross_market_opportunities
+WHERE status = 'settled' AND leg1_bid_depth IS NOT NULL
+GROUP BY 1
+ORDER BY 1;
+
+-- Entry timing analysis (minute within 15-min window)
+SELECT
+    EXTRACT(MINUTE FROM timestamp)::int % 15 as minute_in_window,
+    COUNT(*) as entries,
+    ROUND(AVG(spread), 4) as avg_spread,
+    ROUND(AVG(actual_pnl), 4) as avg_pnl
+FROM cross_market_opportunities
+WHERE status = 'settled'
+GROUP BY 1
+ORDER BY 1;
+```
+
+#### Key Findings from Backtesting
+
+Based on historical analysis:
+
+| Metric | Value |
+|--------|-------|
+| Best combination | Coin1UpCoin2Down (89% win rate) |
+| Optimal entry | Cost < $0.80 (spread > 20%) |
+| Observed correlation | 64% (lower than assumed 85%) |
+| Recommended Kelly | 1/4 Kelly (~19% of bankroll) |
+| Best pairs | SOL/XRP, BTC/SOL, BTC/XRP |
+
+#### Live Trading (Coming Soon)
+
+```bash
+# Paper trade with optimal settings
+cargo run -p algo-trade-cli -- cross-market-scan --optimal --track-depth
+
+# Settings used by --optimal:
+# - Only Coin1UpCoin2Down combinations
+# - Max cost $0.80 (spread > 20%)
+# - 64% observed correlation
+```
+
 ### Web API Only
 
 Start just the web API server without TUI:

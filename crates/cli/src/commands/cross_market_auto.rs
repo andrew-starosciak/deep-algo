@@ -6,7 +6,8 @@
 use algo_trade_polymarket::arbitrage::{
     CrossMarketAutoExecutor, CrossMarketAutoExecutorConfig, CrossMarketAutoExecutorStats,
     CrossMarketCombination, CrossMarketRunner, CrossMarketRunnerConfig, CrossMarketRunnerStats,
-    LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig, PolymarketExecutor,
+    LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig, PendingTradeDisplay,
+    PolymarketExecutor, RecentTradeDisplay,
 };
 use algo_trade_polymarket::models::Coin;
 use anyhow::Result;
@@ -577,6 +578,31 @@ async fn print_dashboard(
     println!("{clear_line}    P&L: {pnl_color}${:.2}{reset}  Volume: ${:.2}",
         auto.realized_pnl, auto.total_volume);
     println!("{clear_line}");
+
+    // Trades this window
+    if !auto.recent_trades.is_empty() || !auto.pending_trades.is_empty() {
+        println!("{clear_line}  {bold}Trades This Window{reset}");
+        for trade in auto.recent_trades.iter().rev().take(3) {
+            let age_secs = (chrono::Utc::now() - trade.executed_at).num_seconds();
+            println!("{clear_line}    {dim}[{:3}s ago]{reset} {}: {}↓${:.2} + {}↑${:.2} = ${:.2}",
+                age_secs, trade.pair,
+                trade.leg1_dir.chars().next().unwrap_or('-'), trade.leg1_price,
+                trade.leg2_dir.chars().next().unwrap_or('-'), trade.leg2_price,
+                trade.total_cost);
+        }
+        for pending in auto.pending_trades.iter().take(2) {
+            let remaining = (pending.window_end - chrono::Utc::now()).num_seconds().max(0);
+            let status = if remaining > 0 {
+                format!("{yellow}settling in {}s{reset}", remaining)
+            } else {
+                format!("{green}settling...{reset}")
+            };
+            println!("{clear_line}    {dim}[pending]{reset} {}: {}↓ + {}↑ ${:.2} {status}",
+                pending.pair, pending.leg1_dir.chars().next().unwrap_or('-'),
+                pending.leg2_dir.chars().next().unwrap_or('-'), pending.total_cost);
+        }
+        println!("{clear_line}");
+    }
 
     // Window progress (15-minute market window)
     let (window_pct, window_remaining) = get_window_progress();

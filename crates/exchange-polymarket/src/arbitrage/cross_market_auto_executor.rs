@@ -32,6 +32,7 @@ use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -347,6 +348,37 @@ pub struct CrossMarketAutoExecutorStats {
 
     /// Current paper balance (for paper trading).
     pub paper_balance: Decimal,
+
+    // === Recent Trades (for dashboard display) ===
+    /// Recent trades for display (trade_id, pair, leg1_price, leg2_price, total_cost, timestamp).
+    pub recent_trades: Vec<RecentTradeDisplay>,
+
+    /// Pending settlements for display.
+    pub pending_trades: Vec<PendingTradeDisplay>,
+}
+
+/// Simplified trade info for dashboard display.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecentTradeDisplay {
+    pub trade_id: String,
+    pub pair: String,
+    pub leg1_dir: String,
+    pub leg1_price: Decimal,
+    pub leg2_dir: String,
+    pub leg2_price: Decimal,
+    pub total_cost: Decimal,
+    pub executed_at: DateTime<Utc>,
+}
+
+/// Pending trade info for dashboard display.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PendingTradeDisplay {
+    pub trade_id: String,
+    pub pair: String,
+    pub leg1_dir: String,
+    pub leg2_dir: String,
+    pub total_cost: Decimal,
+    pub window_end: DateTime<Utc>,
 }
 
 // =============================================================================
@@ -993,7 +1025,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         );
 
         let record = CrossMarketTradeRecord {
-            trade_id,
+            trade_id: trade_id.clone(),
             pair: format!("{}/{}", opp.coin1, opp.coin2),
             combination: opp.combination,
             leg1_token_id: opp.leg1_token_id.clone(),
@@ -1013,6 +1045,26 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         history.push_back(record);
         while history.len() > self.config.max_history {
             history.pop_front();
+        }
+
+        // Update recent trades display in stats
+        if result.is_success() {
+            let mut stats = self.stats.write().await;
+            let display = RecentTradeDisplay {
+                trade_id: trade_id.clone(),
+                pair: format!("{}/{}", opp.coin1, opp.coin2),
+                leg1_dir: opp.leg1_direction.clone(),
+                leg1_price: opp.leg1_price,
+                leg2_dir: opp.leg2_direction.clone(),
+                leg2_price: opp.leg2_price,
+                total_cost: opp.total_cost,
+                executed_at: Utc::now(),
+            };
+            stats.recent_trades.push(display);
+            // Keep only last 10 trades
+            if stats.recent_trades.len() > 10 {
+                stats.recent_trades.remove(0);
+            }
         }
 
         // Add to pending settlements for paper trading (if successful)
@@ -1180,16 +1232,239 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         };
 
         let mut pending = self.pending_settlements.write().await;
-        pending.push(settlement);
+        pending.push(settlement.clone());
 
         let mut stats = self.stats.write().await;
         stats.pending_settlement = pending.len() as u64;
+
+        // Update pending trades display
+        stats.pending_trades.push(PendingTradeDisplay {
+            trade_id: settlement.trade_id,
+            pair: format!("{}/{}", opp.coin1, opp.coin2),
+            leg1_dir: settlement.leg1_direction,
+            leg2_dir: settlement.leg2_direction,
+            total_cost: settlement.total_cost,
+            window_end,
+        });
+    }
+
+    /// Tries fast settlement by fetching CLOB prices directly.
+    ///
+    /// For trades where the window has closed, fetches current token prices
+    /// and settles if they're decisive (>$0.90 = winner, <$0.10 = loser).
+    async fn try_fast_settle_via_clob(&self) -> Result<u64, CrossMarketAutoExecutorError> {
+        let now = Utc::now();
+        let threshold_high = dec!(0.90);
+        let threshold_low = dec!(0.10);
+
+        // Find trades with closed windows
+        let trades_to_check: Vec<PendingPaperSettlement> = {
+            let pending = self.pending_settlements.read().await;
+            pending.iter()
+                .filter(|s| now > s.window_end) // Window has closed
+                .cloned()
+                .collect()
+        };
+
+        if trades_to_check.is_empty() {
+            return Ok(0);
+        }
+
+        let mut settled_count = 0u64;
+
+        for settlement in trades_to_check {
+            // Fetch current prices for the tokens
+            let token_ids = vec![
+                settlement.leg1_token_id.clone(),
+                settlement.leg2_token_id.clone(),
+            ];
+
+            let url = format!(
+                "https://clob.polymarket.com/prices?token_ids={}",
+                token_ids.join(",")
+            );
+
+            let response = match self.http_client.get(&url)
+                .header("Accept", "application/json")
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(error = %e, "Failed to fetch CLOB prices for fast settlement");
+                    continue;
+                }
+            };
+
+            if !response.status().is_success() {
+                continue;
+            }
+
+            #[derive(Deserialize)]
+            struct PriceResponse {
+                price: String,
+            }
+
+            let prices: std::collections::HashMap<String, PriceResponse> = match response.json().await {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // Parse prices
+            let leg1_price = prices.get(&settlement.leg1_token_id)
+                .and_then(|p| Decimal::from_str(&p.price).ok());
+            let leg2_price = prices.get(&settlement.leg2_token_id)
+                .and_then(|p| Decimal::from_str(&p.price).ok());
+
+            if let (Some(p1), Some(p2)) = (leg1_price, leg2_price) {
+                // Determine if prices are decisive
+                let leg1_decisive = p1 > threshold_high || p1 < threshold_low;
+                let leg2_decisive = p2 > threshold_high || p2 < threshold_low;
+
+                if leg1_decisive && leg2_decisive {
+                    // Prices are decisive - we can settle
+                    let leg1_won = p1 > threshold_high;
+                    let leg2_won = p2 > threshold_high;
+
+                    info!(
+                        trade_id = %settlement.trade_id,
+                        leg1_price = %p1,
+                        leg2_price = %p2,
+                        leg1_won = leg1_won,
+                        leg2_won = leg2_won,
+                        "Fast settlement via CLOB prices"
+                    );
+
+                    // Finalize
+                    self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
+
+                    // Remove from pending
+                    {
+                        let mut pending = self.pending_settlements.write().await;
+                        pending.retain(|s| s.trade_id != settlement.trade_id);
+
+                        let mut stats = self.stats.write().await;
+                        stats.pending_settlement = pending.len() as u64;
+                        stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
+                    }
+
+                    settled_count += 1;
+                }
+            }
+        }
+
+        Ok(settled_count)
+    }
+
+    /// Tries fast settlement using live WebSocket prices.
+    ///
+    /// If prices are decisive (>$0.90 or <$0.10), we can infer the outcome
+    /// without waiting for official resolution. This is faster and more reliable.
+    ///
+    /// # Arguments
+    /// * `current_prices` - Map of coin -> (up_price, down_price) from WebSocket
+    pub async fn try_fast_settle_with_prices(
+        &self,
+        current_prices: &std::collections::HashMap<String, (Decimal, Decimal)>,
+    ) -> Result<u64, CrossMarketAutoExecutorError> {
+        let now = Utc::now();
+        let threshold_high = dec!(0.90); // If price > 0.90, consider it a winner
+        let threshold_low = dec!(0.10);  // If price < 0.10, consider it a loser
+
+        let mut settled_count = 0u64;
+
+        // Collect trades ready for fast settlement
+        let mut to_settle = Vec::new();
+        {
+            let pending = self.pending_settlements.read().await;
+            for settlement in pending.iter() {
+                // Only try fast settle after window has closed
+                if now <= settlement.window_end {
+                    continue;
+                }
+
+                // Get prices for both coins
+                let c1_prices = current_prices.get(&settlement.coin1.to_uppercase());
+                let c2_prices = current_prices.get(&settlement.coin2.to_uppercase());
+
+                if let (Some((c1_up, c1_down)), Some((c2_up, c2_down))) = (c1_prices, c2_prices) {
+                    // Determine outcomes from decisive prices
+                    let c1_outcome = if *c1_up > threshold_high {
+                        Some("UP")
+                    } else if *c1_down > threshold_high {
+                        Some("DOWN")
+                    } else if *c1_up < threshold_low {
+                        Some("DOWN") // If UP is near 0, DOWN won
+                    } else if *c1_down < threshold_low {
+                        Some("UP")   // If DOWN is near 0, UP won
+                    } else {
+                        None // Prices not decisive yet
+                    };
+
+                    let c2_outcome = if *c2_up > threshold_high {
+                        Some("UP")
+                    } else if *c2_down > threshold_high {
+                        Some("DOWN")
+                    } else if *c2_up < threshold_low {
+                        Some("DOWN")
+                    } else if *c2_down < threshold_low {
+                        Some("UP")
+                    } else {
+                        None
+                    };
+
+                    if let (Some(c1), Some(c2)) = (c1_outcome, c2_outcome) {
+                        to_settle.push((settlement.clone(), c1.to_string(), c2.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Settle the decisive trades
+        for (settlement, c1_outcome, c2_outcome) in to_settle {
+            let leg1_won = settlement.leg1_direction == c1_outcome;
+            let leg2_won = settlement.leg2_direction == c2_outcome;
+
+            info!(
+                trade_id = %settlement.trade_id,
+                c1 = &settlement.coin1,
+                c1_outcome = %c1_outcome,
+                c2 = &settlement.coin2,
+                c2_outcome = %c2_outcome,
+                leg1_won = leg1_won,
+                leg2_won = leg2_won,
+                "Fast settlement via live prices"
+            );
+
+            // Calculate P&L and update stats
+            self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
+
+            // Remove from pending
+            {
+                let mut pending = self.pending_settlements.write().await;
+                pending.retain(|s| s.trade_id != settlement.trade_id);
+
+                let mut stats = self.stats.write().await;
+                stats.pending_settlement = pending.len() as u64;
+                // Also remove from pending display
+                stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
+            }
+
+            settled_count += 1;
+        }
+
+        Ok(settled_count)
     }
 
     /// Checks and settles any pending paper trades whose windows have closed.
     async fn check_pending_settlements(&self) -> Result<(), CrossMarketAutoExecutorError> {
+        // First, try fast settlement via CLOB prices for any closed windows
+        if let Err(e) = self.try_fast_settle_via_clob().await {
+            debug!(error = %e, "Fast settlement check failed (non-fatal)");
+        }
+
         let now = Utc::now();
-        let settlement_delay = chrono::Duration::seconds(120); // 2 minute delay after window close
+        let settlement_delay = chrono::Duration::seconds(30); // Reduced from 120s since we try fast settle first
 
         // Collect trades ready for settlement
         let mut to_settle = Vec::new();
@@ -1301,17 +1576,32 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         };
 
+        self.finalize_settlement(settlement, leg1_won, leg2_won).await;
+        Ok(())
+    }
+
+    /// Finalizes settlement by calculating P&L and updating stats.
+    async fn finalize_settlement(
+        &self,
+        settlement: &PendingPaperSettlement,
+        leg1_won: bool,
+        leg2_won: bool,
+    ) {
         // Derive coin outcomes from leg results
         // If leg won, coin moved in the direction we bet on
         let c1_out = if leg1_won {
             settlement.leg1_direction.clone()
+        } else if settlement.leg1_direction == "UP" {
+            "DOWN".to_string()
         } else {
-            if settlement.leg1_direction == "UP" { "DOWN".to_string() } else { "UP".to_string() }
+            "UP".to_string()
         };
         let c2_out = if leg2_won {
             settlement.leg2_direction.clone()
+        } else if settlement.leg2_direction == "UP" {
+            "DOWN".to_string()
         } else {
-            if settlement.leg2_direction == "UP" { "DOWN".to_string() } else { "UP".to_string() }
+            "UP".to_string()
         };
 
         // Calculate payout
@@ -1390,8 +1680,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 warn!(error = %e, "Failed to update settlement status in database");
             }
         }
-
-        Ok(())
     }
 
     /// Fetches coin outcome (UP or DOWN) from Binance using 1m candles.
