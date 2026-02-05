@@ -203,6 +203,96 @@ impl GammaClient {
 
         markets
     }
+
+    /// Gets the outcome of a resolved 15-minute market.
+    ///
+    /// Returns the winning direction ("UP" or "DOWN") for the specified coin and window.
+    /// Returns None if the market hasn't resolved yet.
+    ///
+    /// # Arguments
+    /// * `coin` - The coin (btc, eth, sol, xrp)
+    /// * `window_end` - The end time of the 15-minute window
+    pub async fn get_market_outcome(
+        &self,
+        coin: Coin,
+        window_end: DateTime<Utc>,
+    ) -> Result<Option<String>> {
+        // Calculate the window start timestamp (window_end - 15 minutes, rounded to window boundary)
+        let window_timestamp = Self::calculate_window_timestamp(
+            window_end - chrono::Duration::minutes(15)
+        );
+        let slug = Self::generate_event_slug(coin, window_timestamp);
+        let path = format!("/events?slug={}", slug);
+
+        tracing::debug!(
+            coin = coin.slug_prefix(),
+            window_timestamp = window_timestamp,
+            slug = %slug,
+            "Fetching resolved market outcome"
+        );
+
+        let events: Vec<GammaEvent> = match self.get(&path).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to fetch event for outcome");
+                return Ok(None);
+            }
+        };
+
+        let event = match events.into_iter().next() {
+            Some(e) => e,
+            None => {
+                tracing::debug!(slug = %slug, "No event found for outcome");
+                return Ok(None);
+            }
+        };
+
+        // Look for a market with resolved tokens
+        for gamma_market in event.markets {
+            if let Some(market) = gamma_market.to_market() {
+                // Check if tokens have winner field set
+                for token in &market.tokens {
+                    if let Some(is_winner) = token.winner {
+                        if is_winner {
+                            // This token won - return its outcome
+                            let outcome = token.outcome.to_uppercase();
+                            tracing::info!(
+                                coin = coin.slug_prefix(),
+                                outcome = %outcome,
+                                token_id = %token.token_id,
+                                "Got market outcome from Gamma API"
+                            );
+                            return Ok(Some(outcome));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Market exists but not yet resolved
+        tracing::debug!(slug = %slug, "Market not yet resolved");
+        Ok(None)
+    }
+
+    /// Gets outcomes for multiple coins at once.
+    ///
+    /// Returns a map of coin -> outcome ("UP" or "DOWN").
+    /// Coins without resolved outcomes are not included.
+    pub async fn get_market_outcomes(
+        &self,
+        coins: &[Coin],
+        window_end: DateTime<Utc>,
+    ) -> std::collections::HashMap<Coin, String> {
+        let mut outcomes = std::collections::HashMap::new();
+
+        for coin in coins {
+            if let Ok(Some(outcome)) = self.get_market_outcome(*coin, window_end).await {
+                outcomes.insert(*coin, outcome);
+            }
+        }
+
+        outcomes
+    }
 }
 
 impl Default for GammaClient {

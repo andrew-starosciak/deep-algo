@@ -43,6 +43,7 @@ use super::cross_market_types::{CrossMarketCombination, CrossMarketOpportunity};
 use super::execution::{
     ExecutionError, OrderParams, OrderResult, OrderStatus, OrderType, PolymarketExecutor, Side,
 };
+use crate::gamma::GammaClient;
 use crate::models::Coin;
 
 // =============================================================================
@@ -532,6 +533,9 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
     /// HTTP client for settlement price checks.
     http_client: reqwest::Client,
 
+    /// Gamma API client for fetching market outcomes.
+    gamma_client: GammaClient,
+
     /// Fee rate on winnings (default 2%).
     fee_rate: Decimal,
 
@@ -568,6 +572,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             history: Arc::new(RwLock::new(VecDeque::new())),
             pending_settlements: Arc::new(RwLock::new(Vec::new())),
             http_client: reqwest::Client::new(),
+            gamma_client: GammaClient::new(),
             fee_rate: dec!(0.02), // 2% fee
             should_stop: Arc::new(AtomicBool::new(false)),
             db_pool: None,
@@ -601,6 +606,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             history: Arc::new(RwLock::new(VecDeque::new())),
             pending_settlements: Arc::new(RwLock::new(Vec::new())),
             http_client: reqwest::Client::new(),
+            gamma_client: GammaClient::new(),
             fee_rate: dec!(0.02), // 2% fee
             should_stop: Arc::new(AtomicBool::new(false)),
             db_pool: Some(db_pool),
@@ -1243,20 +1249,34 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         &self,
         settlement: &PendingPaperSettlement,
     ) -> Result<(), CrossMarketAutoExecutorError> {
-        // Try to get outcomes - CLOB first, then Binance fallback
-        let (leg1_won, leg2_won) = match self.try_settle_via_clob(settlement).await {
+        // Try to get outcomes - Gamma API first (official), then CLOB prices, then Binance fallback
+        let (leg1_won, leg2_won) = match self.try_settle_via_gamma(settlement).await {
             Ok(result) => {
-                debug!(trade_id = %settlement.trade_id, "Settled via CLOB prices");
+                info!(trade_id = %settlement.trade_id, "Settled via Gamma API (official outcomes)");
                 result
             }
             Err(e) => {
-                info!(
+                debug!(
                     trade_id = %settlement.trade_id,
                     error = %e,
-                    "CLOB settlement failed, trying Binance fallback"
+                    "Gamma API settlement not available, trying CLOB"
                 );
-                // Fall back to Binance
-                self.try_settle_via_binance(settlement).await?
+                // Try CLOB prices
+                match self.try_settle_via_clob(settlement).await {
+                    Ok(result) => {
+                        info!(trade_id = %settlement.trade_id, "Settled via CLOB prices");
+                        result
+                    }
+                    Err(e2) => {
+                        info!(
+                            trade_id = %settlement.trade_id,
+                            error = %e2,
+                            "CLOB settlement failed, trying Binance fallback"
+                        );
+                        // Fall back to Binance
+                        self.try_settle_via_binance(settlement).await?
+                    }
+                }
             }
         };
 
@@ -1484,6 +1504,74 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         );
 
         Ok(Some(outcome.to_string()))
+    }
+
+    /// Tries to settle via Gamma API (official market outcomes).
+    ///
+    /// This is the most reliable source as it uses Polymarket's official
+    /// resolution data from the `winner` field on tokens.
+    async fn try_settle_via_gamma(
+        &self,
+        settlement: &PendingPaperSettlement,
+    ) -> Result<(bool, bool), CrossMarketAutoExecutorError> {
+        // Parse coins from settlement
+        let coin1 = match settlement.coin1.to_uppercase().as_str() {
+            "BTC" => Coin::Btc,
+            "ETH" => Coin::Eth,
+            "SOL" => Coin::Sol,
+            "XRP" => Coin::Xrp,
+            other => {
+                return Err(CrossMarketAutoExecutorError::Execution(
+                    ExecutionError::rejected(format!("Unknown coin: {}", other)),
+                ));
+            }
+        };
+
+        let coin2 = match settlement.coin2.to_uppercase().as_str() {
+            "BTC" => Coin::Btc,
+            "ETH" => Coin::Eth,
+            "SOL" => Coin::Sol,
+            "XRP" => Coin::Xrp,
+            other => {
+                return Err(CrossMarketAutoExecutorError::Execution(
+                    ExecutionError::rejected(format!("Unknown coin: {}", other)),
+                ));
+            }
+        };
+
+        // Get outcomes from Gamma API
+        let c1_outcome = self.gamma_client.get_market_outcome(coin1, settlement.window_end).await
+            .map_err(|e| CrossMarketAutoExecutorError::Execution(
+                ExecutionError::rejected(format!("Gamma API error for {}: {}", coin1.slug_prefix(), e)),
+            ))?;
+
+        let c2_outcome = self.gamma_client.get_market_outcome(coin2, settlement.window_end).await
+            .map_err(|e| CrossMarketAutoExecutorError::Execution(
+                ExecutionError::rejected(format!("Gamma API error for {}: {}", coin2.slug_prefix(), e)),
+            ))?;
+
+        match (c1_outcome, c2_outcome) {
+            (Some(c1), Some(c2)) => {
+                // Leg won if our bet direction matches actual outcome
+                let leg1_won = settlement.leg1_direction == c1;
+                let leg2_won = settlement.leg2_direction == c2;
+
+                info!(
+                    trade_id = %settlement.trade_id,
+                    coin1_outcome = %c1,
+                    coin2_outcome = %c2,
+                    leg1_direction = %settlement.leg1_direction,
+                    leg2_direction = %settlement.leg2_direction,
+                    leg1_won = leg1_won,
+                    leg2_won = leg2_won,
+                    "Got official outcomes from Gamma API"
+                );
+                Ok((leg1_won, leg2_won))
+            }
+            _ => Err(CrossMarketAutoExecutorError::Execution(
+                ExecutionError::rejected("Market outcomes not yet available from Gamma".to_string()),
+            )),
+        }
     }
 
     /// Tries to settle via CLOB token prices.
