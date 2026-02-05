@@ -189,6 +189,7 @@ struct DashboardConfig {
     bet_size: String,
     kelly_fraction: f64,
     min_spread: f64,
+    max_position: Decimal,
     balance: Decimal,
     duration: Duration,
     persist: bool,
@@ -277,6 +278,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
                 bet_size: bet_str,
                 kelly_fraction: args.kelly_fraction,
                 min_spread: args.min_spread,
+                max_position: Decimal::from_str(&format!("{:.2}", args.max_position))?,
                 balance: args.paper_balance_decimal(),
                 duration,
                 persist: args.persist,
@@ -308,6 +310,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
                 bet_size: bet_str,
                 kelly_fraction: args.kelly_fraction,
                 min_spread: args.min_spread,
+                max_position: Decimal::from_str(&format!("{:.2}", args.max_position))?,
                 balance,
                 duration,
                 persist: args.persist,
@@ -503,11 +506,11 @@ async fn print_dashboard(
         reset
     };
 
-    // Latency display
+    // Latency display (only available after trades execute)
     let latency_str = if auto.latency_samples > 0 {
         format!("{}ms (avg {}ms)", auto.last_latency_ms, auto.avg_latency_ms)
     } else {
-        "-".to_string()
+        "waiting for trade".to_string()
     };
 
     // Get current prices for the pair
@@ -526,8 +529,8 @@ async fn print_dashboard(
     // Config line
     println!("{clear_line}  {dim}Mode:{reset} {mode_color}{:6}{reset}   {dim}Pair:{reset} {:8}   {dim}Strategy:{reset} {}",
         config.mode, config.pair, config.combination);
-    println!("{clear_line}  {dim}Bet:{reset}  {:7}  {dim}Spread:{reset} ${:.2}       {dim}Balance:{reset} ${:.2}",
-        config.bet_size, config.min_spread, config.balance);
+    println!("{clear_line}  {dim}Bet:{reset}  {:7}  {dim}Spread:{reset} ${:.2}   {dim}Max/Window:{reset} ${:.0}   {dim}Balance:{reset} ${:.2}",
+        config.bet_size, config.min_spread, config.max_position, config.balance);
     println!("{clear_line}");
 
     // Systems status
@@ -583,9 +586,11 @@ async fn print_dashboard(
     if !auto.recent_trades.is_empty() || !auto.pending_trades.is_empty() {
         println!("{clear_line}  {bold}Trades This Window{reset}");
         for trade in auto.recent_trades.iter().rev().take(3) {
-            let age_secs = (chrono::Utc::now() - trade.executed_at).num_seconds();
-            println!("{clear_line}    {dim}[{:3}s ago]{reset} {}: {}↓${:.2} + {}↑${:.2} = ${:.2}",
-                age_secs, trade.pair,
+            // Convert to local time for display
+            let local_time: chrono::DateTime<chrono::Local> = trade.executed_at.into();
+            println!("{clear_line}    {dim}[{}]{reset} {}: {}${:.2} + {}${:.2} = ${:.2}",
+                local_time.format("%H:%M:%S"),
+                trade.pair,
                 trade.leg1_dir.chars().next().unwrap_or('-'), trade.leg1_price,
                 trade.leg2_dir.chars().next().unwrap_or('-'), trade.leg2_price,
                 trade.total_cost);
@@ -593,11 +598,11 @@ async fn print_dashboard(
         for pending in auto.pending_trades.iter().take(2) {
             let remaining = (pending.window_end - chrono::Utc::now()).num_seconds().max(0);
             let status = if remaining > 0 {
-                format!("{yellow}settling in {}s{reset}", remaining)
+                format!("{yellow}settles in {}s{reset}", remaining)
             } else {
                 format!("{green}settling...{reset}")
             };
-            println!("{clear_line}    {dim}[pending]{reset} {}: {}↓ + {}↑ ${:.2} {status}",
+            println!("{clear_line}    {dim}[pending]{reset} {}: {}+{} ${:.2} {status}",
                 pending.pair, pending.leg1_dir.chars().next().unwrap_or('-'),
                 pending.leg2_dir.chars().next().unwrap_or('-'), pending.total_cost);
         }
