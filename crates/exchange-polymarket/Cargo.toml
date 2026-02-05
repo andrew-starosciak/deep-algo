@@ -27,6 +27,7 @@ rust_decimal_macros = "1.38"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.8"
 parking_lot = "0.12"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "rust_decimal"] }
 tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 futures-util = "0.3"
 secrecy = "0.10"
@@ -45,3 +46,4 @@ hex = "0.4"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
 rust_decimal_macros = "1.38"
+tempfile = "3.10"

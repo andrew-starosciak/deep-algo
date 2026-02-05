@@ -3,6 +3,7 @@
 //! All models use `rust_decimal::Decimal` for financial precision.
 //! Models derive `sqlx::FromRow` for database compatibility.
 
+pub mod cross_market;
 pub mod cvd_aggregate;
 pub mod funding;
 pub mod liquidation;
@@ -14,6 +15,7 @@ pub mod signal_snapshot;
 pub mod trade;
 pub mod trade_tick;
 
+pub use cross_market::CrossMarketOpportunityRecord;
 pub use cvd_aggregate::{
     calculate_cumulative_cvd, calculate_rolling_cvd, extract_close_prices, CvdAggregateRecord,
 };

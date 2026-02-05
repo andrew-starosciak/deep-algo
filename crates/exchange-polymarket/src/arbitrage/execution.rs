@@ -23,14 +23,7 @@
 //!     println!("Available balance: {}", balance);
 //!
 //!     // Submit a FOK order
-//!     let order = OrderParams {
-//!         token_id: "abc123".to_string(),
-//!         side: Side::Buy,
-//!         price: dec!(0.45),
-//!         size: dec!(100),
-//!         order_type: OrderType::Fok,
-//!         neg_risk: true,
-//!     };
+//!     let order = OrderParams::buy_fok("abc123", dec!(0.45), dec!(100));
 //!
 //!     let result = executor.submit_order(order).await?;
 //!     println!("Order {} status: {:?}", result.order_id, result.status);
@@ -101,6 +94,7 @@ impl std::fmt::Display for OrderType {
 /// Parameters for order submission.
 ///
 /// Contains all required fields for submitting an order to Polymarket's CLOB.
+/// Optionally includes pre-signed order data to skip signing on the hot path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderParams {
     /// Token ID for the outcome (YES or NO token).
@@ -123,6 +117,27 @@ pub struct OrderParams {
     /// Neg-risk flag required for certain market types.
     /// Must be true for BTC 15-minute binary markets.
     pub neg_risk: bool,
+
+    /// Pre-signed order data (optional).
+    /// If present, executor can skip signing and submit immediately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presigned: Option<PresignedData>,
+}
+
+/// Pre-signed order data for low-latency execution.
+///
+/// When these fields are populated, the executor can skip the ~5-10ms
+/// signing step and submit the order immediately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresignedData {
+    /// Order nonce for uniqueness.
+    pub nonce: String,
+
+    /// Order expiration timestamp (Unix seconds, 0 = no expiration).
+    pub expiration: u64,
+
+    /// EIP-712 signature of the order.
+    pub signature: String,
 }
 
 impl OrderParams {
@@ -136,6 +151,7 @@ impl OrderParams {
             size,
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         }
     }
 
@@ -149,6 +165,7 @@ impl OrderParams {
             size,
             order_type: OrderType::Fak,
             neg_risk: true,
+            presigned: None,
         }
     }
 
@@ -157,6 +174,19 @@ impl OrderParams {
     pub fn with_neg_risk(mut self, neg_risk: bool) -> Self {
         self.neg_risk = neg_risk;
         self
+    }
+
+    /// Attaches pre-signed data to skip signing on submission.
+    #[must_use]
+    pub fn with_presigned(mut self, presigned: PresignedData) -> Self {
+        self.presigned = Some(presigned);
+        self
+    }
+
+    /// Returns true if this order has pre-signed data.
+    #[must_use]
+    pub fn is_presigned(&self) -> bool {
+        self.presigned.is_some()
     }
 
     /// Total cost/proceeds of this order if fully filled.

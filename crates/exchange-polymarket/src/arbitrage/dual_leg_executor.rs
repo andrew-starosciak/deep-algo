@@ -262,6 +262,7 @@ impl<E: PolymarketExecutor> DualLegExecutor<E> {
             size: shares,
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         let no_order = OrderParams {
@@ -271,6 +272,7 @@ impl<E: PolymarketExecutor> DualLegExecutor<E> {
             size: shares,
             order_type: OrderType::Fok,
             neg_risk: true,
+            presigned: None,
         };
 
         // Submit both orders
@@ -372,6 +374,7 @@ impl<E: PolymarketExecutor> DualLegExecutor<E> {
             size,
             order_type: OrderType::Fak, // Fill what we can
             neg_risk: true,
+            presigned: None,
         };
 
         match self.executor.submit_order(unwind_order).await {

@@ -3,6 +3,7 @@
 //! Each repository provides typed access to a specific table with
 //! batch insert capabilities and time-range queries.
 
+pub mod cross_market_repo;
 pub mod cvd_repo;
 pub mod funding_repo;
 pub mod liquidation_repo;
@@ -15,6 +16,10 @@ pub mod signal_snapshot_repo;
 pub mod trade_repo;
 pub mod trade_tick_repo;
 
+pub use cross_market_repo::{
+    CalibrationBucket, CoinPerformance, CrossMarketRepository, CrossMarketStatistics,
+    PairStatistics, SettlementStats,
+};
 pub use cvd_repo::CvdRepository;
 pub use funding_repo::FundingRateRepository;
 pub use liquidation_repo::LiquidationRepository;
@@ -41,6 +46,7 @@ pub struct Repositories {
     pub ohlcv: OhlcvRepository,
     pub trade_ticks: TradeTickRepository,
     pub cvd: CvdRepository,
+    pub cross_market: CrossMarketRepository,
 }
 
 impl Repositories {
@@ -57,7 +63,8 @@ impl Repositories {
             signal_snapshots: SignalSnapshotRepository::new(pool.clone()),
             ohlcv: OhlcvRepository::new(pool.clone()),
             trade_ticks: TradeTickRepository::new(pool.clone()),
-            cvd: CvdRepository::new(pool),
+            cvd: CvdRepository::new(pool.clone()),
+            cross_market: CrossMarketRepository::new(pool),
         }
     }
 }

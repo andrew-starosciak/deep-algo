@@ -21,17 +21,25 @@ pub struct LatencyMonitorArgs {
     #[arg(short, long, default_value = "15")]
     pub duration_mins: u64,
 
-    /// Minimum spot price change threshold (percent, e.g., 0.2).
-    #[arg(long, default_value = "0.2")]
-    pub min_spot_change_pct: f64,
+    /// Minimum delta vs window reference (percent, e.g., 0.05 = 0.05%).
+    /// This is the key threshold - how much BTC must move from the window's
+    /// "price to beat" before we consider it a signal.
+    #[arg(long, default_value = "0.05")]
+    pub min_delta_pct: f64,
 
     /// Maximum entry price for signals (e.g., 0.45).
     #[arg(long, default_value = "0.45")]
     pub max_entry_price: f64,
 
-    /// Lookback period for spot change in minutes.
-    #[arg(long, default_value = "5")]
-    pub lookback_mins: u64,
+    /// Minimum time into window before signaling (seconds).
+    /// Avoids signaling right at window open when reference just set.
+    #[arg(long, default_value = "30")]
+    pub min_elapsed_secs: u64,
+
+    /// Minimum time remaining in window to still enter (seconds).
+    /// Don't enter if window is about to close.
+    #[arg(long, default_value = "60")]
+    pub min_remaining_secs: u64,
 
     /// Signal cooldown in seconds.
     #[arg(long, default_value = "5")]
@@ -41,11 +49,11 @@ pub struct LatencyMonitorArgs {
     #[arg(long, default_value = "100")]
     pub check_interval_ms: u64,
 
-    /// Use aggressive config (lower thresholds).
+    /// Use aggressive config (lower thresholds, earlier entry).
     #[arg(long)]
     pub aggressive: bool,
 
-    /// Use conservative config (higher thresholds).
+    /// Use conservative config (higher thresholds, safer timing).
     #[arg(long)]
     pub conservative: bool,
 
@@ -58,8 +66,8 @@ pub struct LatencyMonitorArgs {
 pub async fn run(args: LatencyMonitorArgs) -> Result<()> {
     info!("=== Latency Arbitrage Monitor ===");
     info!(
-        "Duration: {} minutes | Min spot change: {}% | Max entry: ${}",
-        args.duration_mins, args.min_spot_change_pct, args.max_entry_price
+        "Duration: {} minutes | Min delta: {}% | Max entry: ${}",
+        args.duration_mins, args.min_delta_pct, args.max_entry_price
     );
 
     // Build latency config
@@ -71,18 +79,19 @@ pub async fn run(args: LatencyMonitorArgs) -> Result<()> {
         LatencyConfig::conservative()
     } else {
         LatencyConfig {
-            min_spot_change: args.min_spot_change_pct / 100.0,
+            min_reference_delta: args.min_delta_pct / 100.0, // Convert % to decimal
             max_entry_price: Decimal::try_from(args.max_entry_price)?,
-            lookback_ms: (args.lookback_mins * 60 * 1000) as i64,
-            min_staleness_ms: 1000,
+            min_window_elapsed_ms: (args.min_elapsed_secs * 1000) as i64,
+            min_time_remaining_ms: (args.min_remaining_secs * 1000) as i64,
         }
     };
 
     info!(
-        "Config: min_change={:.2}%, max_price=${}, lookback={}min",
-        latency_config.min_spot_change * 100.0,
+        "Config: min_delta={:.3}%, max_price=${}, elapsed>{}s, remaining>{}s",
+        latency_config.min_reference_delta * 100.0,
         latency_config.max_entry_price,
-        latency_config.lookback_ms / 60000
+        latency_config.min_window_elapsed_ms / 1000,
+        latency_config.min_time_remaining_ms / 1000
     );
 
     // Fetch current BTC 15-min market
@@ -265,7 +274,7 @@ pub async fn run(args: LatencyMonitorArgs) -> Result<()> {
         println!("No signals detected during monitoring period.");
         println!("This could mean:");
         println!("  - Market is efficiently priced (no < ${} opportunities)", args.max_entry_price);
-        println!("  - BTC spot didn't move enough (need {}%+)", args.min_spot_change_pct);
+        println!("  - BTC didn't move enough vs reference (need {}%+)", args.min_delta_pct);
         println!("  - Try running during higher volatility periods");
     }
 
@@ -280,12 +289,13 @@ fn print_signal(signal: &LatencySignal) {
     };
 
     println!(
-        "\n🎯 SIGNAL: {} @ ${} | BTC ${:.2} ({:+.2}%) | Strength: {:.2}",
+        "\n🎯 SIGNAL: {} @ ${} | BTC ${:.2} vs ref ${:.2} ({:+.3}%) | {}s left",
         direction,
         signal.entry_price,
         signal.spot_price,
+        signal.reference_price,
         signal.spot_change_pct * 100.0,
-        signal.strength
+        signal.time_remaining_secs
     );
     println!(
         "   Hedge target: ${} | Time: {}",

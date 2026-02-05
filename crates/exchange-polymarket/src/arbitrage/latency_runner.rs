@@ -340,8 +340,10 @@ impl LatencyRunner {
                 info!(
                     direction = ?sig.direction,
                     entry_price = %sig.entry_price,
-                    spot_change = format!("{:.2}%", sig.spot_change_pct * 100.0),
-                    spot_price = sig.spot_price,
+                    spot_vs_ref = format!("{:+.3}%", sig.spot_change_pct * 100.0),
+                    spot_price = format!("${:.2}", sig.spot_price),
+                    reference_price = format!("${:.2}", sig.reference_price),
+                    time_remaining = format!("{}s", sig.time_remaining_secs),
                     strength = format!("{:.2}", sig.strength),
                     "🎯 LATENCY SIGNAL DETECTED"
                 );

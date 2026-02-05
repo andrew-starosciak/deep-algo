@@ -237,7 +237,7 @@ pub struct RawToken {
 // ============================================================================
 
 /// Supported coins for 15-minute markets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Coin {
     Btc,
     Eth,

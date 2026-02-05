@@ -7,8 +7,10 @@ mod tui_live_bot;
 
 use commands::{
     ArbitrageBotArgs, BackfillFundingArgs, BackfillOhlcvArgs, BackfillSignalsArgs,
-    BinaryBacktestArgs, CalculateReturnsArgs, CollectPolymarketArgs, CollectSignalsArgs,
-    CrossArbitrageArgs, DataStatusArgs, EntryStrategySimArgs, LatencyMonitorArgs,
+    BinaryBacktestArgs, CalculateReturnsArgs, CheckDepthArgs, CollectPolymarketArgs,
+    CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs, CrossMarketBacktestArgs,
+    CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
+    EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs, LatencyMonitorArgs,
     Phase1ArbitrageArgs, PolymarketPaperTradeArgs, ValidateSignalsArgs,
 };
 
@@ -139,6 +141,20 @@ enum Commands {
     CrossArbitrage(CrossArbitrageArgs),
     /// Monitor for latency arbitrage opportunities (gabagool strategy)
     LatencyMonitor(LatencyMonitorArgs),
+    /// Monitor for Gabagool hybrid arbitrage (entry/hedge/scratch)
+    GabagoolMonitor(GabagoolMonitorArgs),
+    /// Run automated Gabagool trading (signal detection + execution)
+    GabagoolAuto(GabagoolAutoArgs),
+    /// Scan for cross-market correlation arbitrage (BTC/ETH/SOL/XRP)
+    CrossMarketScan(CrossMarketScannerArgs),
+    /// Settle cross-market opportunities and track outcomes
+    CrossMarketSettle(CrossMarketSettleArgs),
+    /// Backtest cross-market correlation opportunities
+    CrossMarketBacktest(CrossMarketBacktestArgs),
+    /// Run automated cross-market trading (BTC/ETH correlation arbitrage)
+    CrossMarketAuto(CrossMarketAutoArgs),
+    /// Check order book depth for 15-minute crypto markets
+    CheckDepth(CheckDepthArgs),
 }
 
 #[tokio::main]
@@ -267,6 +283,27 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::LatencyMonitor(args) => {
             commands::run_latency_monitor(args).await?;
+        }
+        Commands::GabagoolMonitor(args) => {
+            commands::run_gabagool_monitor(args).await?;
+        }
+        Commands::GabagoolAuto(args) => {
+            commands::run_gabagool_auto(args).await?;
+        }
+        Commands::CrossMarketScan(args) => {
+            commands::run_cross_market_scanner(args).await?;
+        }
+        Commands::CrossMarketSettle(args) => {
+            commands::run_cross_market_settle(args).await?;
+        }
+        Commands::CrossMarketBacktest(args) => {
+            commands::run_cross_market_backtest(args).await?;
+        }
+        Commands::CrossMarketAuto(args) => {
+            commands::run_cross_market_auto(args).await?;
+        }
+        Commands::CheckDepth(args) => {
+            commands::run_check_depth(args).await?;
         }
     }
 
