@@ -1234,7 +1234,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             leg2_direction: opp.leg2_direction.clone(),
             leg1_token_id: opp.leg1_token_id.clone(),
             leg2_token_id: opp.leg2_token_id.clone(),
-            total_cost: opp.total_cost,
+            total_cost: opp.total_cost * shares,  // Actual USDC spent, not pair ratio
             shares,
             window_end,
             executed_at: Utc::now(),
@@ -1263,11 +1263,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     /// 1. Try using live_prices from WebSocket (most reliable)
     /// 2. Fall back to fetching CLOB prices directly
     ///
-    /// If UP price > 0.70, coin went UP. If DOWN price > 0.70, coin went DOWN.
+    /// Simple logic: If UP price > $0.50, coin went UP. Otherwise DOWN.
     async fn try_fast_settle_via_clob(&self) -> Result<u64, CrossMarketAutoExecutorError> {
         let now = Utc::now();
-        // If price > 0.70, that outcome won (lowered from 0.75 for faster settlement)
-        let threshold = dec!(0.70);
+        let half = dec!(0.50);
 
         // Find trades with closed windows
         let trades_to_check: Vec<PendingPaperSettlement> = {
@@ -1304,78 +1303,48 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             let c1_upper = settlement.coin1.to_uppercase();
             let c2_upper = settlement.coin2.to_uppercase();
 
-            if let (Some(&(c1_up, c1_down)), Some(&(c2_up, c2_down))) =
+            if let (Some(&(c1_up, _c1_down)), Some(&(c2_up, _c2_down))) =
                 (live_prices.get(&c1_upper), live_prices.get(&c2_upper))
             {
-                // Determine outcomes from live prices
-                // If UP price > threshold, coin went UP; if DOWN price > threshold, coin went DOWN
-                let c1_outcome = if c1_up > threshold {
-                    Some("UP")
-                } else if c1_down > threshold {
-                    Some("DOWN")
-                } else {
-                    None
-                };
+                // Simple: if UP > 0.50, coin went UP. Otherwise DOWN.
+                let c1_outcome = if c1_up > half { "UP" } else { "DOWN" };
+                let c2_outcome = if c2_up > half { "UP" } else { "DOWN" };
 
-                let c2_outcome = if c2_up > threshold {
-                    Some("UP")
-                } else if c2_down > threshold {
-                    Some("DOWN")
-                } else {
-                    None
-                };
+                // Determine if our legs won
+                let leg1_won = settlement.leg1_direction == c1_outcome;
+                let leg2_won = settlement.leg2_direction == c2_outcome;
 
                 info!(
                     trade_id = %settlement.trade_id,
                     secs_since_close = secs_since_close,
                     c1 = %c1_upper,
                     c1_up = %c1_up,
-                    c1_down = %c1_down,
-                    c1_outcome = ?c1_outcome,
+                    c1_outcome = %c1_outcome,
                     c2 = %c2_upper,
                     c2_up = %c2_up,
-                    c2_down = %c2_down,
-                    c2_outcome = ?c2_outcome,
-                    "Checking live WebSocket prices for settlement"
+                    c2_outcome = %c2_outcome,
+                    leg1_dir = %settlement.leg1_direction,
+                    leg2_dir = %settlement.leg2_direction,
+                    leg1_won = leg1_won,
+                    leg2_won = leg2_won,
+                    "SETTLING via live WebSocket prices"
                 );
 
-                if let (Some(c1_out), Some(c2_out)) = (c1_outcome, c2_outcome) {
-                    // We can determine the outcome!
-                    let leg1_won = settlement.leg1_direction == c1_out;
-                    let leg2_won = settlement.leg2_direction == c2_out;
+                // Finalize
+                self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
 
-                    info!(
-                        trade_id = %settlement.trade_id,
-                        leg1_dir = %settlement.leg1_direction,
-                        leg2_dir = %settlement.leg2_direction,
-                        c1_outcome = %c1_out,
-                        c2_outcome = %c2_out,
-                        leg1_won = leg1_won,
-                        leg2_won = leg2_won,
-                        "SETTLING via live WebSocket prices"
-                    );
+                // Remove from pending
+                {
+                    let mut pending = self.pending_settlements.write().await;
+                    pending.retain(|s| s.trade_id != settlement.trade_id);
 
-                    // Finalize
-                    self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
-
-                    // Remove from pending
-                    {
-                        let mut pending = self.pending_settlements.write().await;
-                        pending.retain(|s| s.trade_id != settlement.trade_id);
-
-                        let mut stats = self.stats.write().await;
-                        stats.pending_settlement = pending.len() as u64;
-                        stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
-                    }
-
-                    settled_count += 1;
-                    continue; // Move to next trade
-                } else {
-                    info!(
-                        trade_id = %settlement.trade_id,
-                        "Live prices not decisive (need one side > 0.70), trying CLOB API"
-                    );
+                    let mut stats = self.stats.write().await;
+                    stats.pending_settlement = pending.len() as u64;
+                    stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
                 }
+
+                settled_count += 1;
+                continue; // Move to next trade
             } else {
                 info!(
                     trade_id = %settlement.trade_id,
@@ -1447,48 +1416,31 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 .and_then(|p| Decimal::from_str(&p.price).ok());
 
             if let (Some(p1), Some(p2)) = (leg1_price, leg2_price) {
+                // Simple: if token price > 0.50, that token won
+                let leg1_won = p1 > half;
+                let leg2_won = p2 > half;
+
                 info!(
                     trade_id = %settlement.trade_id,
                     leg1_token_price = %p1,
                     leg2_token_price = %p2,
-                    "CLOB token prices fetched"
+                    leg1_won = leg1_won,
+                    leg2_won = leg2_won,
+                    "SETTLING via CLOB token prices"
                 );
 
-                // For token prices: if > 0.70, that token won
-                let leg1_decisive = p1 > threshold || p1 < (Decimal::ONE - threshold);
-                let leg2_decisive = p2 > threshold || p2 < (Decimal::ONE - threshold);
+                self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
 
-                if leg1_decisive && leg2_decisive {
-                    let leg1_won = p1 > threshold;
-                    let leg2_won = p2 > threshold;
+                {
+                    let mut pending = self.pending_settlements.write().await;
+                    pending.retain(|s| s.trade_id != settlement.trade_id);
 
-                    info!(
-                        trade_id = %settlement.trade_id,
-                        leg1_won = leg1_won,
-                        leg2_won = leg2_won,
-                        "SETTLING via CLOB token prices"
-                    );
-
-                    self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
-
-                    {
-                        let mut pending = self.pending_settlements.write().await;
-                        pending.retain(|s| s.trade_id != settlement.trade_id);
-
-                        let mut stats = self.stats.write().await;
-                        stats.pending_settlement = pending.len() as u64;
-                        stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
-                    }
-
-                    settled_count += 1;
-                } else {
-                    info!(
-                        trade_id = %settlement.trade_id,
-                        leg1_price = %p1,
-                        leg2_price = %p2,
-                        "CLOB prices not decisive (need > 0.70 or < 0.30)"
-                    );
+                    let mut stats = self.stats.write().await;
+                    stats.pending_settlement = pending.len() as u64;
+                    stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
                 }
+
+                settled_count += 1;
             }
         }
 

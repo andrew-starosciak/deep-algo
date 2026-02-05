@@ -8,6 +8,7 @@
 #   ./scripts/run_cross_market_auto.sh [options]
 #
 # Options:
+#   --overnight           Run overnight (12h duration, persist, log to file)
 #   --mode paper|live     Trading mode (default: paper)
 #   --duration <time>     How long to run (default: 1h)
 #   --bet-size <amount>   Fixed bet size per leg in USDC
@@ -16,6 +17,10 @@
 #   --no-persist          Disable database persistence
 #   --session <id>        Custom session ID
 #   --help                Show this help
+#
+# Examples:
+#   ./scripts/run_cross_market_auto.sh --overnight              # Run overnight
+#   ./scripts/run_cross_market_auto.sh --mode paper --duration 2h
 #
 
 set -e
@@ -42,23 +47,25 @@ NC='\033[0m' # No Color
 
 # Default configuration
 MODE="paper"
-DURATION="1h"
+DURATION="30m"
 PAIR="btc,eth"
 COMBINATION="coin1down_coin2up"
-MIN_SPREAD="0.03"
-MIN_WIN_PROB="0.85"
-MAX_POSITION="200"
-PAPER_BALANCE="1000"
-KELLY_FRACTION="0.25"
-BET_SIZE=""
+BET_SIZE="50"
 PERSIST="--persist"
 SESSION_ID=""
-STATS_INTERVAL="10"
 VERBOSE=""
+OVERNIGHT=""
+LOG_FILE=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
+        --overnight)
+            OVERNIGHT="1"
+            DURATION="12h"
+            LOG_FILE="$PROJECT_ROOT/logs/overnight-$(date +%Y%m%d-%H%M%S).log"
+            shift
+            ;;
         --mode)
             MODE="$2"
             shift 2
@@ -141,18 +148,12 @@ if [[ -n "$PERSIST" && -z "$DATABASE_URL" ]]; then
 fi
 
 # Build the command
-CMD="cargo run -p algo-trade-cli --release -- cross-market-auto"
-CMD="$CMD --mode $MODE"
-CMD="$CMD --duration $DURATION"
+CMD="cargo run -p algo-trade-cli -- cross-market-auto"
 CMD="$CMD --pair $PAIR"
 CMD="$CMD --combination $COMBINATION"
-CMD="$CMD --min-spread $MIN_SPREAD"
-CMD="$CMD --min-win-prob $MIN_WIN_PROB"
-CMD="$CMD --max-position $MAX_POSITION"
-CMD="$CMD --kelly-fraction $KELLY_FRACTION"
-CMD="$CMD --stats-interval-secs $STATS_INTERVAL"
-[[ "$MODE" == "paper" ]] && CMD="$CMD --paper-balance $PAPER_BALANCE"
-[[ -n "$BET_SIZE" ]] && CMD="$CMD $BET_SIZE"
+CMD="$CMD --mode $MODE"
+CMD="$CMD --bet-size $BET_SIZE"
+CMD="$CMD --duration $DURATION"
 [[ -n "$PERSIST" ]] && CMD="$CMD $PERSIST"
 [[ -n "$SESSION_ID" ]] && CMD="$CMD $SESSION_ID"
 [[ -n "$VERBOSE" ]] && CMD="$CMD $VERBOSE"
@@ -174,16 +175,7 @@ fi
 echo -e "  ${DIM}Duration:${NC}      $DURATION"
 echo -e "  ${DIM}Pair:${NC}          ${PAIR^^}"
 echo -e "  ${DIM}Combination:${NC}   $COMBINATION"
-echo -e "  ${DIM}Min Spread:${NC}    \$$MIN_SPREAD"
-echo -e "  ${DIM}Min Win Prob:${NC}  ${MIN_WIN_PROB}%"
-echo -e "  ${DIM}Max Position:${NC}  \$$MAX_POSITION/window"
-echo -e "  ${DIM}Kelly:${NC}         ${KELLY_FRACTION}x"
-if [[ -n "$BET_SIZE" ]]; then
-    echo -e "  ${DIM}Fixed Bet:${NC}     $(echo $BET_SIZE | cut -d' ' -f2)"
-fi
-if [[ "$MODE" == "paper" ]]; then
-    echo -e "  ${DIM}Paper Balance:${NC} \$$PAPER_BALANCE"
-fi
+echo -e "  ${DIM}Bet Size:${NC}      \$$BET_SIZE"
 echo -e "  ${DIM}Persistence:${NC}   $([ -n "$PERSIST" ] && echo "ENABLED" || echo "disabled")"
 echo -e "  ${DIM}Session:${NC}       $SESSION_DISPLAY"
 echo ""
@@ -197,6 +189,18 @@ if [[ "$MODE" == "live" ]]; then
         exit 1
     fi
     echo ""
+fi
+
+# Create logs directory if needed
+mkdir -p "$PROJECT_ROOT/logs"
+
+# Set log file if overnight mode
+if [[ -n "$OVERNIGHT" ]]; then
+    echo -e "${CYAN}OVERNIGHT MODE${NC}"
+    echo -e "  ${DIM}Log file:${NC}      $LOG_FILE"
+    echo -e "  ${DIM}Dashboard logs redirected to file${NC}"
+    echo ""
+    export CROSS_MARKET_LOG="$LOG_FILE"
 fi
 
 echo -e "${GREEN}Starting bot...${NC}"
@@ -262,6 +266,14 @@ done
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════${NC}"
 echo -e "${WHITE}Bot stopped${NC}"
+
+# Show log file location if overnight
+if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
+    echo ""
+    echo -e "${WHITE}Log file saved:${NC} $LOG_FILE"
+    echo -e "${DIM}View with: tail -f $LOG_FILE${NC}"
+    echo -e "${DIM}Or: less $LOG_FILE${NC}"
+fi
 
 # Show final database stats if persisting
 if [[ -n "$PERSIST" && -n "$DATABASE_URL" ]]; then
