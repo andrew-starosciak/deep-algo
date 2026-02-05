@@ -708,6 +708,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 break;
             }
 
+            // Always check settlement if interval has passed (before waiting for opportunities)
+            if last_settlement_check.elapsed() >= settlement_check_interval {
+                info!("Running periodic settlement check...");
+                if let Err(e) = self.check_pending_settlements().await {
+                    warn!(error = %e, "Settlement check error");
+                }
+                last_settlement_check = std::time::Instant::now();
+            }
+
+            // Wait for next opportunity with short timeout
             tokio::select! {
                 opp = opp_rx.recv() => {
                     match opp {
@@ -722,14 +732,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         }
                     }
                 }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                    // Periodic settlement check (every 30 seconds)
-                    if last_settlement_check.elapsed() >= settlement_check_interval {
-                        if let Err(e) = self.check_pending_settlements().await {
-                            debug!(error = %e, "Settlement check error (non-fatal)");
-                        }
-                        last_settlement_check = std::time::Instant::now();
-                    }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    // Just a short sleep to avoid busy-looping
                 }
             }
         }
