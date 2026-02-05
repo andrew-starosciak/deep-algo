@@ -698,9 +698,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             stats.started_at = Some(Utc::now());
         }
 
-        // Track last settlement check time
+        // Track last settlement check time - check every 5 seconds for faster settlement
         let mut last_settlement_check = std::time::Instant::now();
-        let settlement_check_interval = std::time::Duration::from_secs(30);
+        let settlement_check_interval = std::time::Duration::from_secs(5);
 
         loop {
             if self.should_stop.load(Ordering::SeqCst) {
@@ -1251,11 +1251,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     /// Tries fast settlement by fetching CLOB prices directly.
     ///
     /// For trades where the window has closed, fetches current token prices
-    /// and settles if they're decisive (>$0.90 = winner, <$0.10 = loser).
+    /// and settles if they're decisive (>$0.75 = winner, <$0.25 = loser).
     async fn try_fast_settle_via_clob(&self) -> Result<u64, CrossMarketAutoExecutorError> {
         let now = Utc::now();
-        let threshold_high = dec!(0.90);
-        let threshold_low = dec!(0.10);
+        // Lowered thresholds - prices should be very skewed after resolution
+        let threshold_high = dec!(0.75);
+        let threshold_low = dec!(0.25);
 
         // Find trades with closed windows
         let trades_to_check: Vec<PendingPaperSettlement> = {
@@ -1270,9 +1271,17 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             return Ok(0);
         }
 
+        info!(
+            count = trades_to_check.len(),
+            "Checking {} pending trades for fast settlement",
+            trades_to_check.len()
+        );
+
         let mut settled_count = 0u64;
 
         for settlement in trades_to_check {
+            let secs_since_close = (now - settlement.window_end).num_seconds();
+
             // Fetch current prices for the tokens
             let token_ids = vec![
                 settlement.leg1_token_id.clone(),
@@ -1284,6 +1293,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 token_ids.join(",")
             );
 
+            info!(
+                trade_id = %settlement.trade_id,
+                secs_since_close = secs_since_close,
+                "Fetching CLOB prices for settlement"
+            );
+
             let response = match self.http_client.get(&url)
                 .header("Accept", "application/json")
                 .send()
@@ -1291,23 +1306,40 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             {
                 Ok(r) => r,
                 Err(e) => {
-                    debug!(error = %e, "Failed to fetch CLOB prices for fast settlement");
+                    warn!(error = %e, trade_id = %settlement.trade_id, "Failed to fetch CLOB prices");
                     continue;
                 }
             };
 
-            if !response.status().is_success() {
+            let status = response.status();
+            if !status.is_success() {
+                warn!(
+                    status = %status,
+                    trade_id = %settlement.trade_id,
+                    "CLOB API returned error status"
+                );
                 continue;
             }
 
-            #[derive(Deserialize)]
+            #[derive(Deserialize, Debug)]
             struct PriceResponse {
                 price: String,
             }
 
-            let prices: std::collections::HashMap<String, PriceResponse> = match response.json().await {
+            let body = match response.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "Failed to read CLOB response body");
+                    continue;
+                }
+            };
+
+            let prices: std::collections::HashMap<String, PriceResponse> = match serde_json::from_str(&body) {
                 Ok(p) => p,
-                Err(_) => continue,
+                Err(e) => {
+                    warn!(error = %e, body = %body, "Failed to parse CLOB prices JSON");
+                    continue;
+                }
             };
 
             // Parse prices
@@ -1315,6 +1347,15 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 .and_then(|p| Decimal::from_str(&p.price).ok());
             let leg2_price = prices.get(&settlement.leg2_token_id)
                 .and_then(|p| Decimal::from_str(&p.price).ok());
+
+            info!(
+                trade_id = %settlement.trade_id,
+                leg1_price = ?leg1_price,
+                leg2_price = ?leg2_price,
+                leg1_token = %settlement.leg1_token_id,
+                leg2_token = %settlement.leg2_token_id,
+                "CLOB prices fetched"
+            );
 
             if let (Some(p1), Some(p2)) = (leg1_price, leg2_price) {
                 // Determine if prices are decisive
@@ -1332,7 +1373,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         leg2_price = %p2,
                         leg1_won = leg1_won,
                         leg2_won = leg2_won,
-                        "Fast settlement via CLOB prices"
+                        "Fast settlement via CLOB prices - SETTLING"
                     );
 
                     // Finalize
@@ -1349,7 +1390,21 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     }
 
                     settled_count += 1;
+                } else {
+                    info!(
+                        trade_id = %settlement.trade_id,
+                        leg1_price = %p1,
+                        leg2_price = %p2,
+                        leg1_decisive = leg1_decisive,
+                        leg2_decisive = leg2_decisive,
+                        "Prices not decisive yet (need >0.75 or <0.25)"
+                    );
                 }
+            } else {
+                warn!(
+                    trade_id = %settlement.trade_id,
+                    "Could not parse prices from CLOB response"
+                );
             }
         }
 
