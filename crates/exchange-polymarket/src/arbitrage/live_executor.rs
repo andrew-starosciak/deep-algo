@@ -271,13 +271,13 @@ pub struct HardLimits {
 impl Default for HardLimits {
     fn default() -> Self {
         Self {
-            max_order_size: dec!(10000),     // Max 10k shares per order
-            min_order_size: dec!(1),         // Min 1 share
-            max_price: dec!(0.99),           // Max 99 cents
-            min_price: dec!(0.01),           // Min 1 cent
-            max_order_value: dec!(5000),     // Max $5k per order
-            max_daily_volume: dec!(50000),   // Max $50k daily volume
-            min_balance_reserve: dec!(100),  // Keep $100 minimum
+            max_order_size: dec!(10000),    // Max 10k shares per order
+            min_order_size: dec!(1),        // Min 1 share
+            max_price: dec!(0.99),          // Max 99 cents
+            min_price: dec!(0.01),          // Min 1 cent
+            max_order_value: dec!(5000),    // Max $5k per order
+            max_daily_volume: dec!(50000),  // Max $50k daily volume
+            min_balance_reserve: dec!(100), // Keep $100 minimum
         }
     }
 }
@@ -822,7 +822,10 @@ impl PolymarketExecutor for LiveExecutor {
         }
 
         // Record metrics
-        self.record_metrics(result.is_filled(), result.status.has_fills() && !result.is_filled());
+        self.record_metrics(
+            result.is_filled(),
+            result.status.has_fills() && !result.is_filled(),
+        );
 
         tracing::info!(
             order_id = %result.order_id,

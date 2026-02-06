@@ -179,7 +179,6 @@ impl Default for WalletConfig {
 pub struct Wallet {
     /// The private key stored securely.
     /// SECURITY: Never log or expose this value.
-    #[allow(dead_code)] // Will be used for EIP-712 signing in Phase 3
     private_key: SecretString,
     /// Derived Ethereum address (checksummed).
     address: String,
@@ -293,9 +292,8 @@ impl Wallet {
         use sha3::{Digest, Keccak256};
 
         // 1. Parse hex to 32-byte private key
-        let key_bytes = hex::decode(key_hex).map_err(|e| {
-            WalletError::InvalidPrivateKey(format!("Invalid hex encoding: {}", e))
-        })?;
+        let key_bytes = hex::decode(key_hex)
+            .map_err(|e| WalletError::InvalidPrivateKey(format!("Invalid hex encoding: {}", e)))?;
 
         if key_bytes.len() != 32 {
             return Err(WalletError::InvalidPrivateKey(format!(
@@ -305,9 +303,8 @@ impl Wallet {
         }
 
         // 2. Create signing key from bytes
-        let signing_key = SigningKey::from_slice(&key_bytes).map_err(|e| {
-            WalletError::InvalidPrivateKey(format!("Invalid secp256k1 key: {}", e))
-        })?;
+        let signing_key = SigningKey::from_slice(&key_bytes)
+            .map_err(|e| WalletError::InvalidPrivateKey(format!("Invalid secp256k1 key: {}", e)))?;
 
         // 3. Get uncompressed public key (65 bytes: 0x04 || x || y)
         let verifying_key = signing_key.verifying_key();
@@ -348,7 +345,6 @@ impl Wallet {
     /// This method should only be called by signing code.
     /// The returned reference must NEVER be logged or stored.
     #[must_use]
-    #[allow(dead_code)] // Will be used for EIP-712 signing in Phase 3
     pub(crate) fn expose_private_key(&self) -> &str {
         self.private_key.expose_secret()
     }
@@ -689,7 +685,10 @@ mod tests {
         // Should have both uppercase and lowercase letters (EIP-55 checksum)
         let has_upper = address[2..].chars().any(|c| c.is_ascii_uppercase());
         let has_lower = address[2..].chars().any(|c| c.is_ascii_lowercase());
-        assert!(has_upper && has_lower, "EIP-55 checksum should produce mixed case");
+        assert!(
+            has_upper && has_lower,
+            "EIP-55 checksum should produce mixed case"
+        );
     }
 
     #[test]

@@ -36,24 +36,38 @@
 
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::models::Coin;
 
+use super::correlation_tracker::CorrelationTracker;
 use super::cross_market_types::{
-    CoinMarketSnapshot, CoinPair, CrossMarketCombination, CrossMarketConfig,
-    CrossMarketOpportunity,
+    CoinMarketSnapshot, CoinPair, CrossMarketCombination, CrossMarketConfig, CrossMarketOpportunity,
 };
 
 /// Fee rate on winning side (2%).
 const FEE_RATE: f64 = 0.02;
 
 /// Cross-market correlation arbitrage detector.
-#[derive(Debug)]
 pub struct CrossMarketDetector {
     /// Configuration.
     config: CrossMarketConfig,
     /// Last signal time per (coin1, coin2, combination) to enforce cooldown.
     last_signal_ms: HashMap<(Coin, Coin, CrossMarketCombination), i64>,
+    /// Optional dynamic correlation tracker.
+    correlation_tracker: Option<Arc<CorrelationTracker>>,
+}
+
+impl std::fmt::Debug for CrossMarketDetector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CrossMarketDetector")
+            .field("config", &self.config)
+            .field(
+                "has_correlation_tracker",
+                &self.correlation_tracker.is_some(),
+            )
+            .finish()
+    }
 }
 
 impl CrossMarketDetector {
@@ -63,6 +77,20 @@ impl CrossMarketDetector {
         Self {
             config,
             last_signal_ms: HashMap::new(),
+            correlation_tracker: None,
+        }
+    }
+
+    /// Creates a detector with a dynamic correlation tracker.
+    #[must_use]
+    pub fn with_correlation_tracker(
+        config: CrossMarketConfig,
+        tracker: Arc<CorrelationTracker>,
+    ) -> Self {
+        Self {
+            config,
+            last_signal_ms: HashMap::new(),
+            correlation_tracker: Some(tracker),
         }
     }
 
@@ -102,8 +130,7 @@ impl CrossMarketDetector {
                     .clone()
                     .unwrap_or_else(|| CrossMarketCombination::all().to_vec());
                 for combo in combos {
-                    if let Some(opp) =
-                        self.check_combination(pair, m1, m2, combo, current_time_ms)
+                    if let Some(opp) = self.check_combination(pair, m1, m2, combo, current_time_ms)
                     {
                         opportunities.push(opp);
                     }
@@ -149,8 +176,15 @@ impl CrossMarketDetector {
             return None;
         }
 
+        // Get effective correlation: dynamic tracker or static config
+        let effective_rho = if let Some(ref tracker) = self.correlation_tracker {
+            tracker.get_conservative_correlation(&pair)
+        } else {
+            self.config.assumed_correlation
+        };
+
         // Calculate win probability and expected value
-        let win_prob = self.calculate_win_probability(combo, leg1_price, leg2_price);
+        let win_prob = self.calculate_win_probability(combo, leg1_price, leg2_price, effective_rho);
         let ev = self.calculate_expected_value(total_cost, win_prob);
 
         // Check EV threshold
@@ -167,8 +201,14 @@ impl CrossMarketDetector {
 
         // Check minimum depth requirement (if configured)
         if self.config.min_depth > Decimal::ZERO {
-            let leg1_ask = leg1_depth.as_ref().map(|d| d.ask_depth).unwrap_or(Decimal::ZERO);
-            let leg2_ask = leg2_depth.as_ref().map(|d| d.ask_depth).unwrap_or(Decimal::ZERO);
+            let leg1_ask = leg1_depth
+                .as_ref()
+                .map(|d| d.ask_depth)
+                .unwrap_or(Decimal::ZERO);
+            let leg2_ask = leg2_depth
+                .as_ref()
+                .map(|d| d.ask_depth)
+                .unwrap_or(Decimal::ZERO);
             let min_available = leg1_ask.min(leg2_ask);
 
             if min_available < self.config.min_depth {
@@ -197,7 +237,7 @@ impl CrossMarketDetector {
             total_cost,
             spread,
             expected_value: ev,
-            assumed_correlation: self.config.assumed_correlation,
+            assumed_correlation: effective_rho,
             win_probability: win_prob,
             detected_at,
             // Depth fields
@@ -231,9 +271,8 @@ impl CrossMarketDetector {
         combo: CrossMarketCombination,
         leg1_price: Decimal,
         leg2_price: Decimal,
+        rho: f64,
     ) -> f64 {
-        let rho = self.config.assumed_correlation;
-
         // Market-implied probabilities (used for more advanced models)
         let _p1 = decimal_to_f64(leg1_price); // P(leg1 outcome)
         let _p2 = decimal_to_f64(leg2_price); // P(leg2 outcome)
@@ -250,7 +289,7 @@ impl CrossMarketDetector {
                 let p_both_up = 0.5 * (0.5 + 0.5 * rho);
                 let p_both_down = 0.5 * (0.5 + 0.5 * rho);
                 let p_c1_up_c2_down = 0.5 * (0.5 - 0.5 * rho); // Rare with high correlation
-                // P(C1 DOWN, C2 UP) = rare, this is our loss scenario
+                                                               // P(C1 DOWN, C2 UP) = rare, this is our loss scenario
 
                 // We win in 3 of 4 scenarios:
                 // Both UP: C1_UP wins
@@ -453,6 +492,7 @@ mod tests {
             CrossMarketCombination::Coin1UpCoin2Down,
             dec!(0.05),
             dec!(0.91),
+            0.85,
         );
 
         // With 85% correlation, opposite movements are rare
@@ -474,12 +514,14 @@ mod tests {
             CrossMarketCombination::BothUp,
             dec!(0.50),
             dec!(0.50),
+            0.85,
         );
 
         let win_prob_down = detector.calculate_win_probability(
             CrossMarketCombination::BothDown,
             dec!(0.50),
             dec!(0.50),
+            0.85,
         );
 
         // BothUp wins if at least one goes up
@@ -493,7 +535,11 @@ mod tests {
         );
 
         // Should be reasonably high (>50%) since we win if AT LEAST ONE goes our way
-        assert!(win_prob_up > 0.50, "Win prob {} should be > 0.50", win_prob_up);
+        assert!(
+            win_prob_up > 0.50,
+            "Win prob {} should be > 0.50",
+            win_prob_up
+        );
     }
 
     #[test]
@@ -510,8 +556,9 @@ mod tests {
 
         let combo = CrossMarketCombination::Coin1UpCoin2Down;
 
-        let win_prob_low = low_corr.calculate_win_probability(combo, dec!(0.10), dec!(0.90));
-        let win_prob_high = high_corr.calculate_win_probability(combo, dec!(0.10), dec!(0.90));
+        let win_prob_low = low_corr.calculate_win_probability(combo, dec!(0.10), dec!(0.90), 0.50);
+        let win_prob_high =
+            high_corr.calculate_win_probability(combo, dec!(0.10), dec!(0.90), 0.95);
 
         // Higher correlation = more likely to move together = higher win rate for opposite bets
         assert!(
@@ -598,7 +645,11 @@ mod tests {
 
         // Third check at t=15000 (after cooldown)
         let opps3 = detector.check(&snapshots, 15000);
-        assert_eq!(opps3.len(), count1, "Should find opportunities after cooldown");
+        assert_eq!(
+            opps3.len(),
+            count1,
+            "Should find opportunities after cooldown"
+        );
     }
 
     #[test]
@@ -776,7 +827,10 @@ mod tests {
                 && o.combination == CrossMarketCombination::Coin1DownCoin2Up
         });
 
-        assert!(target.is_some(), "Should find BTC_DOWN + ETH_UP opportunity");
+        assert!(
+            target.is_some(),
+            "Should find BTC_DOWN + ETH_UP opportunity"
+        );
 
         let opp = target.unwrap();
         assert_eq!(opp.total_cost, dec!(0.96));
@@ -817,7 +871,14 @@ mod tests {
         assert!(
             both_up.is_some(),
             "Should find BothUp opportunity. Found: {:?}",
-            opps.iter().map(|o| format!("{} {:?} cost={}", o.display_short(), o.combination, o.total_cost)).collect::<Vec<_>>()
+            opps.iter()
+                .map(|o| format!(
+                    "{} {:?} cost={}",
+                    o.display_short(),
+                    o.combination,
+                    o.total_cost
+                ))
+                .collect::<Vec<_>>()
         );
         let opp = both_up.unwrap();
         assert_eq!(opp.total_cost, dec!(0.65));

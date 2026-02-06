@@ -67,6 +67,7 @@ use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
+use super::correlation_tracker::CorrelationTracker;
 use super::cross_market_detector::CrossMarketDetector;
 use super::cross_market_types::{
     CoinMarketSnapshot, CrossMarketConfig, CrossMarketOpportunity, TokenDepth,
@@ -201,15 +202,43 @@ impl CrossMarketRunner {
     /// Creates a new cross-market runner.
     ///
     /// Returns the runner and a channel to receive opportunities.
-    pub fn new(
-        config: CrossMarketRunnerConfig,
-    ) -> (Self, mpsc::Receiver<CrossMarketOpportunity>) {
+    pub fn new(config: CrossMarketRunnerConfig) -> (Self, mpsc::Receiver<CrossMarketOpportunity>) {
         let (opp_tx, opp_rx) = mpsc::channel(config.signal_buffer_size);
 
         let gamma_client = GammaClient::with_rate_limit(
             NonZeroU32::new(config.gamma_rate_limit).unwrap_or(nonzero!(30u32)),
         );
         let detector = CrossMarketDetector::new(config.detector_config.clone());
+
+        let runner = Self {
+            config,
+            gamma_client,
+            detector,
+            opp_tx,
+            should_stop: Arc::new(AtomicBool::new(false)),
+            stats: Arc::new(RwLock::new(CrossMarketRunnerStats::default())),
+            ws_handle: None,
+            subscribed_tokens: Arc::new(RwLock::new(Vec::new())),
+        };
+
+        (runner, opp_rx)
+    }
+
+    /// Creates a new cross-market runner with a dynamic correlation tracker.
+    ///
+    /// The tracker provides real-time correlation estimates to the detector,
+    /// replacing the static `assumed_correlation` config value.
+    pub fn with_correlation_tracker(
+        config: CrossMarketRunnerConfig,
+        tracker: Arc<CorrelationTracker>,
+    ) -> (Self, mpsc::Receiver<CrossMarketOpportunity>) {
+        let (opp_tx, opp_rx) = mpsc::channel(config.signal_buffer_size);
+
+        let gamma_client = GammaClient::with_rate_limit(
+            NonZeroU32::new(config.gamma_rate_limit).unwrap_or(nonzero!(30u32)),
+        );
+        let detector =
+            CrossMarketDetector::with_correlation_tracker(config.detector_config.clone(), tracker);
 
         let runner = Self {
             config,
@@ -508,7 +537,6 @@ impl CrossMarketRunner {
             down_depth,
         })
     }
-
 
     /// Detects which coin a market belongs to based on its question text.
     fn detect_coin_from_market(&self, market: &Market) -> Option<Coin> {

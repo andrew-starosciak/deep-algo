@@ -488,7 +488,8 @@ mod tests {
 
         // Write partial JSON
         let mut file = File::create(&path).unwrap();
-        file.write_all(b"{\"window_start_ms\": 900000, \"yes_position\":").unwrap();
+        file.write_all(b"{\"window_start_ms\": 900000, \"yes_position\":")
+            .unwrap();
 
         // Load should return fresh tracker
         let loaded = persistence.load(900_000).unwrap();
@@ -550,7 +551,11 @@ mod tests {
     #[test]
     fn test_save_creates_parent_directories() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("nested").join("deep").join("positions.json");
+        let path = dir
+            .path()
+            .join("nested")
+            .join("deep")
+            .join("positions.json");
         let persistence = PositionPersistence::new(path.clone());
 
         // Parent doesn't exist

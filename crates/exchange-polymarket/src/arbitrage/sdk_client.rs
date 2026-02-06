@@ -31,6 +31,8 @@ use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use super::clob_auth::{self, L2Auth};
+use super::eip712::{self, Eip712Config, SIDE_BUY, SIDE_SELL};
 use super::execution::{ExecutionError, OrderParams, OrderResult, OrderStatus, OrderType, Side};
 use super::signer::Wallet;
 
@@ -112,7 +114,10 @@ impl ClobError {
             ClobError::Http(_)
                 | ClobError::RateLimited { .. }
                 | ClobError::Timeout(_)
-                | ClobError::Api { status: 500..=599, .. }
+                | ClobError::Api {
+                    status: 500..=599,
+                    ..
+                }
         )
     }
 
@@ -390,11 +395,13 @@ pub struct ClobClient {
     /// Wallet for signing
     wallet: Wallet,
     /// API key (derived from wallet signature)
-    #[allow(dead_code)] // Will be used for authenticated endpoints
     api_key: Option<String>,
     /// API secret (derived from wallet signature)
-    #[allow(dead_code)] // Will be used for authenticated endpoints
     api_secret: Option<String>,
+    /// L2 auth for HMAC-signed requests.
+    l2_auth: Option<L2Auth>,
+    /// API passphrase.
+    api_passphrase: Option<String>,
 }
 
 impl ClobClient {
@@ -413,6 +420,8 @@ impl ClobClient {
             wallet,
             api_key: None,
             api_secret: None,
+            l2_auth: None,
+            api_passphrase: None,
         })
     }
 
@@ -440,38 +449,107 @@ impl ClobClient {
 
     /// Authenticates with the CLOB API by deriving API credentials.
     ///
+    /// Uses EIP-712 ClobAuth signing to derive or create API credentials.
     /// This must be called before using authenticated endpoints like
     /// order submission.
     pub async fn authenticate(&mut self) -> Result<(), ClobError> {
-        // The Polymarket CLOB uses a signature-based authentication flow:
-        // 1. Sign a specific message with the wallet
-        // 2. Derive API key and secret from the signature
-        //
-        // For now, we'll implement a placeholder that will be completed
-        // when we have access to the exact authentication flow.
-
         info!(address = %self.wallet.address(), "Authenticating with CLOB API");
 
-        // TODO: Implement actual authentication flow
-        // This requires signing a specific message format defined by Polymarket
+        // Step 1: Sign ClobAuth EIP-712 message
+        let l1_headers = clob_auth::sign_clob_auth(
+            self.wallet.address(),
+            self.wallet.expose_private_key(),
+            0, // nonce
+        )
+        .map_err(|e| ClobError::Auth(format!("L1 signing failed: {}", e)))?;
 
-        // For testing, we'll mark as authenticated
-        self.api_key = Some(format!("key_{}", &self.wallet.address()[2..10]));
-        self.api_secret = Some("placeholder_secret".to_string());
+        // Step 2: Try to derive existing API key first
+        let derive_url = format!("{}/auth/derive-api-key", self.config.base_url);
+        let derive_response = self
+            .http
+            .get(&derive_url)
+            .header("POLY_ADDRESS", &l1_headers.address)
+            .header("POLY_SIGNATURE", &l1_headers.signature)
+            .header("POLY_TIMESTAMP", &l1_headers.timestamp)
+            .header("POLY_NONCE", &l1_headers.nonce)
+            .send()
+            .await?;
 
-        debug!("Authentication placeholder complete");
+        let creds = if derive_response.status().is_success() {
+            let body = derive_response.text().await?;
+            serde_json::from_str::<clob_auth::ApiCredentials>(&body).map_err(|e| {
+                ClobError::Parse(format!(
+                    "Failed to parse API credentials: {} - body: {}",
+                    e, body
+                ))
+            })?
+        } else {
+            // Step 3: Create new API key if derivation fails
+            debug!(status = %derive_response.status(), "Derive failed, creating new API key");
+
+            // Re-sign (timestamp may have expired)
+            let l1_headers = clob_auth::sign_clob_auth(
+                self.wallet.address(),
+                self.wallet.expose_private_key(),
+                0,
+            )
+            .map_err(|e| ClobError::Auth(format!("L1 signing failed: {}", e)))?;
+
+            let create_url = format!("{}/auth/api-key", self.config.base_url);
+            let create_response = self
+                .http
+                .post(&create_url)
+                .header("POLY_ADDRESS", &l1_headers.address)
+                .header("POLY_SIGNATURE", &l1_headers.signature)
+                .header("POLY_TIMESTAMP", &l1_headers.timestamp)
+                .header("POLY_NONCE", &l1_headers.nonce)
+                .send()
+                .await?;
+
+            let status = create_response.status();
+            let body = create_response.text().await?;
+
+            if !status.is_success() {
+                return Err(ClobError::Auth(format!(
+                    "API key creation failed ({}): {}",
+                    status, body
+                )));
+            }
+
+            serde_json::from_str::<clob_auth::ApiCredentials>(&body).map_err(|e| {
+                ClobError::Parse(format!(
+                    "Failed to parse API credentials: {} - body: {}",
+                    e, body
+                ))
+            })?
+        };
+
+        // Step 4: Store credentials and create L2 auth
+        let l2_auth = L2Auth::new(&creds, self.wallet.address().to_string());
+
+        info!(api_key = %creds.api_key, "CLOB authentication successful");
+
+        self.api_key = Some(creds.api_key);
+        self.api_secret = Some(creds.secret);
+        self.api_passphrase = Some(creds.passphrase);
+        self.l2_auth = Some(l2_auth);
+
         Ok(())
     }
 
     /// Returns true if the client is authenticated.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
-        self.api_key.is_some() && self.api_secret.is_some()
+        self.l2_auth.is_some()
     }
 
     /// Gets the USDC balance for the authenticated wallet.
     pub async fn get_balance(&self) -> Result<Decimal, ClobError> {
-        let url = format!("{}/balance?address={}", self.config.base_url, self.wallet.address());
+        let url = format!(
+            "{}/balance?address={}",
+            self.config.base_url,
+            self.wallet.address()
+        );
 
         debug!(url = %url, "Fetching balance");
 
@@ -486,17 +564,22 @@ impl ClobClient {
             });
         }
 
-        let balance: BalanceResponse = response.json().await.map_err(|e| {
-            ClobError::Parse(format!("Failed to parse balance response: {}", e))
-        })?;
+        let balance: BalanceResponse = response
+            .json()
+            .await
+            .map_err(|e| ClobError::Parse(format!("Failed to parse balance response: {}", e)))?;
 
         // Parse USDC balance (or collateral for neg-risk)
-        let balance_str = balance.usdc
+        let balance_str = balance
+            .usdc
             .or(balance.collateral)
             .unwrap_or_else(|| "0".to_string());
 
         balance_str.parse::<Decimal>().map_err(|e| {
-            ClobError::Parse(format!("Failed to parse balance value '{}': {}", balance_str, e))
+            ClobError::Parse(format!(
+                "Failed to parse balance value '{}': {}",
+                balance_str, e
+            ))
         })
     }
 
@@ -532,9 +615,10 @@ impl ClobClient {
             });
         }
 
-        let positions: Vec<WalletPosition> = response.json().await.map_err(|e| {
-            ClobError::Parse(format!("Failed to parse positions response: {}", e))
-        })?;
+        let positions: Vec<WalletPosition> = response
+            .json()
+            .await
+            .map_err(|e| ClobError::Parse(format!("Failed to parse positions response: {}", e)))?;
 
         debug!(count = positions.len(), "Fetched wallet positions");
 
@@ -566,10 +650,7 @@ impl ClobClient {
     /// - `Some(true)` if the position won (cur_price >= 0.95)
     /// - `Some(false)` if the position lost (cur_price <= 0.05)
     /// - `None` if the market hasn't resolved yet or position not found
-    pub async fn check_position_outcome(
-        &self,
-        token_id: &str,
-    ) -> Result<Option<bool>, ClobError> {
+    pub async fn check_position_outcome(&self, token_id: &str) -> Result<Option<bool>, ClobError> {
         let positions = self.get_positions_for_tokens(&[token_id]).await?;
 
         if let Some(pos) = positions.first() {
@@ -614,11 +695,29 @@ impl ClobClient {
             "Submitting order to CLOB"
         );
 
-        // Submit to API
+        // Submit to API with L2 auth headers
         let url = format!("{}/order", self.config.base_url);
-        let response = self.http
+        let body_json = serde_json::to_string(&request)
+            .map_err(|e| ClobError::Parse(format!("Failed to serialize order: {}", e)))?;
+
+        let l2_auth = self
+            .l2_auth
+            .as_ref()
+            .ok_or_else(|| ClobError::Auth("L2 auth not initialized".to_string()))?;
+        let l2_headers = l2_auth
+            .headers("POST", "/order", &body_json)
+            .map_err(|e| ClobError::Auth(format!("L2 header generation failed: {}", e)))?;
+
+        let response = self
+            .http
             .post(&url)
-            .json(&request)
+            .header("POLY_ADDRESS", &l2_headers.address)
+            .header("POLY_SIGNATURE", &l2_headers.signature)
+            .header("POLY_TIMESTAMP", &l2_headers.timestamp)
+            .header("POLY_API_KEY", &l2_headers.api_key)
+            .header("POLY_PASSPHRASE", &l2_headers.passphrase)
+            .header("Content-Type", "application/json")
+            .body(body_json)
             .send()
             .await?;
 
@@ -632,7 +731,9 @@ impl ClobClient {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(1000);
-            return Err(ClobError::RateLimited { retry_after_ms: retry_after });
+            return Err(ClobError::RateLimited {
+                retry_after_ms: retry_after,
+            });
         }
 
         let body = response.text().await?;
@@ -645,15 +746,22 @@ impl ClobClient {
         }
 
         // Parse response
-        let order_response: CreateOrderResponse = serde_json::from_str(&body)
-            .map_err(|e| ClobError::Parse(format!("Failed to parse order response: {} - body: {}", e, body)))?;
+        let order_response: CreateOrderResponse = serde_json::from_str(&body).map_err(|e| {
+            ClobError::Parse(format!(
+                "Failed to parse order response: {} - body: {}",
+                e, body
+            ))
+        })?;
 
         // Convert to OrderResult
         self.parse_order_response(params, order_response)
     }
 
     /// Submits an order with automatic retries for transient errors.
-    pub async fn submit_order_with_retry(&self, params: &OrderParams) -> Result<OrderResult, ClobError> {
+    pub async fn submit_order_with_retry(
+        &self,
+        params: &OrderParams,
+    ) -> Result<OrderResult, ClobError> {
         let mut delay = BASE_RETRY_DELAY;
 
         for attempt in 0..=self.config.max_retries {
@@ -697,9 +805,10 @@ impl ClobClient {
             });
         }
 
-        let status_response: OrderStatusResponse = response.json().await.map_err(|e| {
-            ClobError::Parse(format!("Failed to parse order status: {}", e))
-        })?;
+        let status_response: OrderStatusResponse = response
+            .json()
+            .await
+            .map_err(|e| ClobError::Parse(format!("Failed to parse order status: {}", e)))?;
 
         self.parse_status_response(status_response)
     }
@@ -758,7 +867,7 @@ impl ClobClient {
         Ok(())
     }
 
-    /// Creates an order request with EIP-712 signature.
+    /// Creates an order request with real EIP-712 signature.
     fn create_order_request(&self, params: &OrderParams) -> Result<CreateOrderRequest, ClobError> {
         // Generate nonce (timestamp-based for uniqueness)
         let nonce = std::time::SystemTime::now()
@@ -766,12 +875,43 @@ impl ClobClient {
             .map(|d| d.as_millis().to_string())
             .unwrap_or_else(|_| "0".to_string());
 
-        // No expiration for now
-        let expiration = "0".to_string();
+        // Expiration: 10 minutes from now
+        let expiration_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() + 600) // 10 minutes
+            .unwrap_or(0);
+        let expiration = expiration_secs.to_string();
 
-        // TODO: Implement actual EIP-712 signing
-        // For now, use a placeholder signature
-        let signature = format!("0x{}", "00".repeat(65));
+        let nonce_u64: u64 = nonce.parse().unwrap_or(0);
+
+        // Convert side to EIP-712 format
+        let eip712_side = match params.side {
+            Side::Buy => SIDE_BUY,
+            Side::Sell => SIDE_SELL,
+        };
+
+        // Build EIP-712 order
+        let eip712_config = Eip712Config {
+            chain_id: self.wallet.chain_id(),
+            neg_risk: self.config.neg_risk,
+        };
+
+        let order = eip712::build_order(&eip712::BuildOrderParams {
+            maker_address: self.wallet.address(),
+            token_id: &params.token_id,
+            side: eip712_side,
+            price: params.price,
+            size: params.size,
+            expiration_secs,
+            nonce: nonce_u64,
+            fee_rate_bps: 0, // CLOB handles fees
+        })
+        .map_err(|e| ClobError::Signing(format!("Failed to build order: {}", e)))?;
+
+        // Sign the order
+        let signature =
+            eip712::sign_order(&order, &eip712_config, self.wallet.expose_private_key())
+                .map_err(|e| ClobError::Signing(format!("Failed to sign order: {}", e)))?;
 
         Ok(CreateOrderRequest {
             token_id: params.token_id.clone(),
@@ -793,7 +933,9 @@ impl ClobClient {
         response: CreateOrderResponse,
     ) -> Result<OrderResult, ClobError> {
         if !response.success {
-            let error_msg = response.error_msg.unwrap_or_else(|| "Unknown error".to_string());
+            let error_msg = response
+                .error_msg
+                .unwrap_or_else(|| "Unknown error".to_string());
             return Err(ClobError::OrderRejected(error_msg));
         }
 
@@ -831,7 +973,10 @@ impl ClobClient {
     }
 
     /// Parses order status response into OrderResult.
-    fn parse_status_response(&self, response: OrderStatusResponse) -> Result<OrderResult, ClobError> {
+    fn parse_status_response(
+        &self,
+        response: OrderStatusResponse,
+    ) -> Result<OrderResult, ClobError> {
         let status = match response.status.to_uppercase().as_str() {
             "FILLED" => OrderStatus::Filled,
             "PARTIAL" | "PARTIALLY_FILLED" => OrderStatus::PartiallyFilled,
@@ -842,7 +987,10 @@ impl ClobClient {
             _ => OrderStatus::Pending,
         };
 
-        let filled_size = response.size_matched.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+        let filled_size = response
+            .size_matched
+            .parse::<Decimal>()
+            .unwrap_or(Decimal::ZERO);
         let avg_price = response.price.and_then(|p| p.parse::<Decimal>().ok());
 
         Ok(OrderResult {
@@ -872,6 +1020,8 @@ impl std::fmt::Debug for ClobClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // Test private key (NOT REAL - for testing only)
     const TEST_PRIVATE_KEY: &str =
@@ -916,32 +1066,59 @@ mod tests {
 
     #[test]
     fn test_error_is_retryable() {
-        assert!(ClobError::RateLimited { retry_after_ms: 1000 }.is_retryable());
+        assert!(ClobError::RateLimited {
+            retry_after_ms: 1000
+        }
+        .is_retryable());
         assert!(ClobError::Timeout(Duration::from_secs(30)).is_retryable());
-        assert!(ClobError::Api { status: 500, message: "error".to_string() }.is_retryable());
-        assert!(ClobError::Api { status: 503, message: "error".to_string() }.is_retryable());
+        assert!(ClobError::Api {
+            status: 500,
+            message: "error".to_string()
+        }
+        .is_retryable());
+        assert!(ClobError::Api {
+            status: 503,
+            message: "error".to_string()
+        }
+        .is_retryable());
 
         // Not retryable
-        assert!(!ClobError::Api { status: 400, message: "bad request".to_string() }.is_retryable());
+        assert!(!ClobError::Api {
+            status: 400,
+            message: "bad request".to_string()
+        }
+        .is_retryable());
         assert!(!ClobError::Auth("auth failed".to_string()).is_retryable());
         assert!(!ClobError::OrderRejected("rejected".to_string()).is_retryable());
     }
 
     #[test]
     fn test_error_display() {
-        let err = ClobError::Api { status: 400, message: "Bad request".to_string() };
+        let err = ClobError::Api {
+            status: 400,
+            message: "Bad request".to_string(),
+        };
         assert!(err.to_string().contains("400"));
         assert!(err.to_string().contains("Bad request"));
 
-        let err = ClobError::RateLimited { retry_after_ms: 5000 };
+        let err = ClobError::RateLimited {
+            retry_after_ms: 5000,
+        };
         assert!(err.to_string().contains("5000"));
     }
 
     #[test]
     fn test_error_into_execution_error() {
-        let err = ClobError::RateLimited { retry_after_ms: 1000 };
+        let err = ClobError::RateLimited {
+            retry_after_ms: 1000,
+        };
         let exec_err = err.into_execution_error();
-        assert!(matches!(exec_err, ExecutionError::RateLimited { retry_after_secs: 1 }));
+        assert!(matches!(
+            exec_err,
+            ExecutionError::RateLimited {
+                retry_after_secs: 1
+            }
+        ));
 
         let err = ClobError::OrderRejected("no liquidity".to_string());
         let exec_err = err.into_execution_error();
@@ -1236,8 +1413,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_authenticate_sets_credentials() {
+        let mock_server = MockServer::start().await;
+
+        // Mock the derive-api-key endpoint to return valid credentials
+        Mock::given(method("GET"))
+            .and(path("/auth/derive-api-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "apiKey": "test-api-key-123",
+                "secret": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"test-secret-bytes"),
+                "passphrase": "test-passphrase"
+            })))
+            .mount(&mock_server)
+            .await;
+
         let wallet = test_wallet();
-        let mut client = ClobClient::mainnet(wallet).unwrap();
+        let config = ClobClientConfig::mainnet().with_base_url(&mock_server.uri());
+        let mut client = ClobClient::new(wallet, config).unwrap();
 
         assert!(!client.is_authenticated());
 

@@ -66,14 +66,17 @@
 
 pub mod auto_executor;
 pub mod book_feed;
-pub mod cross_market_auto_executor;
 pub mod circuit_breaker;
+pub mod clob_auth;
+pub mod correlation_tracker;
+pub mod cross_market_auto_executor;
 pub mod cross_market_detector;
 pub mod cross_market_runner;
 pub mod cross_market_settlement;
 pub mod cross_market_types;
 pub mod detector;
 pub mod dual_leg_executor;
+pub mod eip712;
 pub mod execution;
 pub mod gabagool_detector;
 pub mod gabagool_runner;
@@ -94,6 +97,7 @@ pub mod settlement;
 pub mod signer;
 pub mod spot_feed;
 pub mod types;
+pub mod wallet_signer;
 
 // Re-export main types for convenience
 pub use detector::ArbitrageDetector;
@@ -157,8 +161,7 @@ pub use spot_feed::{SpotFeedError, SpotFeedStats, SpotPriceFeed, SpotPriceFeedCo
 
 // Integrated latency arbitrage runner
 pub use latency_runner::{
-    run_latency_monitor, LatencyRunner, LatencyRunnerConfig, LatencyRunnerError,
-    LatencyRunnerStats,
+    run_latency_monitor, LatencyRunner, LatencyRunnerConfig, LatencyRunnerError, LatencyRunnerStats,
 };
 
 // Reference price tracking for windows
@@ -200,8 +203,8 @@ pub use presigned_orders::{
 // Cross-market correlation arbitrage
 pub use cross_market_detector::CrossMarketDetector;
 pub use cross_market_runner::{
-    run_cross_market_scanner, CrossMarketRunner, CrossMarketRunnerConfig,
-    CrossMarketRunnerError, CrossMarketRunnerStats,
+    run_cross_market_scanner, CrossMarketRunner, CrossMarketRunnerConfig, CrossMarketRunnerError,
+    CrossMarketRunnerStats,
 };
 pub use cross_market_settlement::{
     CrossMarketSettlementConfig, CrossMarketSettlementHandler, SettlementMode, SettlementStats,
@@ -209,6 +212,20 @@ pub use cross_market_settlement::{
 pub use cross_market_types::{
     CoinMarketSnapshot, CoinPair, CrossMarketCombination, CrossMarketConfig,
     CrossMarketOpportunity, CrossMarketStats, TokenDepth,
+};
+
+// EIP-712 order signing
+pub use eip712::{BuildOrderParams, Eip712Config, Eip712Error, Eip712Order};
+
+// CLOB authentication
+pub use clob_auth::{ApiCredentials, ClobAuthError, L1Headers, L2Auth, L2Headers};
+
+// Real wallet-backed order signer
+pub use wallet_signer::WalletSigner;
+
+// Dynamic correlation tracker
+pub use correlation_tracker::{
+    CorrelationEstimate, CorrelationObservation, CorrelationTracker, CorrelationTrackerConfig,
 };
 
 // Cross-market auto executor

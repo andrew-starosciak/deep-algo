@@ -83,7 +83,10 @@ pub enum AutoExecutorError {
 
     /// Insufficient balance.
     #[error("Insufficient balance: need {required}, have {available}")]
-    InsufficientBalance { required: Decimal, available: Decimal },
+    InsufficientBalance {
+        required: Decimal,
+        available: Decimal,
+    },
 
     /// Signal channel closed.
     #[error("Signal channel closed")]
@@ -568,7 +571,11 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
     /// If `persistence_path` is configured, attempts to load existing positions.
     /// Note: Positions will be validated against the current window on first signal.
     pub fn new(executor: E, config: AutoExecutorConfig) -> Self {
-        let sizer = KellySizer::new(config.kelly_fraction, config.min_bet_size, config.max_bet_size);
+        let sizer = KellySizer::new(
+            config.kelly_fraction,
+            config.min_bet_size,
+            config.max_bet_size,
+        );
 
         // Set up persistence if configured
         let persistence = config
@@ -617,8 +624,16 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
     /// Creates a new auto executor with a specific initial window.
     ///
     /// This loads persisted positions for the given window, clearing stale positions.
-    pub fn new_with_window(executor: E, config: AutoExecutorConfig, current_window_ms: i64) -> Self {
-        let sizer = KellySizer::new(config.kelly_fraction, config.min_bet_size, config.max_bet_size);
+    pub fn new_with_window(
+        executor: E,
+        config: AutoExecutorConfig,
+        current_window_ms: i64,
+    ) -> Self {
+        let sizer = KellySizer::new(
+            config.kelly_fraction,
+            config.min_bet_size,
+            config.max_bet_size,
+        );
 
         // Set up persistence if configured
         let persistence = config
@@ -870,8 +885,7 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
         let window_changed = {
             let mut pos = self.position.write().await;
             // Simple window tracking by signal timestamp
-            let signal_window_ms =
-                (signal.timestamp.timestamp_millis() / 900_000) * 900_000; // 15-min windows
+            let signal_window_ms = (signal.timestamp.timestamp_millis() / 900_000) * 900_000; // 15-min windows
 
             if signal_window_ms != pos.window_start_ms {
                 // New window - clear old positions
@@ -931,7 +945,10 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
         let bet_size = if let Some(fixed) = self.config.fixed_bet_size {
             fixed
         } else {
-            match self.sizer.size(signal.estimated_edge, signal.entry_price, balance) {
+            match self
+                .sizer
+                .size(signal.estimated_edge, signal.entry_price, balance)
+            {
                 Some(size) => size,
                 None => {
                     debug!("Kelly recommends no bet");
@@ -951,7 +968,10 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
         };
 
         if token_id.is_empty() {
-            warn!("Token ID not configured for direction {:?}", signal.direction);
+            warn!(
+                "Token ID not configured for direction {:?}",
+                signal.direction
+            );
             return Ok(());
         }
 
@@ -1050,7 +1070,10 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
         };
 
         if token_id.is_empty() {
-            warn!("Token ID not configured for direction {:?}", signal.direction);
+            warn!(
+                "Token ID not configured for direction {:?}",
+                signal.direction
+            );
             return Ok(());
         }
 
@@ -1148,7 +1171,10 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
         };
 
         if token_id.is_empty() {
-            warn!("Token ID not configured for direction {:?}", signal.direction);
+            warn!(
+                "Token ID not configured for direction {:?}",
+                signal.direction
+            );
             return Ok(());
         }
 
@@ -1254,9 +1280,8 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
         let mut writer = BufWriter::new(file);
 
         for record in history.iter() {
-            serde_json::to_writer(&mut writer, record).map_err(|e| {
-                std::io::Error::other(e.to_string())
-            })?;
+            serde_json::to_writer(&mut writer, record)
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
             writeln!(writer)?;
         }
 
@@ -1682,8 +1707,8 @@ mod tests {
 
     #[test]
     fn test_config_with_persistence_path() {
-        let config = AutoExecutorConfig::default()
-            .with_persistence_path("/tmp/test_positions.json");
+        let config =
+            AutoExecutorConfig::default().with_persistence_path("/tmp/test_positions.json");
 
         assert!(config.persistence_path.is_some());
         assert_eq!(
@@ -1767,8 +1792,7 @@ mod tests {
 
         // Create executor - should load position
         let executor = PaperExecutor::new(PaperExecutorConfig::default());
-        let auto_config = AutoExecutorConfig::default()
-            .with_persistence_path(&path);
+        let auto_config = AutoExecutorConfig::default().with_persistence_path(&path);
 
         let auto = AutoExecutor::new(executor, auto_config);
 
@@ -1802,8 +1826,7 @@ mod tests {
 
         // Create executor with DIFFERENT window - should clear stale position
         let executor = PaperExecutor::new(PaperExecutorConfig::default());
-        let auto_config = AutoExecutorConfig::default()
-            .with_persistence_path(&path);
+        let auto_config = AutoExecutorConfig::default().with_persistence_path(&path);
 
         let auto = AutoExecutor::new_with_window(executor, auto_config, 1_800_000); // New window
 
@@ -1836,8 +1859,7 @@ mod tests {
 
         // Create executor with SAME window - should preserve position
         let executor = PaperExecutor::new(PaperExecutorConfig::default());
-        let auto_config = AutoExecutorConfig::default()
-            .with_persistence_path(&path);
+        let auto_config = AutoExecutorConfig::default().with_persistence_path(&path);
 
         let auto = AutoExecutor::new_with_window(executor, auto_config, 900_000);
 

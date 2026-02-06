@@ -267,7 +267,11 @@ impl PreSignedPoolConfig {
             return 0;
         }
         let range = self.max_price - self.min_price;
-        ((range / self.price_step).to_string().parse::<f64>().unwrap_or(0.0) as usize) + 1
+        ((range / self.price_step)
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.0) as usize)
+            + 1
     }
 
     /// Generates all price levels.

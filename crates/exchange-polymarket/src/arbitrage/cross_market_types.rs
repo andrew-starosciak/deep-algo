@@ -218,7 +218,6 @@ pub struct CrossMarketOpportunity {
     pub detected_at: DateTime<Utc>,
 
     // === Order Book Depth Fields ===
-
     /// Leg 1 bid depth (total shares available).
     pub leg1_bid_depth: Option<Decimal>,
     /// Leg 1 ask depth (total shares available).
@@ -274,9 +273,7 @@ impl CrossMarketOpportunity {
             self.leg2_bid_depth,
             self.leg2_ask_depth,
         ) {
-            (Some(l1b), Some(l1a), Some(l2b), Some(l2a)) => {
-                Some(l1b.min(l1a).min(l2b).min(l2a))
-            }
+            (Some(l1b), Some(l1a), Some(l2b), Some(l2a)) => Some(l1b.min(l1a).min(l2b).min(l2a)),
             _ => None,
         }
     }
@@ -357,7 +354,7 @@ impl Default for CrossMarketConfig {
             min_expected_value: dec!(0.01),
             signal_cooldown_ms: 5_000,
             coins: vec![Coin::Btc, Coin::Eth, Coin::Sol, Coin::Xrp],
-            combinations: None, // All combinations
+            combinations: None,       // All combinations
             min_depth: Decimal::ZERO, // No depth filtering by default
         }
     }
@@ -452,7 +449,10 @@ impl CrossMarketStats {
         }
 
         // Track lowest cost
-        if self.lowest_cost_seen.map_or(true, |lowest| opp.total_cost < lowest) {
+        if self
+            .lowest_cost_seen
+            .map_or(true, |lowest| opp.total_cost < lowest)
+        {
             self.lowest_cost_seen = Some(opp.total_cost);
         }
     }
@@ -543,7 +543,10 @@ mod tests {
             (false, true)
         );
         assert_eq!(CrossMarketCombination::BothUp.directions(), (true, true));
-        assert_eq!(CrossMarketCombination::BothDown.directions(), (false, false));
+        assert_eq!(
+            CrossMarketCombination::BothDown.directions(),
+            (false, false)
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -658,10 +661,13 @@ mod tests {
     #[test]
     fn opportunity_roi_calculation() {
         let opp = make_opp(
-            "BTC", "ETH",
+            "BTC",
+            "ETH",
             CrossMarketCombination::Coin1UpCoin2Down,
-            "UP", dec!(0.05),
-            "DOWN", dec!(0.91),
+            "UP",
+            dec!(0.05),
+            "DOWN",
+            dec!(0.91),
         );
 
         // ROI = (1.00 - 0.96) / 0.96 = 0.04 / 0.96 ≈ 0.0417
@@ -673,10 +679,13 @@ mod tests {
     #[test]
     fn opportunity_roi_zero_cost_returns_zero() {
         let mut opp = make_opp(
-            "BTC", "ETH",
+            "BTC",
+            "ETH",
             CrossMarketCombination::BothUp,
-            "UP", Decimal::ZERO,
-            "UP", Decimal::ZERO,
+            "UP",
+            Decimal::ZERO,
+            "UP",
+            Decimal::ZERO,
         );
         opp.total_cost = Decimal::ZERO;
 
@@ -701,10 +710,13 @@ mod tests {
     fn stats_record_opportunity_increments_count() {
         let mut stats = CrossMarketStats::default();
         let opp = make_opp(
-            "BTC", "ETH",
+            "BTC",
+            "ETH",
             CrossMarketCombination::Coin1UpCoin2Down,
-            "UP", dec!(0.05),
-            "DOWN", dec!(0.91),
+            "UP",
+            dec!(0.05),
+            "DOWN",
+            dec!(0.91),
         );
 
         stats.record_opportunity(&opp);
@@ -721,17 +733,23 @@ mod tests {
         let mut stats = CrossMarketStats::default();
 
         let opp1 = make_opp(
-            "BTC", "ETH",
+            "BTC",
+            "ETH",
             CrossMarketCombination::Coin1UpCoin2Down,
-            "UP", dec!(0.10),
-            "DOWN", dec!(0.85),
+            "UP",
+            dec!(0.10),
+            "DOWN",
+            dec!(0.85),
         );
 
         let opp2 = make_opp(
-            "SOL", "XRP",
+            "SOL",
+            "XRP",
             CrossMarketCombination::BothDown,
-            "DOWN", dec!(0.05),
-            "DOWN", dec!(0.85),
+            "DOWN",
+            dec!(0.05),
+            "DOWN",
+            dec!(0.85),
         );
 
         stats.record_opportunity(&opp1);

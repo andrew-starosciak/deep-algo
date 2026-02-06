@@ -64,7 +64,9 @@ use crate::arbitrage::gabagool_detector::{
     GabagoolConfig, GabagoolDetector, GabagoolDirection, GabagoolSignal, GabagoolSignalType,
     MarketSnapshot, OpenPosition,
 };
-use crate::arbitrage::reference_tracker::{ReferenceTracker, ReferenceTrackerConfig, WindowReference};
+use crate::arbitrage::reference_tracker::{
+    ReferenceTracker, ReferenceTrackerConfig, WindowReference,
+};
 use crate::arbitrage::spot_feed::{SpotFeedError, SpotPriceFeedConfig};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -290,11 +292,12 @@ impl GabagoolRunner {
 
         // Write as JSONL (one JSON object per line)
         for record in history.iter() {
-            serde_json::to_writer(&mut writer, record)
-                .map_err(|e| GabagoolRunnerError::Io(std::io::Error::new(
+            serde_json::to_writer(&mut writer, record).map_err(|e| {
+                GabagoolRunnerError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     e.to_string(),
-                )))?;
+                ))
+            })?;
             writeln!(writer)?;
         }
 
@@ -383,8 +386,8 @@ impl GabagoolRunner {
         should_stop: Arc<AtomicBool>,
         stats: Arc<RwLock<GabagoolRunnerStats>>,
     ) -> Result<(), SpotFeedError> {
-        use tokio_tungstenite::connect_async;
         use futures_util::StreamExt;
+        use tokio_tungstenite::connect_async;
 
         // Try spot API first, fall back to futures if geo-blocked
         let spot_url = format!(
@@ -519,9 +522,8 @@ impl GabagoolRunner {
             };
 
             // Helper to check if we should log a warning (rate limited)
-            let should_warn = || {
-                last_warning_time.map_or(true, |t| t.elapsed() >= warning_interval)
-            };
+            let should_warn =
+                || last_warning_time.map_or(true, |t| t.elapsed() >= warning_interval);
 
             // Get best prices
             let yes_ask = match yes_book.best_ask() {

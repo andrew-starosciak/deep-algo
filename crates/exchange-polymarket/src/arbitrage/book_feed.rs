@@ -264,7 +264,10 @@ impl BookFeedManager {
     }
 
     /// Gets books for a specific market.
-    pub fn get_books(&self, condition_id: &str) -> Result<(L2OrderBook, L2OrderBook), BookFeedError> {
+    pub fn get_books(
+        &self,
+        condition_id: &str,
+    ) -> Result<(L2OrderBook, L2OrderBook), BookFeedError> {
         self.feeds
             .get(condition_id)
             .ok_or(BookFeedError::NotReady)?
@@ -272,7 +275,10 @@ impl BookFeedManager {
     }
 
     /// Waits for all feeds to be ready.
-    pub async fn wait_for_all_ready(&self, timeout_duration: Duration) -> Result<(), BookFeedError> {
+    pub async fn wait_for_all_ready(
+        &self,
+        timeout_duration: Duration,
+    ) -> Result<(), BookFeedError> {
         for (condition_id, feed) in &self.feeds {
             feed.wait_for_ready(timeout_duration).await.map_err(|e| {
                 warn!(condition_id = %condition_id, error = %e, "Feed not ready");

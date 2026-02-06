@@ -80,12 +80,12 @@ impl GabagoolConfig {
     #[must_use]
     pub fn aggressive() -> Self {
         Self {
-            cheap_threshold: dec!(0.48),     // Enter at almost fair value
-            min_reference_delta: 0.0002,     // 0.02% (~$15 on $78k)
+            cheap_threshold: dec!(0.48), // Enter at almost fair value
+            min_reference_delta: 0.0002, // 0.02% (~$15 on $78k)
             pair_cost_threshold: dec!(0.98),
-            scratch_time_secs: 120,          // 2 minutes
+            scratch_time_secs: 120, // 2 minutes
             scratch_loss_limit: dec!(0.03),
-            min_window_elapsed_ms: 15_000,   // 15 seconds
+            min_window_elapsed_ms: 15_000, // 15 seconds
             min_reference_confidence: ReferenceConfidence::Low,
         }
     }
@@ -95,12 +95,12 @@ impl GabagoolConfig {
     #[must_use]
     pub fn conservative() -> Self {
         Self {
-            cheap_threshold: dec!(0.35),     // Only enter on significant mispricing
-            min_reference_delta: 0.0005,     // 0.05% (~$39 on $78k)
+            cheap_threshold: dec!(0.35), // Only enter on significant mispricing
+            min_reference_delta: 0.0005, // 0.05% (~$39 on $78k)
             pair_cost_threshold: dec!(0.95),
-            scratch_time_secs: 300,          // 5 minutes
+            scratch_time_secs: 300, // 5 minutes
             scratch_loss_limit: dec!(0.01),
-            min_window_elapsed_ms: 60_000,   // 1 minute
+            min_window_elapsed_ms: 60_000, // 1 minute
             min_reference_confidence: ReferenceConfidence::High,
         }
     }
@@ -450,10 +450,7 @@ impl GabagoolDetector {
         // - At min_delta (0.05%), we have weak confirmation ~55%
         // - At 2x min_delta, stronger ~65%
         // - At 3x+ min_delta, cap at ~80%
-        let entry_price_f64 = entry_price
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(0.5);
+        let entry_price_f64 = entry_price.to_string().parse::<f64>().unwrap_or(0.5);
         let delta_ratio = (abs_delta / self.config.min_reference_delta).min(3.0);
         let win_prob = 0.50 + 0.10 * delta_ratio; // 55% to 80%
         let estimated_edge = win_prob - entry_price_f64;
@@ -501,10 +498,7 @@ impl GabagoolDetector {
 
         // Calculate locked profit per pair
         let profit_per_pair = Decimal::ONE - effective_pair_cost;
-        let profit_f64 = profit_per_pair
-            .to_string()
-            .parse::<f64>()
-            .unwrap_or(0.0);
+        let profit_f64 = profit_per_pair.to_string().parse::<f64>().unwrap_or(0.0);
 
         Some(GabagoolSignal {
             signal_type: GabagoolSignalType::Hedge,
@@ -559,7 +553,7 @@ impl GabagoolDetector {
         Some(GabagoolSignal {
             signal_type: GabagoolSignalType::Scratch,
             direction: position.direction, // Same direction (selling)
-            entry_price: exit_price, // Exit price
+            entry_price: exit_price,       // Exit price
             spot_price,
             reference_price: reference.reference_price,
             spot_delta_pct,
@@ -614,8 +608,8 @@ mod tests {
         let spot_price = 78_078.0; // +0.1% above reference
 
         let market = MarketSnapshot::from_asks(
-            dec!(0.30), // YES cheap
-            dec!(0.70), // NO expensive
+            dec!(0.30),      // YES cheap
+            dec!(0.70),      // NO expensive
             make_time(5, 0), // 5 min into window
         );
 
@@ -999,7 +993,10 @@ mod tests {
 
         let signal1 = detector.check(&reference, spot1, &market1);
         assert!(signal1.is_some());
-        assert_eq!(signal1.as_ref().unwrap().signal_type, GabagoolSignalType::Entry);
+        assert_eq!(
+            signal1.as_ref().unwrap().signal_type,
+            GabagoolSignalType::Entry
+        );
         assert_eq!(signal1.unwrap().direction, GabagoolDirection::Yes);
 
         // Record the entry

@@ -218,9 +218,8 @@ impl GammaClient {
         window_end: DateTime<Utc>,
     ) -> Result<Option<String>> {
         // Calculate the window start timestamp (window_end - 15 minutes, rounded to window boundary)
-        let window_timestamp = Self::calculate_window_timestamp(
-            window_end - chrono::Duration::minutes(15)
-        );
+        let window_timestamp =
+            Self::calculate_window_timestamp(window_end - chrono::Duration::minutes(15));
         let slug = Self::generate_event_slug(coin, window_timestamp);
         let path = format!("/events?slug={}", slug);
 

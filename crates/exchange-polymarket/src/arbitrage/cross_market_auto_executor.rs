@@ -233,7 +233,10 @@ impl CrossMarketExecutionResult {
     /// Returns true if there was a partial fill (exposure created).
     #[must_use]
     pub fn is_partial(&self) -> bool {
-        matches!(self, Self::Leg1OnlyFilled { .. } | Self::Leg2OnlyFilled { .. })
+        matches!(
+            self,
+            Self::Leg1OnlyFilled { .. } | Self::Leg2OnlyFilled { .. }
+        )
     }
 }
 
@@ -703,10 +706,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             config.max_bet_size,
         );
 
-        let session_id = format!(
-            "auto-{}",
-            Utc::now().format("%Y%m%d-%H%M%S")
-        );
+        let session_id = format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S"));
 
         Self {
             executor,
@@ -739,9 +739,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             config.max_bet_size,
         );
 
-        let session_id = session_id.unwrap_or_else(|| {
-            format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S"))
-        });
+        let session_id =
+            session_id.unwrap_or_else(|| format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S")));
 
         Self {
             executor,
@@ -928,7 +927,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let bet_per_leg = if let Some(fixed) = self.config.fixed_bet_size {
             fixed
         } else {
-            match self.sizer.size(opp.win_probability, opp.total_cost, balance) {
+            match self
+                .sizer
+                .size(opp.win_probability, opp.total_cost, balance)
+            {
                 Some(size) => size,
                 None => {
                     debug!("Kelly recommends no bet");
@@ -1033,7 +1035,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             FilledLeg::Leg1 => IncompleteTrade {
                 trade_id: format!(
                     "incomplete-{}-{}-{}",
-                    opp.coin1, opp.coin2, opp.detected_at.timestamp_millis()
+                    opp.coin1,
+                    opp.coin2,
+                    opp.detected_at.timestamp_millis()
                 ),
                 filled_leg,
                 coin1: opp.coin1.clone(),
@@ -1053,7 +1057,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             FilledLeg::Leg2 => IncompleteTrade {
                 trade_id: format!(
                     "incomplete-{}-{}-{}",
-                    opp.coin1, opp.coin2, opp.detected_at.timestamp_millis()
+                    opp.coin1,
+                    opp.coin2,
+                    opp.detected_at.timestamp_millis()
                 ),
                 filled_leg,
                 coin1: opp.coin1.clone(),
@@ -1199,7 +1205,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     // Increment retry count
                     {
                         let mut incomplete = self.incomplete_trades.write().await;
-                        if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
+                        if let Some(t) =
+                            incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id)
+                        {
                             t.retry_count += 1;
                         }
                     }
@@ -1399,15 +1407,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             stats.last_latency_ms = latency_ms;
             stats.latency_samples += 1;
             // Running average
-            stats.avg_latency_ms = ((stats.avg_latency_ms * (stats.latency_samples - 1)) + latency_ms) / stats.latency_samples;
+            stats.avg_latency_ms = ((stats.avg_latency_ms * (stats.latency_samples - 1))
+                + latency_ms)
+                / stats.latency_samples;
         }
 
         if results.len() != 2 {
             return Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!(
-                    "Expected 2 results, got {}",
-                    results.len()
-                )),
+                ExecutionError::rejected(format!("Expected 2 results, got {}", results.len())),
             ));
         }
 
@@ -1540,11 +1547,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 leg1_result,
                 leg2_result,
                 ..
-            } => (
-                leg1_result.avg_fill_price,
-                leg2_result.avg_fill_price,
-                true,
-            ),
+            } => (leg1_result.avg_fill_price, leg2_result.avg_fill_price, true),
             CrossMarketExecutionResult::Leg1OnlyFilled { leg1_result, .. } => {
                 (leg1_result.avg_fill_price, None, true)
             }
@@ -1631,11 +1634,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 );
                 Ok(())
             }
-            Err(e) => {
-                Err(CrossMarketAutoExecutorError::Execution(
-                    ExecutionError::rejected(format!("Database error: {}", e)),
-                ))
-            }
+            Err(e) => Err(CrossMarketAutoExecutorError::Execution(
+                ExecutionError::rejected(format!("Database error: {}", e)),
+            )),
         }
     }
 
@@ -1644,11 +1645,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     // =========================================================================
 
     /// Adds a successful trade to pending settlements for paper trading.
-    async fn add_pending_settlement(
-        &self,
-        opp: &CrossMarketOpportunity,
-        shares: Decimal,
-    ) {
+    async fn add_pending_settlement(&self, opp: &CrossMarketOpportunity, shares: Decimal) {
         // Calculate window end
         let window_end = {
             let ts = opp.detected_at.timestamp();
@@ -1671,7 +1668,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             leg2_direction: opp.leg2_direction.clone(),
             leg1_token_id: opp.leg1_token_id.clone(),
             leg2_token_id: opp.leg2_token_id.clone(),
-            total_cost: opp.total_cost * shares,  // Actual USDC spent, not pair ratio
+            total_cost: opp.total_cost * shares, // Actual USDC spent, not pair ratio
             shares,
             window_end,
             executed_at: Utc::now(),
@@ -1708,7 +1705,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // Find trades with closed windows
         let trades_to_check: Vec<PendingPaperSettlement> = {
             let pending = self.pending_settlements.read().await;
-            pending.iter()
+            pending
+                .iter()
                 .filter(|s| now > s.window_end) // Window has closed
                 .cloned()
                 .collect()
@@ -1768,7 +1766,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 );
 
                 // Finalize
-                self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
+                self.finalize_settlement(&settlement, leg1_won, leg2_won)
+                    .await;
 
                 // Remove from pending
                 {
@@ -1777,7 +1776,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
                     let mut stats = self.stats.write().await;
                     stats.pending_settlement = pending.len() as u64;
-                    stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
+                    stats
+                        .pending_trades
+                        .retain(|t| t.trade_id != settlement.trade_id);
                 }
 
                 settled_count += 1;
@@ -1803,7 +1804,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 token_ids.join(",")
             );
 
-            let response = match self.http_client.get(&url)
+            let response = match self
+                .http_client
+                .get(&url)
                 .header("Accept", "application/json")
                 .send()
                 .await
@@ -1838,18 +1841,21 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
             };
 
-            let prices: std::collections::HashMap<String, PriceResponse> = match serde_json::from_str(&body) {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(error = %e, body = %body, "Failed to parse CLOB prices JSON");
-                    continue;
-                }
-            };
+            let prices: std::collections::HashMap<String, PriceResponse> =
+                match serde_json::from_str(&body) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(error = %e, body = %body, "Failed to parse CLOB prices JSON");
+                        continue;
+                    }
+                };
 
             // Parse prices - these are the specific token prices
-            let leg1_price = prices.get(&settlement.leg1_token_id)
+            let leg1_price = prices
+                .get(&settlement.leg1_token_id)
                 .and_then(|p| Decimal::from_str(&p.price).ok());
-            let leg2_price = prices.get(&settlement.leg2_token_id)
+            let leg2_price = prices
+                .get(&settlement.leg2_token_id)
                 .and_then(|p| Decimal::from_str(&p.price).ok());
 
             if let (Some(p1), Some(p2)) = (leg1_price, leg2_price) {
@@ -1866,7 +1872,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     "SETTLING via CLOB token prices"
                 );
 
-                self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
+                self.finalize_settlement(&settlement, leg1_won, leg2_won)
+                    .await;
 
                 {
                     let mut pending = self.pending_settlements.write().await;
@@ -1874,7 +1881,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
                     let mut stats = self.stats.write().await;
                     stats.pending_settlement = pending.len() as u64;
-                    stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
+                    stats
+                        .pending_trades
+                        .retain(|t| t.trade_id != settlement.trade_id);
                 }
 
                 settled_count += 1;
@@ -1897,7 +1906,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     ) -> Result<u64, CrossMarketAutoExecutorError> {
         let now = Utc::now();
         let threshold_high = dec!(0.90); // If price > 0.90, consider it a winner
-        let threshold_low = dec!(0.10);  // If price < 0.10, consider it a loser
+        let threshold_low = dec!(0.10); // If price < 0.10, consider it a loser
 
         let mut settled_count = 0u64;
 
@@ -1924,7 +1933,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     } else if *c1_up < threshold_low {
                         Some("DOWN") // If UP is near 0, DOWN won
                     } else if *c1_down < threshold_low {
-                        Some("UP")   // If DOWN is near 0, UP won
+                        Some("UP") // If DOWN is near 0, UP won
                     } else {
                         None // Prices not decisive yet
                     };
@@ -1965,7 +1974,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             );
 
             // Calculate P&L and update stats
-            self.finalize_settlement(&settlement, leg1_won, leg2_won).await;
+            self.finalize_settlement(&settlement, leg1_won, leg2_won)
+                .await;
 
             // Remove from pending
             {
@@ -1975,7 +1985,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 let mut stats = self.stats.write().await;
                 stats.pending_settlement = pending.len() as u64;
                 // Also remove from pending display
-                stats.pending_trades.retain(|t| t.trade_id != settlement.trade_id);
+                stats
+                    .pending_trades
+                    .retain(|t| t.trade_id != settlement.trade_id);
             }
 
             settled_count += 1;
@@ -2019,12 +2031,19 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         if to_settle.is_empty() {
             if waiting_count > 0 {
-                debug!(waiting = waiting_count, "No trades ready, {} still waiting", waiting_count);
+                debug!(
+                    waiting = waiting_count,
+                    "No trades ready, {} still waiting", waiting_count
+                );
             }
             return Ok(());
         }
 
-        info!(ready = to_settle.len(), waiting = waiting_count, "Settling ready trades");
+        info!(
+            ready = to_settle.len(),
+            waiting = waiting_count,
+            "Settling ready trades"
+        );
 
         for settlement in to_settle {
             info!(
@@ -2104,7 +2123,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         };
 
-        self.finalize_settlement(settlement, leg1_won, leg2_won).await;
+        self.finalize_settlement(settlement, leg1_won, leg2_won)
+            .await;
         Ok(())
     }
 
@@ -2263,9 +2283,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("HTTP error: {}", e)),
-            ))?;
+            .map_err(|e| {
+                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
+                    "HTTP error: {}",
+                    e
+                )))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -2276,12 +2299,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         // Parse klines: [open_time, open, high, low, close, volume, close_time, ...]
-        let klines: Vec<Vec<serde_json::Value>> = response
-            .json()
-            .await
-            .map_err(|e| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("JSON parse error: {}", e)),
-            ))?;
+        let klines: Vec<Vec<serde_json::Value>> = response.json().await.map_err(|e| {
+            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
+                "JSON parse error: {}",
+                e
+            )))
+        })?;
 
         if klines.is_empty() {
             warn!(symbol = symbol, "No candles returned from Binance");
@@ -2290,21 +2313,21 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         // Get the first candle's open price
         let first_kline = &klines[0];
-        let open_str = first_kline.get(1)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Invalid first kline open price".to_string()),
-            ))?;
+        let open_str = first_kline.get(1).and_then(|v| v.as_str()).ok_or_else(|| {
+            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
+                "Invalid first kline open price".to_string(),
+            ))
+        })?;
 
         // Get the last candle's close price
         let last_kline = &klines[klines.len() - 1];
 
         // Check if the last kline is closed (close_time < now)
-        let close_time_ms = last_kline.get(6)
-            .and_then(|v| v.as_i64())
-            .ok_or_else(|| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Invalid kline close_time".to_string()),
-            ))?;
+        let close_time_ms = last_kline.get(6).and_then(|v| v.as_i64()).ok_or_else(|| {
+            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
+                "Invalid kline close_time".to_string(),
+            ))
+        })?;
 
         let now_ms = Utc::now().timestamp_millis();
         if close_time_ms > now_ms {
@@ -2317,21 +2340,21 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             return Ok(None); // Window not fully closed yet
         }
 
-        let close_str = last_kline.get(4)
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Invalid last kline close price".to_string()),
-            ))?;
+        let close_str = last_kline.get(4).and_then(|v| v.as_str()).ok_or_else(|| {
+            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
+                "Invalid last kline close price".to_string(),
+            ))
+        })?;
 
         let open: f64 = open_str.parse().map_err(|_| {
-            CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Invalid open price format".to_string()),
-            )
+            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
+                "Invalid open price format".to_string(),
+            ))
         })?;
         let close: f64 = close_str.parse().map_err(|_| {
-            CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Invalid close price format".to_string()),
-            )
+            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
+                "Invalid close price format".to_string(),
+            ))
         })?;
 
         // UP if close > open, DOWN otherwise
@@ -2383,15 +2406,29 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         };
 
         // Get outcomes from Gamma API
-        let c1_outcome = self.gamma_client.get_market_outcome(coin1, settlement.window_end).await
-            .map_err(|e| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("Gamma API error for {}: {}", coin1.slug_prefix(), e)),
-            ))?;
+        let c1_outcome = self
+            .gamma_client
+            .get_market_outcome(coin1, settlement.window_end)
+            .await
+            .map_err(|e| {
+                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
+                    "Gamma API error for {}: {}",
+                    coin1.slug_prefix(),
+                    e
+                )))
+            })?;
 
-        let c2_outcome = self.gamma_client.get_market_outcome(coin2, settlement.window_end).await
-            .map_err(|e| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("Gamma API error for {}: {}", coin2.slug_prefix(), e)),
-            ))?;
+        let c2_outcome = self
+            .gamma_client
+            .get_market_outcome(coin2, settlement.window_end)
+            .await
+            .map_err(|e| {
+                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
+                    "Gamma API error for {}: {}",
+                    coin2.slug_prefix(),
+                    e
+                )))
+            })?;
 
         match (c1_outcome, c2_outcome) {
             (Some(c1), Some(c2)) => {
@@ -2412,7 +2449,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 Ok((leg1_won, leg2_won))
             }
             _ => Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Market outcomes not yet available from Gamma".to_string()),
+                ExecutionError::rejected(
+                    "Market outcomes not yet available from Gamma".to_string(),
+                ),
             )),
         }
     }
@@ -2438,9 +2477,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             .header("Accept", "application/json")
             .send()
             .await
-            .map_err(|e| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("HTTP error: {}", e)),
-            ))?;
+            .map_err(|e| {
+                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
+                    "HTTP error: {}",
+                    e
+                )))
+            })?;
 
         if !response.status().is_success() {
             return Err(CrossMarketAutoExecutorError::Execution(
@@ -2448,26 +2490,35 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             ));
         }
 
-        let prices: std::collections::HashMap<String, serde_json::Value> = response
-            .json()
-            .await
-            .map_err(|e| CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("JSON parse error: {}", e)),
-            ))?;
+        let prices: std::collections::HashMap<String, serde_json::Value> =
+            response.json().await.map_err(|e| {
+                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
+                    "JSON parse error: {}",
+                    e
+                )))
+            })?;
 
         let leg1_price = prices
             .get(&settlement.leg1_token_id)
             .and_then(|v| v.get("price").or(v.get("mid")))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| prices.get(&settlement.leg1_token_id).and_then(|v| v.as_f64()));
+            .or_else(|| {
+                prices
+                    .get(&settlement.leg1_token_id)
+                    .and_then(|v| v.as_f64())
+            });
 
         let leg2_price = prices
             .get(&settlement.leg2_token_id)
             .and_then(|v| v.get("price").or(v.get("mid")))
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| prices.get(&settlement.leg2_token_id).and_then(|v| v.as_f64()));
+            .or_else(|| {
+                prices
+                    .get(&settlement.leg2_token_id)
+                    .and_then(|v| v.as_f64())
+            });
 
         match (leg1_price, leg2_price) {
             (Some(p1), Some(p2)) => {
@@ -2497,8 +2548,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let window_end = settlement.window_end;
         let window_start = window_end - chrono::Duration::minutes(15);
 
-        let c1_outcome = self.get_coin_outcome(&settlement.coin1, window_start, window_end).await?;
-        let c2_outcome = self.get_coin_outcome(&settlement.coin2, window_start, window_end).await?;
+        let c1_outcome = self
+            .get_coin_outcome(&settlement.coin1, window_start, window_end)
+            .await?;
+        let c2_outcome = self
+            .get_coin_outcome(&settlement.coin2, window_start, window_end)
+            .await?;
 
         match (c1_outcome, c2_outcome) {
             (Some(c1), Some(c2)) => {
@@ -2735,19 +2790,13 @@ mod tests {
         let auto_config = CrossMarketAutoExecutorConfig::btc_eth_only();
         let auto = CrossMarketAutoExecutor::new(executor, auto_config);
 
-        assert_eq!(
-            auto.config().filter_pair,
-            Some((Coin::Btc, Coin::Eth))
-        );
+        assert_eq!(auto.config().filter_pair, Some((Coin::Btc, Coin::Eth)));
     }
 
     #[tokio::test]
     async fn test_auto_executor_stop_handle() {
         let executor = PaperExecutor::new(PaperExecutorConfig::default());
-        let auto = CrossMarketAutoExecutor::new(
-            executor,
-            CrossMarketAutoExecutorConfig::default(),
-        );
+        let auto = CrossMarketAutoExecutor::new(executor, CrossMarketAutoExecutorConfig::default());
 
         let stop = auto.stop_handle();
         assert!(!stop.load(Ordering::SeqCst));
@@ -2792,8 +2841,7 @@ mod tests {
         };
         let executor = PaperExecutor::new(paper_config);
 
-        let auto_config = CrossMarketAutoExecutorConfig::btc_eth_only()
-            .with_fixed_bet(dec!(20));
+        let auto_config = CrossMarketAutoExecutorConfig::btc_eth_only().with_fixed_bet(dec!(20));
 
         let mut auto = CrossMarketAutoExecutor::new(executor, auto_config);
 
@@ -2885,8 +2933,7 @@ mod tests {
         let executor = PaperExecutor::new(paper_config);
 
         // Fixed bet of $20 per leg = $40 total per opportunity
-        let auto_config = CrossMarketAutoExecutorConfig::btc_eth_only()
-            .with_fixed_bet(dec!(20));
+        let auto_config = CrossMarketAutoExecutorConfig::btc_eth_only().with_fixed_bet(dec!(20));
 
         let mut auto = CrossMarketAutoExecutor::new(executor, auto_config);
 
@@ -2907,6 +2954,9 @@ mod tests {
 
         // Should be skipped due to position limit
         let stats = auto.stats.read().await;
-        assert_eq!(stats.opportunities_skipped, 1, "Should skip due to position limit");
+        assert_eq!(
+            stats.opportunities_skipped, 1,
+            "Should skip due to position limit"
+        );
     }
 }

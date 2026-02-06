@@ -224,8 +224,7 @@ impl ReferenceTracker {
     #[must_use]
     pub fn window_start_for_time(timestamp_ms: i64) -> i64 {
         // Windows start at 00, 15, 30, 45 minutes
-        let dt = DateTime::from_timestamp_millis(timestamp_ms)
-            .unwrap_or_else(Utc::now);
+        let dt = DateTime::from_timestamp_millis(timestamp_ms).unwrap_or_else(Utc::now);
 
         let minute = dt.minute();
         let window_minute = (minute / 15) * 15;
@@ -299,12 +298,7 @@ impl ReferenceTracker {
             }
         };
 
-        let reference = WindowReference::new(
-            window_start_ms,
-            price,
-            source,
-            current_time_ms,
-        );
+        let reference = WindowReference::new(window_start_ms, price, source, current_time_ms);
 
         info!(
             window_start = window_start_ms,
@@ -339,7 +333,8 @@ impl ReferenceTracker {
         let window_start = around_timestamp_ms;
         let window_end = around_timestamp_ms + self.config.vwap_window_ms;
 
-        let prices: Vec<f64> = self.recent_prices
+        let prices: Vec<f64> = self
+            .recent_prices
             .iter()
             .filter(|(ts, _)| *ts >= window_start && *ts <= window_end)
             .map(|(_, price)| *price)
@@ -380,13 +375,17 @@ impl ReferenceTracker {
         actual_outcome_is_yes: bool,
     ) -> Option<bool> {
         // Find the reference for this window
-        let reference = if self.current_reference.as_ref()
+        let reference = if self
+            .current_reference
+            .as_ref()
             .map(|r| r.window_start_ms == window_start_ms)
             .unwrap_or(false)
         {
             self.current_reference.as_ref()
         } else {
-            self.history.iter().find(|r| r.window_start_ms == window_start_ms)
+            self.history
+                .iter()
+                .find(|r| r.window_start_ms == window_start_ms)
         };
 
         reference.map(|r| {
@@ -532,11 +531,17 @@ mod tests {
         );
 
         // At window start: 15 minutes remaining
-        assert_eq!(reference.time_remaining_ms(window_start), WINDOW_DURATION_MS);
+        assert_eq!(
+            reference.time_remaining_ms(window_start),
+            WINDOW_DURATION_MS
+        );
 
         // At 15:07:30: 7.5 minutes remaining
         let mid_point = make_time(15, 7, 30);
-        assert_eq!(reference.time_remaining_ms(mid_point), 7 * 60 * 1000 + 30 * 1000);
+        assert_eq!(
+            reference.time_remaining_ms(mid_point),
+            7 * 60 * 1000 + 30 * 1000
+        );
 
         // At window end: 0 remaining
         let end_time = make_time(15, 15, 0);
@@ -617,7 +622,10 @@ mod tests {
             tracker.current_reference().unwrap().window_start_ms,
             window1_start
         );
-        assert_eq!(tracker.current_reference().unwrap().reference_price, 78500.0);
+        assert_eq!(
+            tracker.current_reference().unwrap().reference_price,
+            78500.0
+        );
 
         // Transition to second window
         tracker.update_price(window2_start, 78700.0);
@@ -625,7 +633,10 @@ mod tests {
             tracker.current_reference().unwrap().window_start_ms,
             window2_start
         );
-        assert_eq!(tracker.current_reference().unwrap().reference_price, 78700.0);
+        assert_eq!(
+            tracker.current_reference().unwrap().reference_price,
+            78700.0
+        );
 
         // First window should be in history
         assert_eq!(tracker.history().len(), 1);
@@ -665,7 +676,8 @@ mod tests {
             78484.41, // Exact "price to beat" from Polymarket
             ReferenceSource::Manual,
             make_time(15, 0, 0),
-        ).with_confidence(ReferenceConfidence::High);
+        )
+        .with_confidence(ReferenceConfidence::High);
 
         tracker.set_reference(reference);
 

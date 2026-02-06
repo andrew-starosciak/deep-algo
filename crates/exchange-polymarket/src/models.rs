@@ -262,6 +262,20 @@ impl Coin {
     pub fn all() -> &'static [Coin] {
         &[Coin::Btc, Coin::Eth, Coin::Sol, Coin::Xrp]
     }
+
+    /// Parses a coin from its slug prefix string.
+    ///
+    /// Accepts lowercase slug prefixes: "btc", "eth", "sol", "xrp".
+    #[must_use]
+    pub fn from_slug(s: &str) -> Option<Coin> {
+        match s.to_lowercase().as_str() {
+            "btc" | "bitcoin" => Some(Coin::Btc),
+            "eth" | "ethereum" => Some(Coin::Eth),
+            "sol" | "solana" => Some(Coin::Sol),
+            "xrp" | "ripple" => Some(Coin::Xrp),
+            _ => None,
+        }
+    }
 }
 
 /// Gamma API event response (contains markets).

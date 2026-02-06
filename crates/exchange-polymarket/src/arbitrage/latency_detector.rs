@@ -278,8 +278,8 @@ pub struct LatencyConfig {
 impl Default for LatencyConfig {
     fn default() -> Self {
         Self {
-            min_reference_delta: 0.0005, // 0.05% (~$39 on $78k BTC)
-            max_entry_price: dec!(0.45), // $0.45 (gabagool enters at $0.41)
+            min_reference_delta: 0.0005,   // 0.05% (~$39 on $78k BTC)
+            max_entry_price: dec!(0.45),   // $0.45 (gabagool enters at $0.41)
             min_window_elapsed_ms: 30_000, // Wait 30 seconds into window
             min_time_remaining_ms: 60_000, // Need at least 1 minute left
         }
@@ -291,8 +291,8 @@ impl LatencyConfig {
     #[must_use]
     pub fn aggressive() -> Self {
         Self {
-            min_reference_delta: 0.0002, // 0.02% (~$16 on $78k BTC)
-            max_entry_price: dec!(0.48), // Almost any mispricing
+            min_reference_delta: 0.0002,   // 0.02% (~$16 on $78k BTC)
+            max_entry_price: dec!(0.48),   // Almost any mispricing
             min_window_elapsed_ms: 15_000, // Enter after 15 seconds
             min_time_remaining_ms: 30_000, // Can enter with 30 sec left
         }
@@ -304,7 +304,7 @@ impl LatencyConfig {
         Self {
             min_reference_delta: 0.001, // 0.1% (~$78 on $78k BTC)
             max_entry_price: dec!(0.40),
-            min_window_elapsed_ms: 60_000, // Wait 1 minute into window
+            min_window_elapsed_ms: 60_000,  // Wait 1 minute into window
             min_time_remaining_ms: 120_000, // Need at least 2 minutes left
         }
     }
@@ -627,7 +627,10 @@ mod tests {
 
         // 1 minute in, 14 minutes remaining
         tracker.update(78_100.0, 60_000);
-        assert_eq!(tracker.time_remaining_ms(), Some(WINDOW_DURATION_MS - 60_000));
+        assert_eq!(
+            tracker.time_remaining_ms(),
+            Some(WINDOW_DURATION_MS - 60_000)
+        );
         assert_eq!(tracker.time_remaining_secs(), Some(14 * 60)); // 840 seconds
     }
 
@@ -776,10 +779,15 @@ mod tests {
         let mut tracker = SpotPriceTracker::new();
 
         tracker.update(78_000.0, 0); // Reference at window start
-        // 14.5 minutes in, only 30 sec left
+                                     // 14.5 minutes in, only 30 sec left
         tracker.update(78_100.0, WINDOW_DURATION_MS - 30_000);
 
-        let signal = detector.check(&tracker, dec!(0.30), dec!(0.70), WINDOW_DURATION_MS - 30_000);
+        let signal = detector.check(
+            &tracker,
+            dec!(0.30),
+            dec!(0.70),
+            WINDOW_DURATION_MS - 30_000,
+        );
         assert!(signal.is_none()); // Too late
     }
 
@@ -1006,7 +1014,9 @@ mod tests {
         tracker.update(78_000.0, 0);
         tracker.update(78_100.0, 300_000); // 5 minutes in
 
-        let signal = detector.check(&tracker, dec!(0.30), dec!(0.70), 300_000).unwrap();
+        let signal = detector
+            .check(&tracker, dec!(0.30), dec!(0.70), 300_000)
+            .unwrap();
 
         // 5 min in = 10 min remaining = 600 sec
         assert_eq!(signal.time_remaining_secs, 600);

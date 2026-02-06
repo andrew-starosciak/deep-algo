@@ -24,7 +24,10 @@ use tracing::{debug, error, info, warn};
 use algo_trade_data::models::CrossMarketOpportunityRecord;
 use algo_trade_data::repositories::CrossMarketRepository;
 
+use super::correlation_tracker::CorrelationTracker;
+use super::cross_market_types::CoinPair;
 use super::sdk_client::ClobClient;
+use crate::models::Coin;
 
 /// Settlement mode determines how outcomes are resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -60,7 +63,7 @@ impl Default for CrossMarketSettlementConfig {
     fn default() -> Self {
         Self {
             mode: SettlementMode::Paper,
-            settlement_delay_ms: 120_000,       // 2 minutes
+            settlement_delay_ms: 120_000, // 2 minutes
             batch_size: 50,
             poll_interval_ms: 30_000,           // 30 seconds
             fee_rate: dec!(0.02),               // 2% fee
@@ -185,6 +188,8 @@ pub struct CrossMarketSettlementHandler {
     stop_flag: Arc<AtomicBool>,
     /// Statistics.
     stats: Arc<RwLock<SettlementStats>>,
+    /// Dynamic correlation tracker (updated on each settlement).
+    correlation_tracker: Option<Arc<CorrelationTracker>>,
 }
 
 impl CrossMarketSettlementHandler {
@@ -198,6 +203,7 @@ impl CrossMarketSettlementHandler {
             config,
             stop_flag: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(SettlementStats::default())),
+            correlation_tracker: None,
         }
     }
 
@@ -221,6 +227,7 @@ impl CrossMarketSettlementHandler {
             config,
             stop_flag: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(SettlementStats::default())),
+            correlation_tracker: None,
         }
     }
 
@@ -228,6 +235,13 @@ impl CrossMarketSettlementHandler {
     #[must_use]
     pub fn with_defaults(repo: CrossMarketRepository) -> Self {
         Self::new(repo, CrossMarketSettlementConfig::default())
+    }
+
+    /// Sets the correlation tracker for dynamic correlation updates.
+    #[must_use]
+    pub fn with_correlation_tracker(mut self, tracker: Arc<CorrelationTracker>) -> Self {
+        self.correlation_tracker = Some(tracker);
+        self
     }
 
     /// Returns a handle to stop the handler.
@@ -261,7 +275,9 @@ impl CrossMarketSettlementHandler {
             if self.wallet_client.is_some() {
                 info!("Live mode: Using wallet positions for settlement (source of truth)");
             } else {
-                warn!("Live mode enabled but no wallet client provided, falling back to paper mode");
+                warn!(
+                    "Live mode enabled but no wallet client provided, falling back to paper mode"
+                );
             }
         }
 
@@ -313,14 +329,18 @@ impl CrossMarketSettlementHandler {
     /// Processes a batch of pending settlements.
     async fn process_pending_batch(&self) -> Result<u64> {
         // Get pending opportunities that have passed window_end + delay
-        let pending = self.repo.get_pending_settlement(self.config.batch_size).await?;
+        let pending = self
+            .repo
+            .get_pending_settlement(self.config.batch_size)
+            .await?;
 
         let mut processed = 0u64;
 
         for opp in pending {
             // Check if enough time has passed since window_end
             let window_end = opp.window_end.unwrap_or(opp.timestamp);
-            let settlement_time = window_end + Duration::milliseconds(self.config.settlement_delay_ms);
+            let settlement_time =
+                window_end + Duration::milliseconds(self.config.settlement_delay_ms);
 
             if Utc::now() < settlement_time {
                 continue;
@@ -377,7 +397,9 @@ impl CrossMarketSettlementHandler {
             if let Some(ref client) = self.wallet_client {
                 match self.try_settle_via_wallet(client, opp).await {
                     Ok((leg1_won, leg2_won)) => {
-                        return self.finalize_settlement(opp, leg1_won, leg2_won, "wallet_positions").await;
+                        return self
+                            .finalize_settlement(opp, leg1_won, leg2_won, "wallet_positions")
+                            .await;
                     }
                     Err(e) => {
                         debug!(
@@ -395,7 +417,9 @@ impl CrossMarketSettlementHandler {
 
         match clob_result {
             Ok((leg1_won, leg2_won, method)) => {
-                return self.finalize_settlement(opp, leg1_won, leg2_won, &method).await;
+                return self
+                    .finalize_settlement(opp, leg1_won, leg2_won, &method)
+                    .await;
             }
             Err(e) => {
                 debug!(
@@ -410,8 +434,12 @@ impl CrossMarketSettlementHandler {
         let window_end = opp.window_end.unwrap_or(opp.timestamp);
         let window_start = window_end - Duration::milliseconds(15 * 60 * 1000);
 
-        let coin1_outcome = self.get_coin_outcome(&opp.coin1, window_start, window_end).await?;
-        let coin2_outcome = self.get_coin_outcome(&opp.coin2, window_start, window_end).await?;
+        let coin1_outcome = self
+            .get_coin_outcome(&opp.coin1, window_start, window_end)
+            .await?;
+        let coin2_outcome = self
+            .get_coin_outcome(&opp.coin2, window_start, window_end)
+            .await?;
 
         match (coin1_outcome, coin2_outcome) {
             (Some(c1), Some(c2)) => {
@@ -427,9 +455,10 @@ impl CrossMarketSettlementHandler {
                     "Using Chainlink/Binance fallback - may not match Polymarket exactly"
                 );
 
-                self.finalize_settlement(opp, leg1_won, leg2_won, "chainlink_fallback").await
+                self.finalize_settlement(opp, leg1_won, leg2_won, "chainlink_fallback")
+                    .await
             }
-            _ => Err(anyhow!("Outcomes not available from any source"))
+            _ => Err(anyhow!("Outcomes not available from any source")),
         }
     }
 
@@ -446,7 +475,9 @@ impl CrossMarketSettlementHandler {
     ) -> Result<(bool, bool)> {
         let token_ids = [opp.leg1_token_id.as_str(), opp.leg2_token_id.as_str()];
 
-        let positions = client.get_positions_for_tokens(&token_ids).await
+        let positions = client
+            .get_positions_for_tokens(&token_ids)
+            .await
             .map_err(|e| anyhow!("Failed to fetch wallet positions: {}", e))?;
 
         // Find our positions
@@ -498,13 +529,18 @@ impl CrossMarketSettlementHandler {
     }
 
     /// Try to settle using CLOB token prices.
-    async fn try_settle_via_clob(&self, opp: &CrossMarketOpportunityRecord) -> Result<(bool, bool, String)> {
+    async fn try_settle_via_clob(
+        &self,
+        opp: &CrossMarketOpportunityRecord,
+    ) -> Result<(bool, bool, String)> {
         let url = format!(
             "https://clob.polymarket.com/prices?token_ids={},{}",
             opp.leg1_token_id, opp.leg2_token_id
         );
 
-        let response = self.http.get(&url)
+        let response = self
+            .http
+            .get(&url)
             .header("Accept", "application/json")
             .send()
             .await?;
@@ -543,7 +579,7 @@ impl CrossMarketSettlementHandler {
                 );
                 Ok((l1_won, l2_won, "clob_prices".to_string()))
             }
-            _ => Err(anyhow!("Token prices not available in CLOB response"))
+            _ => Err(anyhow!("Token prices not available in CLOB response")),
         }
     }
 
@@ -558,13 +594,17 @@ impl CrossMarketSettlementHandler {
         // Derive coin outcomes from leg results
         let c1 = if leg1_won {
             opp.leg1_direction.clone()
+        } else if opp.leg1_direction == "UP" {
+            "DOWN".to_string()
         } else {
-            if opp.leg1_direction == "UP" { "DOWN".to_string() } else { "UP".to_string() }
+            "UP".to_string()
         };
         let c2 = if leg2_won {
             opp.leg2_direction.clone()
+        } else if opp.leg2_direction == "UP" {
+            "DOWN".to_string()
         } else {
-            if opp.leg2_direction == "UP" { "DOWN".to_string() } else { "UP".to_string() }
+            "UP".to_string()
         };
 
         // Determine trade result
@@ -597,6 +637,21 @@ impl CrossMarketSettlementHandler {
                 correlation_correct,
             )
             .await?;
+
+        // Feed correlation observation to dynamic tracker
+        if let Some(ref tracker) = self.correlation_tracker {
+            if let (Some(coin1), Some(coin2)) =
+                (Coin::from_slug(&opp.coin1), Coin::from_slug(&opp.coin2))
+            {
+                let pair = CoinPair::new(coin1, coin2);
+                tracker.record_observation(pair, correlation_correct);
+                debug!(
+                    pair = format!("{}/{}", opp.coin1, opp.coin2),
+                    correct = correlation_correct,
+                    "Recorded correlation observation"
+                );
+            }
+        }
 
         // Update stats
         let mut stats = self.stats.write().await;
@@ -648,14 +703,21 @@ impl CrossMarketSettlementHandler {
         window_end: chrono::DateTime<Utc>,
     ) -> Result<Option<String>> {
         // Try Binance.US first (works in US), then Binance global, then CoinGecko
-        if let Ok(Some(outcome)) = self.get_coin_outcome_binance(coin, window_start, window_end, true).await {
+        if let Ok(Some(outcome)) = self
+            .get_coin_outcome_binance(coin, window_start, window_end, true)
+            .await
+        {
             return Ok(Some(outcome));
         }
-        if let Ok(Some(outcome)) = self.get_coin_outcome_binance(coin, window_start, window_end, false).await {
+        if let Ok(Some(outcome)) = self
+            .get_coin_outcome_binance(coin, window_start, window_end, false)
+            .await
+        {
             return Ok(Some(outcome));
         }
         // Fall back to CoinGecko
-        self.get_coin_outcome_coingecko(coin, window_start, window_end).await
+        self.get_coin_outcome_coingecko(coin, window_start, window_end)
+            .await
     }
 
     /// Gets outcome from Binance klines API.
@@ -668,10 +730,34 @@ impl CrossMarketSettlementHandler {
     ) -> Result<Option<String>> {
         // Convert coin to Binance symbol
         let symbol = match coin.to_uppercase().as_str() {
-            "BTC" => if use_us { "BTCUSD" } else { "BTCUSDT" },
-            "ETH" => if use_us { "ETHUSD" } else { "ETHUSDT" },
-            "SOL" => if use_us { "SOLUSD" } else { "SOLUSDT" },
-            "XRP" => if use_us { "XRPUSD" } else { "XRPUSDT" },
+            "BTC" => {
+                if use_us {
+                    "BTCUSD"
+                } else {
+                    "BTCUSDT"
+                }
+            }
+            "ETH" => {
+                if use_us {
+                    "ETHUSD"
+                } else {
+                    "ETHUSDT"
+                }
+            }
+            "SOL" => {
+                if use_us {
+                    "SOLUSD"
+                } else {
+                    "SOLUSDT"
+                }
+            }
+            "XRP" => {
+                if use_us {
+                    "XRPUSD"
+                } else {
+                    "XRPUSDT"
+                }
+            }
             other => return Err(anyhow!("Unknown coin: {}", other)),
         };
 
@@ -713,21 +799,28 @@ impl CrossMarketSettlementHandler {
         let kline = &klines[0];
 
         // Check if kline is closed (close_time is in the past)
-        let close_time_ms = kline.get(6)
+        let close_time_ms = kline
+            .get(6)
             .and_then(|v| v.as_i64())
             .ok_or_else(|| anyhow!("Invalid kline close_time"))?;
 
         let now_ms = Utc::now().timestamp_millis();
         if close_time_ms > now_ms {
-            debug!(symbol = symbol, close_time = close_time_ms, "Kline not yet closed");
+            debug!(
+                symbol = symbol,
+                close_time = close_time_ms,
+                "Kline not yet closed"
+            );
             return Ok(None);
         }
 
         // Parse open and close prices
-        let open_str = kline.get(1)
+        let open_str = kline
+            .get(1)
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("Invalid kline open price"))?;
-        let close_str = kline.get(4)
+        let close_str = kline
+            .get(4)
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow!("Invalid kline close price"))?;
 
@@ -804,8 +897,8 @@ impl CrossMarketSettlementHandler {
         }
 
         // First price is near window_start, last is near window_end
-        let open = data.prices.first().map(|p| p.get(1).copied()).flatten();
-        let close = data.prices.last().map(|p| p.get(1).copied()).flatten();
+        let open = data.prices.first().and_then(|p| p.get(1).copied());
+        let close = data.prices.last().and_then(|p| p.get(1).copied());
 
         match (open, close) {
             (Some(o), Some(c)) => {
