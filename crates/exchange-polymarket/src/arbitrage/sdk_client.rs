@@ -329,16 +329,15 @@ pub struct OrderStatusResponse {
     pub side: String,
 }
 
-/// Balance response.
+/// Balance/allowance response from `/balance-allowance`.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct BalanceResponse {
-    /// USDC balance
+    /// Available balance.
     #[serde(default)]
-    pub usdc: Option<String>,
-    /// Collateral balance
+    pub balance: Option<String>,
+    /// Allowance for the exchange contract.
     #[serde(default)]
-    pub collateral: Option<String>,
+    pub allowance: Option<String>,
 }
 
 /// Wallet position from Data API.
@@ -545,15 +544,31 @@ impl ClobClient {
 
     /// Gets the USDC balance for the authenticated wallet.
     pub async fn get_balance(&self) -> Result<Decimal, ClobError> {
+        // HMAC signs over the base path only; query params are appended to the URL separately
+        let hmac_path = "/balance-allowance";
         let url = format!(
-            "{}/balance?address={}",
-            self.config.base_url,
-            self.wallet.address()
+            "{}/balance-allowance?asset_type=COLLATERAL&signature_type=0",
+            self.config.base_url
         );
 
         debug!(url = %url, "Fetching balance");
 
-        let response = self.http.get(&url).send().await?;
+        let mut request = self.http.get(&url);
+
+        // Add L2 auth headers if authenticated
+        if let Some(ref l2_auth) = self.l2_auth {
+            let headers = l2_auth
+                .headers("GET", hmac_path, "")
+                .map_err(|e| ClobError::Auth(format!("L2 header generation failed: {}", e)))?;
+            request = request
+                .header("POLY_ADDRESS", &headers.address)
+                .header("POLY_SIGNATURE", &headers.signature)
+                .header("POLY_TIMESTAMP", &headers.timestamp)
+                .header("POLY_API_KEY", &headers.api_key)
+                .header("POLY_PASSPHRASE", &headers.passphrase);
+        }
+
+        let response = request.send().await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
@@ -569,10 +584,9 @@ impl ClobClient {
             .await
             .map_err(|e| ClobError::Parse(format!("Failed to parse balance response: {}", e)))?;
 
-        // Parse USDC balance (or collateral for neg-risk)
+        // Parse balance from response
         let balance_str = balance
-            .usdc
-            .or(balance.collateral)
+            .balance
             .unwrap_or_else(|| "0".to_string());
 
         balance_str.parse::<Decimal>().map_err(|e| {
