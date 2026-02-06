@@ -11,7 +11,10 @@
 //! 3. **L2 Auth**: Use derived `apiKey`, `secret`, `passphrase` for HMAC-SHA256
 //! 4. **Subsequent requests**: Use L2 headers for all authenticated endpoints
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{
+    engine::general_purpose::{STANDARD as BASE64_STANDARD, URL_SAFE as BASE64_URL_SAFE},
+    Engine,
+};
 use chrono::Utc;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
@@ -235,6 +238,9 @@ impl L2Auth {
     ///
     /// Message format: `{timestamp}{method}{path}{body}`
     /// Key: base64-decoded secret
+    ///
+    /// Uses URL-safe base64 (with `-` and `_` instead of `+` and `/`) to match
+    /// the Polymarket Python/TypeScript reference clients.
     fn compute_hmac(
         &self,
         timestamp: &str,
@@ -242,13 +248,17 @@ impl L2Auth {
         path: &str,
         body: &str,
     ) -> Result<String, ClobAuthError> {
-        // Decode the base64 secret
-        let secret_bytes = BASE64
+        // Decode the base64 secret (try URL-safe first, then standard for robustness)
+        let secret_bytes = BASE64_URL_SAFE
             .decode(&self.secret)
+            .or_else(|_| BASE64_STANDARD.decode(&self.secret))
             .map_err(|e| ClobAuthError::Base64Failed(format!("Invalid secret: {}", e)))?;
 
-        // Build the message
-        let message = format!("{}{}{}{}", timestamp, method, path, body);
+        // Build the message (empty body is simply not appended, matching Python client)
+        let mut message = format!("{}{}{}", timestamp, method, path);
+        if !body.is_empty() {
+            message.push_str(body);
+        }
 
         // Compute HMAC-SHA256
         let mut mac = HmacSha256::new_from_slice(&secret_bytes)
@@ -256,8 +266,8 @@ impl L2Auth {
         mac.update(message.as_bytes());
         let result = mac.finalize();
 
-        // Base64 encode the result
-        Ok(BASE64.encode(result.into_bytes()))
+        // URL-safe base64 encode the result (matches Python's urlsafe_b64encode)
+        Ok(BASE64_URL_SAFE.encode(result.into_bytes()))
     }
 }
 
@@ -319,7 +329,7 @@ mod tests {
     fn l2_hmac_signature_deterministic() {
         let creds = ApiCredentials {
             api_key: "test-api-key".to_string(),
-            secret: BASE64.encode(b"test-secret-key-bytes"),
+            secret: BASE64_URL_SAFE.encode(b"test-secret-key-bytes"),
             passphrase: "test-passphrase".to_string(),
         };
 
@@ -335,7 +345,7 @@ mod tests {
     fn l2_hmac_different_methods_different_sigs() {
         let creds = ApiCredentials {
             api_key: "test-api-key".to_string(),
-            secret: BASE64.encode(b"test-secret-key-bytes"),
+            secret: BASE64_URL_SAFE.encode(b"test-secret-key-bytes"),
             passphrase: "test-passphrase".to_string(),
         };
 
@@ -352,7 +362,7 @@ mod tests {
     fn l2_headers_populated() {
         let creds = ApiCredentials {
             api_key: "test-api-key".to_string(),
-            secret: BASE64.encode(b"test-secret-key-bytes"),
+            secret: BASE64_URL_SAFE.encode(b"test-secret-key-bytes"),
             passphrase: "test-passphrase".to_string(),
         };
 
@@ -369,7 +379,7 @@ mod tests {
     #[test]
     fn l2_hmac_known_vector() {
         // Verify HMAC-SHA256 against a known computation
-        let secret_b64 = BASE64.encode(b"mysecret");
+        let secret_b64 = BASE64_URL_SAFE.encode(b"mysecret");
         let creds = ApiCredentials {
             api_key: "key".to_string(),
             secret: secret_b64,
@@ -381,8 +391,11 @@ mod tests {
 
         // Signature should be non-empty base64
         assert!(!sig.is_empty());
-        // Should be valid base64
-        assert!(BASE64.decode(&sig).is_ok());
+        // Should be valid URL-safe base64
+        assert!(BASE64_URL_SAFE.decode(&sig).is_ok());
+        // Must not contain standard base64 chars that differ from URL-safe
+        assert!(!sig.contains('+'), "Signature must use URL-safe base64");
+        assert!(!sig.contains('/'), "Signature must use URL-safe base64");
     }
 
     #[test]

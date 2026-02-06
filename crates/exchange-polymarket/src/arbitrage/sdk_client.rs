@@ -1434,7 +1434,7 @@ mod tests {
             .and(path("/auth/derive-api-key"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "apiKey": "test-api-key-123",
-                "secret": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"test-secret-bytes"),
+                "secret": base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE, b"test-secret-bytes"),
                 "passphrase": "test-passphrase"
             })))
             .mount(&mock_server)

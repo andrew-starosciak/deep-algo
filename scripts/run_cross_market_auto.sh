@@ -11,26 +11,39 @@
 #   --overnight           Run overnight (12h duration, persist, log to file)
 #   --mode paper|live     Trading mode (default: paper)
 #   --duration <time>     How long to run (default: 1h)
-#   --bet-size <amount>   Fixed bet size per leg in USDC
+#   --bet-size <amount>   Fixed bet size per leg in USDC (default: Kelly sizing)
 #   --pair <coins>        Coin pair to trade (default: btc,eth)
+#   --combination <type>  Combination filter (default: coin1down_coin2up)
 #   --min-spread <val>    Minimum spread required (default: 0.03)
+#   --min-win-prob <val>  Minimum win probability (default: 0.85)
+#   --max-position <val>  Max position per window in USDC (default: 500)
+#   --kelly <fraction>    Kelly fraction 0.0-1.0 (default: 0.25)
+#   --paper-balance <amt> Paper mode starting balance (default: 1000)
 #   --no-persist          Disable database persistence
 #   --session <id>        Custom session ID
+#   --verbose             Show verbose log output instead of dashboard
 #   --help                Show this help
 #
 # Examples:
-#   ./scripts/run_cross_market_auto.sh --overnight              # Run overnight
-#   ./scripts/run_cross_market_auto.sh --mode paper --duration 2h
+#   ./scripts/run_cross_market_auto.sh                                   # Paper, 1h
+#   ./scripts/run_cross_market_auto.sh --mode live --bet-size 5          # Live, $5 bets
+#   ./scripts/run_cross_market_auto.sh --overnight                       # Paper, 12h
+#   ./scripts/run_cross_market_auto.sh --mode live --overnight           # Live, 12h
 #
 
-set -e
+set -euo pipefail
 
-# Auto-source .env file if it exists
+# =============================================================================
+# Setup
+# =============================================================================
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# Auto-source .env file if it exists
 if [[ -f "$PROJECT_ROOT/.env" ]]; then
     set -a
+    # shellcheck disable=SC1091
     source "$PROJECT_ROOT/.env"
     set +a
 fi
@@ -39,31 +52,41 @@ fi
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 WHITE='\033[1;37m'
 DIM='\033[2m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
+# =============================================================================
 # Default configuration
+# =============================================================================
+
 MODE="paper"
-DURATION="30m"
+DURATION="1h"
 PAIR="btc,eth"
 COMBINATION="coin1down_coin2up"
-BET_SIZE="50"
+BET_SIZE=""
+KELLY_FRACTION="0.25"
+MIN_SPREAD="0.03"
+MIN_WIN_PROB="0.85"
+MAX_POSITION="500"
+PAPER_BALANCE="1000"
 PERSIST="--persist"
 SESSION_ID=""
 VERBOSE=""
 OVERNIGHT=""
 LOG_FILE=""
+STATS_INTERVAL="1"
 
+# =============================================================================
 # Parse arguments
+# =============================================================================
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --overnight)
             OVERNIGHT="1"
             DURATION="12h"
-            LOG_FILE="$PROJECT_ROOT/logs/overnight-$(date +%Y%m%d-%H%M%S).log"
             shift
             ;;
         --mode)
@@ -83,7 +106,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --bet-size)
-            BET_SIZE="--bet-size $2"
+            BET_SIZE="$2"
             shift 2
             ;;
         --min-spread)
@@ -106,20 +129,24 @@ while [[ $# -gt 0 ]]; do
             KELLY_FRACTION="$2"
             shift 2
             ;;
+        --stats-interval)
+            STATS_INTERVAL="$2"
+            shift 2
+            ;;
         --no-persist)
             PERSIST=""
             shift
             ;;
         --session)
-            SESSION_ID="--session-id $2"
+            SESSION_ID="$2"
             shift 2
             ;;
         --verbose|-v)
-            VERBOSE="--verbose"
+            VERBOSE="1"
             shift
             ;;
         --help|-h)
-            head -20 "$0" | tail -19
+            head -35 "$0" | tail -34
             exit 0
             ;;
         *)
@@ -129,40 +156,99 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# Generate session ID if not provided and persisting
-if [[ -n "$PERSIST" && -z "$SESSION_ID" ]]; then
-    SESSION_ID="--session-id auto-$(date +%Y%m%d-%H%M%S)"
-fi
-
-# Extract session ID value for display
-SESSION_DISPLAY=$(echo "$SESSION_ID" | sed 's/--session-id //')
-if [[ -z "$SESSION_DISPLAY" ]]; then
-    SESSION_DISPLAY="(none)"
-fi
+# =============================================================================
+# Validation
+# =============================================================================
 
 # Check for DATABASE_URL if persisting
-if [[ -n "$PERSIST" && -z "$DATABASE_URL" ]]; then
+if [[ -n "$PERSIST" && -z "${DATABASE_URL:-}" ]]; then
     echo -e "${RED}ERROR: DATABASE_URL environment variable required for --persist${NC}"
-    echo "Set it with: export DATABASE_URL=postgres://user:pass@localhost/dbname"
+    echo "Set it in .env or: export DATABASE_URL=postgres://user:pass@localhost/dbname"
+    echo "Or disable with: --no-persist"
     exit 1
 fi
 
-# Default max position (allow ~10 trades per window with $50 bet)
-MAX_POSITION="${MAX_POSITION:-500}"
+# Check for wallet key in live mode
+if [[ "$MODE" == "live" && -z "${POLYMARKET_PRIVATE_KEY:-}" ]]; then
+    echo -e "${RED}ERROR: POLYMARKET_PRIVATE_KEY environment variable required for live mode${NC}"
+    echo "Set it in .env or: export POLYMARKET_PRIVATE_KEY=your_64char_hex_key"
+    exit 1
+fi
 
-# Build the command
-CMD="cargo run -p algo-trade-cli -- cross-market-auto"
-CMD="$CMD --pair $PAIR"
-CMD="$CMD --combination $COMBINATION"
-CMD="$CMD --mode $MODE"
-CMD="$CMD --bet-size $BET_SIZE"
-CMD="$CMD --max-position $MAX_POSITION"
-CMD="$CMD --duration $DURATION"
-[[ -n "$PERSIST" ]] && CMD="$CMD $PERSIST"
-[[ -n "$SESSION_ID" ]] && CMD="$CMD $SESSION_ID"
-[[ -n "$VERBOSE" ]] && CMD="$CMD $VERBOSE"
+# Generate session ID if not provided and persisting
+if [[ -n "$PERSIST" && -z "$SESSION_ID" ]]; then
+    SESSION_ID="auto-$(date +%Y%m%d-%H%M%S)"
+fi
 
-# Clear screen and show header
+# Set log file for overnight mode
+if [[ -n "$OVERNIGHT" ]]; then
+    mkdir -p "$PROJECT_ROOT/logs"
+    LOG_FILE="$PROJECT_ROOT/logs/${MODE}-$(date +%Y%m%d-%H%M%S).log"
+fi
+
+# =============================================================================
+# Build release binary (live mode always uses release for performance)
+# =============================================================================
+
+CARGO_PROFILE=""
+if [[ "$MODE" == "live" ]]; then
+    CARGO_PROFILE="--release"
+    echo -e "${DIM}Building release binary...${NC}"
+    if ! cargo build -p algo-trade-cli --release 2>&1 | tail -3; then
+        echo -e "${RED}Build failed. Fix errors before live trading.${NC}"
+        exit 1
+    fi
+    echo ""
+fi
+
+# =============================================================================
+# Preflight check (live mode)
+# =============================================================================
+
+if [[ "$MODE" == "live" ]]; then
+    echo -e "${WHITE}Running preflight checks...${NC}"
+    if ! cargo run -p algo-trade-cli $CARGO_PROFILE -- preflight --coins "$PAIR" 2>&1; then
+        echo ""
+        echo -e "${RED}Preflight failed. Fix issues before live trading.${NC}"
+        exit 1
+    fi
+    echo ""
+fi
+
+# =============================================================================
+# Build command
+# =============================================================================
+
+CMD=(cargo run -p algo-trade-cli)
+[[ -n "$CARGO_PROFILE" ]] && CMD+=($CARGO_PROFILE)
+CMD+=(-- cross-market-auto)
+CMD+=(--pair "$PAIR")
+CMD+=(--combination "$COMBINATION")
+CMD+=(--mode "$MODE")
+CMD+=(--duration "$DURATION")
+CMD+=(--min-spread "$MIN_SPREAD")
+CMD+=(--min-win-prob "$MIN_WIN_PROB")
+CMD+=(--max-position "$MAX_POSITION")
+CMD+=(--kelly-fraction "$KELLY_FRACTION")
+CMD+=(--stats-interval-secs "$STATS_INTERVAL")
+
+# Only pass --bet-size if explicitly set (otherwise Kelly sizing is used)
+[[ -n "$BET_SIZE" ]] && CMD+=(--bet-size "$BET_SIZE")
+
+# Paper mode settings
+[[ "$MODE" == "paper" ]] && CMD+=(--paper-balance "$PAPER_BALANCE")
+
+# Persistence
+[[ -n "$PERSIST" ]] && CMD+=($PERSIST)
+[[ -n "$SESSION_ID" ]] && CMD+=(--session-id "$SESSION_ID")
+
+# Verbose
+[[ -n "$VERBOSE" ]] && CMD+=(--verbose)
+
+# =============================================================================
+# Display configuration
+# =============================================================================
+
 clear
 
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
@@ -170,7 +256,6 @@ echo -e "${CYAN}║${NC}        ${WHITE}Cross-Market Correlation Arbitrage Bot${
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
 
-# Show configuration
 echo -e "${WHITE}Configuration:${NC}"
 echo -e "  ${DIM}Mode:${NC}          ${MODE^^}"
 if [[ "$MODE" == "live" ]]; then
@@ -179,16 +264,28 @@ fi
 echo -e "  ${DIM}Duration:${NC}      $DURATION"
 echo -e "  ${DIM}Pair:${NC}          ${PAIR^^}"
 echo -e "  ${DIM}Combination:${NC}   $COMBINATION"
-echo -e "  ${DIM}Bet Size:${NC}      \$$BET_SIZE"
-echo -e "  ${DIM}Max/Window:${NC}   \$$MAX_POSITION"
+if [[ -n "$BET_SIZE" ]]; then
+    echo -e "  ${DIM}Bet Size:${NC}      \$$BET_SIZE (fixed)"
+else
+    echo -e "  ${DIM}Bet Size:${NC}      Kelly ${KELLY_FRACTION} (dynamic)"
+fi
+echo -e "  ${DIM}Min Spread:${NC}    \$$MIN_SPREAD"
+echo -e "  ${DIM}Min Win Prob:${NC}  ${MIN_WIN_PROB}"
+echo -e "  ${DIM}Max/Window:${NC}    \$$MAX_POSITION"
+if [[ "$MODE" == "paper" ]]; then
+    echo -e "  ${DIM}Paper Balance:${NC} \$$PAPER_BALANCE"
+fi
 echo -e "  ${DIM}Persistence:${NC}   $([ -n "$PERSIST" ] && echo "ENABLED" || echo "disabled")"
-echo -e "  ${DIM}Session:${NC}       $SESSION_DISPLAY"
+[[ -n "$SESSION_ID" ]] && echo -e "  ${DIM}Session:${NC}       $SESSION_ID"
+[[ -n "$LOG_FILE" ]] && echo -e "  ${DIM}Log File:${NC}      $LOG_FILE"
 echo ""
 
 # Confirm for live mode
 if [[ "$MODE" == "live" ]]; then
     echo -e "${YELLOW}WARNING: You are about to start LIVE trading with real funds!${NC}"
-    read -p "Type 'yes' to confirm: " confirm
+    echo -e "${DIM}Command: ${CMD[*]}${NC}"
+    echo ""
+    read -rp "Type 'yes' to confirm: " confirm
     if [[ "$confirm" != "yes" ]]; then
         echo "Aborted."
         exit 1
@@ -196,17 +293,9 @@ if [[ "$MODE" == "live" ]]; then
     echo ""
 fi
 
-# Create logs directory if needed
-mkdir -p "$PROJECT_ROOT/logs"
-
-# Set log file if overnight mode
-if [[ -n "$OVERNIGHT" ]]; then
-    echo -e "${CYAN}OVERNIGHT MODE${NC}"
-    echo -e "  ${DIM}Log file:${NC}      $LOG_FILE"
-    echo -e "  ${DIM}Dashboard logs redirected to file${NC}"
-    echo ""
-    export CROSS_MARKET_LOG="$LOG_FILE"
-fi
+# =============================================================================
+# Run
+# =============================================================================
 
 echo -e "${GREEN}Starting bot...${NC}"
 echo -e "${DIM}Press Ctrl+C to stop${NC}"
@@ -214,59 +303,60 @@ echo ""
 echo -e "${DIM}─────────────────────────────────────────────────────────────────────${NC}"
 echo ""
 
-# Create a temp file for output
-OUTPUT_FILE=$(mktemp)
-trap "rm -f $OUTPUT_FILE" EXIT
-
-# Function to display live stats from database
-show_db_stats() {
-    if [[ -z "$PERSIST" || -z "$DATABASE_URL" ]]; then
-        return
+# Trap to clean up child processes
+BOT_PID=""
+cleanup() {
+    if [[ -n "$BOT_PID" ]]; then
+        kill "$BOT_PID" 2>/dev/null || true
+        wait "$BOT_PID" 2>/dev/null || true
     fi
+}
+trap cleanup EXIT INT TERM
 
-    local session_val=$(echo "$SESSION_ID" | sed 's/--session-id //')
+# Format and colorize output
+colorize_output() {
+    while IFS= read -r line; do
+        local timestamp
+        timestamp=$(date '+%H:%M:%S')
 
-    # Query database for stats
-    psql "$DATABASE_URL" -t -A -F'|' <<EOF 2>/dev/null || return
-SELECT
-    COUNT(*) as total,
-    COUNT(*) FILTER (WHERE executed = true) as executed,
-    COUNT(*) FILTER (WHERE status = 'win') as wins,
-    COUNT(*) FILTER (WHERE status = 'loss') as losses,
-    COALESCE(SUM(spread) FILTER (WHERE executed = true), 0) as total_spread,
-    COALESCE(MAX(spread), 0) as best_spread,
-    COALESCE(AVG(win_probability) FILTER (WHERE executed = true), 0) as avg_win_prob
-FROM cross_market_opportunities
-WHERE session_id = '$session_val'
-  AND timestamp > NOW() - INTERVAL '1 day';
-EOF
+        if echo "$line" | grep -q "Both legs filled\|Execution successful"; then
+            echo -e "${GREEN}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "Opportunity detected\|Signal:"; then
+            echo -e "${CYAN}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "Opps:\|Vol:\|Bal:"; then
+            echo -e "${WHITE}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "ERROR\|error\|Error"; then
+            echo -e "${RED}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "WARN\|warn\|Warning"; then
+            echo -e "${YELLOW}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "Position limit\|filtered\|skipped"; then
+            echo -e "${DIM}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "Final Summary\|==="; then
+            echo ""
+            echo -e "${WHITE}$line${NC}"
+        else
+            echo -e "${DIM}[$timestamp]${NC} $line"
+        fi
+    done
 }
 
-# Run the command with output processing
-RUST_LOG=info $CMD 2>&1 | while IFS= read -r line; do
-    # Filter and format output
-    timestamp=$(date '+%H:%M:%S')
+if [[ -n "$LOG_FILE" ]]; then
+    # Overnight mode: tee to log file and colorize terminal output
+    echo -e "${CYAN}OVERNIGHT MODE - logging to: ${LOG_FILE}${NC}"
+    echo ""
+    RUST_LOG=info "${CMD[@]}" 2>&1 | tee "$LOG_FILE" | colorize_output &
+    BOT_PID=$!
+else
+    RUST_LOG=info "${CMD[@]}" 2>&1 | colorize_output &
+    BOT_PID=$!
+fi
 
-    # Check for key events and highlight them
-    if echo "$line" | grep -q "Both legs filled\|Execution successful"; then
-        echo -e "${GREEN}[$timestamp] ✓ $line${NC}"
-    elif echo "$line" | grep -q "Opportunity detected\|Signal:"; then
-        echo -e "${CYAN}[$timestamp] ⚡ $line${NC}"
-    elif echo "$line" | grep -q "Opps:\|Vol:"; then
-        echo -e "${WHITE}[$timestamp] 📊 $line${NC}"
-    elif echo "$line" | grep -q "ERROR\|error\|Error"; then
-        echo -e "${RED}[$timestamp] ✗ $line${NC}"
-    elif echo "$line" | grep -q "WARN\|warn\|Warning"; then
-        echo -e "${YELLOW}[$timestamp] ⚠ $line${NC}"
-    elif echo "$line" | grep -q "Position limit\|filtered\|skipped"; then
-        echo -e "${DIM}[$timestamp] $line${NC}"
-    elif echo "$line" | grep -q "Final Summary\|==="; then
-        echo ""
-        echo -e "${WHITE}$line${NC}"
-    else
-        echo -e "${DIM}[$timestamp]${NC} $line"
-    fi
-done
+wait "$BOT_PID" 2>/dev/null || true
+BOT_PID=""
+
+# =============================================================================
+# Post-run summary
+# =============================================================================
 
 echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════${NC}"
@@ -274,17 +364,16 @@ echo -e "${WHITE}Bot stopped${NC}"
 
 # Show log file location if overnight
 if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
+    LINES=$(wc -l < "$LOG_FILE")
     echo ""
-    echo -e "${WHITE}Log file saved:${NC} $LOG_FILE"
-    echo -e "${DIM}View with: tail -f $LOG_FILE${NC}"
-    echo -e "${DIM}Or: less $LOG_FILE${NC}"
+    echo -e "${WHITE}Log file:${NC} $LOG_FILE ($LINES lines)"
+    echo -e "${DIM}View with: less $LOG_FILE${NC}"
 fi
 
 # Show final database stats if persisting
-if [[ -n "$PERSIST" && -n "$DATABASE_URL" ]]; then
-    session_val=$(echo "$SESSION_ID" | sed 's/--session-id //')
+if [[ -n "$PERSIST" && -n "${DATABASE_URL:-}" && -n "$SESSION_ID" ]]; then
     echo ""
-    echo -e "${WHITE}Database Summary for session: ${CYAN}$session_val${NC}"
+    echo -e "${WHITE}Database Summary for session: ${CYAN}$SESSION_ID${NC}"
     echo ""
 
     psql "$DATABASE_URL" -c "
@@ -296,8 +385,8 @@ if [[ -n "$PERSIST" && -n "$DATABASE_URL" ]]; then
         ROUND(COALESCE(SUM(spread) FILTER (WHERE executed = true), 0)::numeric, 4) as \"Total Spread\",
         ROUND(COALESCE(MAX(spread), 0)::numeric, 4) as \"Best Spread\"
     FROM cross_market_opportunities
-    WHERE session_id = '$session_val';
-    " 2>/dev/null || echo "(Could not fetch database stats)"
+    WHERE session_id = \$\$${SESSION_ID}\$\$;
+    " 2>/dev/null || echo -e "${DIM}(Could not fetch database stats)${NC}"
 fi
 
 echo ""
