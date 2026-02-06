@@ -305,9 +305,9 @@ impl HardLimits {
             min_order_size: dec!(1),
             max_price: dec!(0.95),
             min_price: dec!(0.05),
-            max_order_value: dec!(100),
-            max_daily_volume: dec!(500),
-            min_balance_reserve: dec!(50),
+            max_order_value: dec!(10),
+            max_daily_volume: dec!(100),
+            min_balance_reserve: dec!(5),
         }
     }
 
@@ -1025,9 +1025,9 @@ mod tests {
     fn test_config_micro_testing() {
         let config = LiveExecutorConfig::micro_testing();
 
-        assert_eq!(config.hard_limits.max_order_value, dec!(100));
-        assert_eq!(config.hard_limits.max_daily_volume, dec!(500));
-        assert_eq!(config.hard_limits.min_balance_reserve, dec!(50));
+        assert_eq!(config.hard_limits.max_order_value, dec!(10));
+        assert_eq!(config.hard_limits.max_daily_volume, dec!(100));
+        assert_eq!(config.hard_limits.min_balance_reserve, dec!(5));
     }
 
     #[test]
@@ -1074,9 +1074,9 @@ mod tests {
         let limits = HardLimits::micro_testing();
 
         assert_eq!(limits.max_order_size, dec!(200));
-        assert_eq!(limits.max_order_value, dec!(100));
-        assert_eq!(limits.max_daily_volume, dec!(500));
-        assert_eq!(limits.min_balance_reserve, dec!(50));
+        assert_eq!(limits.max_order_value, dec!(10));
+        assert_eq!(limits.max_daily_volume, dec!(100));
+        assert_eq!(limits.min_balance_reserve, dec!(5));
     }
 
     #[test]
@@ -1354,7 +1354,7 @@ mod tests {
         assert_eq!(config.max_retries, 5);
         assert_eq!(config.order_timeout_secs, 30);
         assert!(!config.neg_risk);
-        assert_eq!(config.hard_limits.max_order_value, dec!(100));
+        assert_eq!(config.hard_limits.max_order_value, dec!(10));
     }
 
     // ==================== HardLimits Serialization Tests ====================

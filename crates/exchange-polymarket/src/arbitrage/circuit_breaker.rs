@@ -76,16 +76,16 @@ impl CircuitBreakerConfig {
     /// Creates a configuration for micro testing with tighter limits.
     ///
     /// - Max daily loss: $10
-    /// - Max consecutive failures: 2
-    /// - Pause duration: 10 minutes
-    /// - Min balance warning: $20
+    /// - Max consecutive failures: 5
+    /// - Pause duration: 2 minutes
+    /// - Min balance warning: $10
     #[must_use]
     pub fn micro_testing() -> Self {
         Self {
             max_daily_loss: dec!(10),
-            max_consecutive_failures: 2,
-            pause_duration: Duration::from_secs(10 * 60), // 10 minutes
-            min_balance_warning: dec!(20),
+            max_consecutive_failures: 5,
+            pause_duration: Duration::from_secs(2 * 60), // 2 minutes
+            min_balance_warning: dec!(10),
         }
     }
 
@@ -466,9 +466,9 @@ mod tests {
         let config = CircuitBreakerConfig::micro_testing();
 
         assert_eq!(config.max_daily_loss, dec!(10));
-        assert_eq!(config.max_consecutive_failures, 2);
-        assert_eq!(config.pause_duration, Duration::from_secs(10 * 60));
-        assert_eq!(config.min_balance_warning, dec!(20));
+        assert_eq!(config.max_consecutive_failures, 5);
+        assert_eq!(config.pause_duration, Duration::from_secs(2 * 60));
+        assert_eq!(config.min_balance_warning, dec!(10));
     }
 
     #[test]
