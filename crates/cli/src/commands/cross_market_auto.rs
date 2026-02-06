@@ -300,7 +300,8 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
         }
         ExecutionMode::Live => {
             let live_config = LiveExecutorConfig::mainnet();
-            let executor = LiveExecutor::new(live_config).await?;
+            let mut executor = LiveExecutor::new(live_config).await?;
+            executor.authenticate().await?;
             let balance = executor.get_balance().await?;
 
             let dashboard_config = DashboardConfig {
