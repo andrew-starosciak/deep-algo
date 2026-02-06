@@ -213,16 +213,18 @@ pub fn compute_domain_separator(
     Ok(keccak256(&encoded))
 }
 
-/// Computes the ClobAuth domain separator (different domain name).
+/// EIP-712 domain type hash for ClobAuth (no verifyingContract field).
+fn clob_auth_domain_type_hash() -> [u8; 32] {
+    keccak256_str("EIP712Domain(string name,string version,uint256 chainId)")
+}
+
+/// Computes the ClobAuth domain separator (no verifyingContract).
 pub fn compute_clob_auth_domain_separator(chain_id: u64) -> [u8; 32] {
-    // ClobAuth uses a simpler domain without verifyingContract
     let mut encoded = Vec::with_capacity(4 * 32);
-    encoded.extend_from_slice(&domain_type_hash());
+    encoded.extend_from_slice(&clob_auth_domain_type_hash());
     encoded.extend_from_slice(&keccak256_str(CLOB_AUTH_DOMAIN_NAME));
     encoded.extend_from_slice(&keccak256_str(DOMAIN_VERSION));
     encoded.extend_from_slice(&abi_encode_u256_from_u64(chain_id));
-    // ClobAuth domain has no verifyingContract, pad with zero address
-    encoded.extend_from_slice(&[0u8; 32]);
 
     keccak256(&encoded)
 }
