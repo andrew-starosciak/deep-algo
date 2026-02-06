@@ -127,8 +127,8 @@ impl Eip712Config {
 /// Maps to the Solidity `Order` struct in the CTF Exchange contract.
 #[derive(Debug, Clone)]
 pub struct Eip712Order {
-    /// Random salt for uniqueness.
-    pub salt: [u8; 32],
+    /// Random salt for uniqueness (small random number matching SDK convention).
+    pub salt: u64,
     /// Maker (funder) address.
     pub maker: [u8; 20],
     /// Signer address.
@@ -237,7 +237,7 @@ pub fn compute_order_struct_hash(order: &Eip712Order) -> [u8; 32] {
 
     let mut encoded = Vec::with_capacity(13 * 32);
     encoded.extend_from_slice(&order_type_hash());
-    encoded.extend_from_slice(&abi_encode_bytes32(&order.salt));
+    encoded.extend_from_slice(&abi_encode_u256_from_u64(order.salt));
     encoded.extend_from_slice(&abi_encode_address(&order.maker));
     encoded.extend_from_slice(&abi_encode_address(&order.signer));
     encoded.extend_from_slice(&abi_encode_address(&order.taker));
@@ -374,13 +374,18 @@ fn decimal_to_u64(d: Decimal) -> Result<u64, Eip712Error> {
 // Salt generation
 // =============================================================================
 
-/// Generates a random 32-byte salt for order uniqueness.
-pub fn generate_salt() -> [u8; 32] {
+/// Generates a random salt for order uniqueness.
+///
+/// Matches the Polymarket Python SDK convention: `round(timestamp * random())`.
+/// This produces a small number that fits in a JSON integer.
+pub fn generate_salt() -> u64 {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let mut salt = [0u8; 32];
-    rng.fill(&mut salt);
-    salt
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let random: f64 = rand::thread_rng().gen();
+    ((now as f64) * random) as u64
 }
 
 // =============================================================================
@@ -628,12 +633,13 @@ mod tests {
     #[test]
     fn generate_salt_not_zero() {
         let salt = generate_salt();
-        assert_ne!(salt, [0u8; 32]);
+        assert_ne!(salt, 0);
     }
 
     #[test]
     fn generate_salt_unique() {
         let s1 = generate_salt();
+        std::thread::sleep(std::time::Duration::from_millis(1));
         let s2 = generate_salt();
         assert_ne!(s1, s2);
     }
@@ -771,7 +777,7 @@ mod tests {
         assert_eq!(order.signature_type, SIGNATURE_TYPE_EOA);
         assert_eq!(order.taker, ZERO_ADDRESS);
         assert_eq!(order.maker, order.signer);
-        assert_ne!(order.salt, [0u8; 32]); // Random salt
+        assert_ne!(order.salt, 0); // Random salt
     }
 
     // -------------------------------------------------------------------------
@@ -780,7 +786,7 @@ mod tests {
 
     fn make_test_order() -> Eip712Order {
         Eip712Order {
-            salt: [42u8; 32],
+            salt: 42,
             maker: [1u8; 20],
             signer: [1u8; 20],
             taker: ZERO_ADDRESS,

@@ -264,29 +264,51 @@ impl From<OrderType> for ApiOrderType {
     }
 }
 
-/// Request to create a new order.
+/// Signed order payload matching the Polymarket CLOB API format.
+///
+/// Field names use camelCase to match the API. Numeric amounts are strings.
+/// Side is "BUY"/"SELL". signatureType is an integer (0 = EOA).
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CreateOrderRequest {
-    /// Token ID to trade
+pub struct SignedOrderPayload {
+    /// Random salt for uniqueness.
+    pub salt: u64,
+    /// Maker (funder) address.
+    pub maker: String,
+    /// Signer address.
+    pub signer: String,
+    /// Taker address (zero address for public orders).
+    pub taker: String,
+    /// Conditional token ID as decimal string.
     pub token_id: String,
-    /// Order side
-    pub side: ApiSide,
-    /// Limit price (0.01 to 0.99)
-    pub price: String,
-    /// Order size in shares
-    pub size: String,
-    /// Order type
-    pub order_type: ApiOrderType,
-    /// Fee rate in basis points (typically 0)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub fee_rate_bps: Option<u32>,
-    /// Nonce for order uniqueness
-    pub nonce: String,
-    /// Expiration timestamp (0 for no expiration)
+    /// Maximum amount maker spends (raw USDC units, 6 decimals).
+    pub maker_amount: String,
+    /// Minimum amount taker pays (raw token units, 6 decimals).
+    pub taker_amount: String,
+    /// Expiration timestamp ("0" for no expiration).
     pub expiration: String,
-    /// EIP-712 signature
+    /// Nonce for on-chain cancellation ("0" typically).
+    pub nonce: String,
+    /// Fee rate in basis points ("0" typically).
+    pub fee_rate_bps: String,
+    /// Order side: "BUY" or "SELL".
+    pub side: String,
+    /// Signature type: 0 = EOA, 1 = POLY_PROXY.
+    pub signature_type: u8,
+    /// EIP-712 hex signature.
     pub signature: String,
+}
+
+/// Top-level POST /order request payload.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PostOrderPayload {
+    /// The signed order object.
+    pub order: SignedOrderPayload,
+    /// API key of the order owner.
+    pub owner: String,
+    /// Order type: "FOK", "GTC", or "GTD".
+    pub order_type: String,
 }
 
 /// Response from order creation.
@@ -591,12 +613,16 @@ impl ClobClient {
                 })?;
 
             let balance_str = balance.balance.unwrap_or_else(|| "0".to_string());
-            let balance_val = balance_str.parse::<Decimal>().map_err(|e| {
+            let raw_balance = balance_str.parse::<Decimal>().map_err(|e| {
                 ClobError::Parse(format!(
                     "Failed to parse balance value '{}': {}",
                     balance_str, e
                 ))
             })?;
+
+            // API returns raw USDC units (6 decimals): 45999455 = $45.999455
+            let usdc_scale = Decimal::from(1_000_000u64);
+            let balance_val = raw_balance / usdc_scale;
 
             if balance_val > Decimal::ZERO {
                 info!(balance = %balance_val, signature_type = sig_type, "Found CLOB balance");
@@ -716,6 +742,8 @@ impl ClobClient {
             side = ?params.side,
             price = %params.price,
             size = %params.size,
+            maker_amount = %request.order.maker_amount,
+            taker_amount = %request.order.taker_amount,
             "Submitting order to CLOB"
         );
 
@@ -723,6 +751,8 @@ impl ClobClient {
         let url = format!("{}/order", self.config.base_url);
         let body_json = serde_json::to_string(&request)
             .map_err(|e| ClobError::Parse(format!("Failed to serialize order: {}", e)))?;
+
+        debug!(body = %body_json, "Order request body");
 
         let l2_auth = self
             .l2_auth
@@ -763,11 +793,18 @@ impl ClobClient {
         let body = response.text().await?;
 
         if !status.is_success() {
+            warn!(
+                http_status = status.as_u16(),
+                body = %body,
+                "Order API error response"
+            );
             return Err(ClobError::Api {
                 status: status.as_u16(),
                 message: body,
             });
         }
+
+        debug!(body = %body, "Order API response");
 
         // Parse response
         let order_response: CreateOrderResponse = serde_json::from_str(&body).map_err(|e| {
@@ -892,21 +929,21 @@ impl ClobClient {
     }
 
     /// Creates an order request with real EIP-712 signature.
-    fn create_order_request(&self, params: &OrderParams) -> Result<CreateOrderRequest, ClobError> {
-        // Generate nonce (timestamp-based for uniqueness)
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis().to_string())
-            .unwrap_or_else(|_| "0".to_string());
+    fn create_order_request(&self, params: &OrderParams) -> Result<PostOrderPayload, ClobError> {
+        // Nonce: "0" for on-chain cancellation (salt provides uniqueness)
+        let nonce: u64 = 0;
 
-        // Expiration: 10 minutes from now
-        let expiration_secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() + 600) // 10 minutes
-            .unwrap_or(0);
-        let expiration = expiration_secs.to_string();
-
-        let nonce_u64: u64 = nonce.parse().unwrap_or(0);
+        // Expiration: "0" for FOK (fill-or-kill doesn't need expiration)
+        let expiration_secs: u64 = match params.order_type {
+            OrderType::Fok | OrderType::Fak => 0,
+            OrderType::Gtc => {
+                // GTC: 10 minutes from now
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() + 600)
+                    .unwrap_or(0)
+            }
+        };
 
         // Convert side to EIP-712 format
         let eip712_side = match params.side {
@@ -927,7 +964,7 @@ impl ClobClient {
             price: params.price,
             size: params.size,
             expiration_secs,
-            nonce: nonce_u64,
+            nonce,
             fee_rate_bps: 0, // CLOB handles fees
         })
         .map_err(|e| ClobError::Signing(format!("Failed to build order: {}", e)))?;
@@ -937,16 +974,45 @@ impl ClobClient {
             eip712::sign_order(&order, &eip712_config, self.wallet.expose_private_key())
                 .map_err(|e| ClobError::Signing(format!("Failed to sign order: {}", e)))?;
 
-        Ok(CreateOrderRequest {
-            token_id: params.token_id.clone(),
-            side: params.side.into(),
-            price: params.price.to_string(),
-            size: params.size.to_string(),
-            order_type: params.order_type.into(),
-            fee_rate_bps: Some(0),
-            nonce,
-            expiration,
-            signature,
+        // Build the Polymarket API payload
+        let maker_addr = format!("0x{}", hex::encode(order.maker));
+        let signer_addr = format!("0x{}", hex::encode(order.signer));
+        let taker_addr = format!("0x{}", hex::encode(order.taker));
+
+        let side_str = match eip712_side {
+            SIDE_BUY => "BUY",
+            _ => "SELL",
+        };
+
+        let order_type_str = match params.order_type {
+            OrderType::Fok => "FOK",
+            OrderType::Fak => "FOK", // FAK maps to FOK in Polymarket API
+            OrderType::Gtc => "GTC",
+        };
+
+        let api_key = self
+            .api_key
+            .as_ref()
+            .ok_or_else(|| ClobError::Auth("Not authenticated - no API key".to_string()))?;
+
+        Ok(PostOrderPayload {
+            order: SignedOrderPayload {
+                salt: order.salt,
+                maker: maker_addr,
+                signer: signer_addr,
+                taker: taker_addr,
+                token_id: order.token_id.clone(),
+                maker_amount: order.maker_amount.to_string(),
+                taker_amount: order.taker_amount.to_string(),
+                expiration: order.expiration.to_string(),
+                nonce: order.nonce.to_string(),
+                fee_rate_bps: order.fee_rate_bps.to_string(),
+                side: side_str.to_string(),
+                signature_type: order.signature_type,
+                signature,
+            },
+            owner: api_key.clone(),
+            order_type: order_type_str.to_string(),
         })
     }
 
@@ -1053,6 +1119,14 @@ mod tests {
 
     fn test_wallet() -> Wallet {
         Wallet::from_private_key(TEST_PRIVATE_KEY, 137).unwrap()
+    }
+
+    /// Creates a test client with a fake API key set (for testing order creation).
+    fn test_client_with_auth() -> ClobClient {
+        let wallet = test_wallet();
+        let mut client = ClobClient::mainnet(wallet).unwrap();
+        client.api_key = Some("test-api-key-1234".to_string());
+        client
     }
 
     // ==================== Config Tests ====================
@@ -1299,8 +1373,7 @@ mod tests {
 
     #[test]
     fn test_create_order_request() {
-        let wallet = test_wallet();
-        let client = ClobClient::mainnet(wallet).unwrap();
+        let client = test_client_with_auth();
 
         let params = OrderParams {
             token_id: "token-123".to_string(),
@@ -1312,15 +1385,27 @@ mod tests {
             presigned: None,
         };
 
-        let request = client.create_order_request(&params).unwrap();
+        let payload = client.create_order_request(&params).unwrap();
 
-        assert_eq!(request.token_id, "token-123");
-        assert_eq!(request.side, ApiSide::Buy);
-        assert_eq!(request.price, "0.45");
-        assert_eq!(request.size, "100");
-        assert_eq!(request.order_type, ApiOrderType::Fok);
-        assert!(!request.nonce.is_empty());
-        assert!(request.signature.starts_with("0x"));
+        // Top-level fields
+        assert_eq!(payload.order_type, "FOK");
+        assert!(!payload.owner.is_empty()); // API key
+
+        // Order fields
+        assert_eq!(payload.order.token_id, "token-123");
+        assert_eq!(payload.order.side, "BUY");
+        assert_ne!(payload.order.salt, 0);
+        assert!(!payload.order.maker.is_empty());
+        assert!(!payload.order.signer.is_empty());
+        assert_eq!(payload.order.maker, payload.order.signer); // EOA
+        assert_eq!(payload.order.nonce, "0");
+        assert_eq!(payload.order.fee_rate_bps, "0");
+        assert_eq!(payload.order.signature_type, 0); // EOA
+        assert!(payload.order.signature.starts_with("0x"));
+
+        // Amounts should be non-empty strings
+        assert!(!payload.order.maker_amount.is_empty());
+        assert!(!payload.order.taker_amount.is_empty());
     }
 
     // ==================== Response Parsing Tests ====================
