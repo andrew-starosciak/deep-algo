@@ -154,8 +154,11 @@ pub struct ClobClientConfig {
     /// Maximum retries for transient errors
     pub max_retries: u32,
 
-    /// Whether to use neg-risk mode (required for most Polymarket markets)
+    /// Whether to use neg-risk mode (check market's neg_risk field via CLOB API)
     pub neg_risk: bool,
+
+    /// Taker fee rate in basis points (from market's taker_base_fee field).
+    pub taker_fee_bps: u16,
 
     /// Funder address (for neg-risk CTF exchange)
     pub funder: Option<String>,
@@ -175,7 +178,8 @@ impl ClobClientConfig {
             base_url: CLOB_API_MAINNET.to_string(),
             timeout: DEFAULT_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
-            neg_risk: true,
+            neg_risk: false,
+            taker_fee_bps: 0,
             funder: None,
         }
     }
@@ -187,7 +191,8 @@ impl ClobClientConfig {
             base_url: CLOB_API_TESTNET.to_string(),
             timeout: DEFAULT_TIMEOUT,
             max_retries: DEFAULT_MAX_RETRIES,
-            neg_risk: true,
+            neg_risk: false,
+            taker_fee_bps: 0,
             funder: None,
         }
     }
@@ -315,15 +320,18 @@ pub struct PostOrderPayload {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateOrderResponse {
-    /// Order ID assigned by the exchange
+    /// Order ID assigned by the exchange.
+    /// API returns "orderID" (not "orderId"), so we need an alias.
+    #[serde(alias = "orderID")]
     pub order_id: String,
     /// Whether the order was accepted
     pub success: bool,
     /// Error message if not successful
     #[serde(default)]
     pub error_msg: Option<String>,
-    /// Transaction hashes if filled
-    #[serde(default)]
+    /// Transaction hashes if filled.
+    /// API returns "transactionsHashes" (with extra 's'), so we need an alias.
+    #[serde(default, alias = "transactionsHashes")]
     pub transaction_hashes: Vec<String>,
     /// Order status
     #[serde(default)]
@@ -793,6 +801,17 @@ impl ClobClient {
         let body = response.text().await?;
 
         if !status.is_success() {
+            // FOK orders that can't be fully filled return HTTP 400 with a specific message.
+            // This is normal liquidity behavior, not an error - return a Rejected OrderResult
+            // instead of an error so the circuit breaker is not triggered.
+            if status.as_u16() == 400 && body.contains("couldn't be fully filled") {
+                info!(body = %body, "FOK order not filled (insufficient liquidity)");
+                return Ok(OrderResult::rejected(
+                    "fok-not-filled",
+                    format!("FOK not filled: {}", body),
+                ));
+            }
+
             warn!(
                 http_status = status.as_u16(),
                 body = %body,
@@ -965,7 +984,7 @@ impl ClobClient {
             size: params.size,
             expiration_secs,
             nonce,
-            fee_rate_bps: 0, // CLOB handles fees
+            fee_rate_bps: self.config.taker_fee_bps,
         })
         .map_err(|e| ClobError::Signing(format!("Failed to build order: {}", e)))?;
 
@@ -1135,7 +1154,7 @@ mod tests {
     fn test_config_mainnet() {
         let config = ClobClientConfig::mainnet();
         assert_eq!(config.base_url, CLOB_API_MAINNET);
-        assert!(config.neg_risk);
+        assert!(!config.neg_risk);
         assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
     }
 
@@ -1143,7 +1162,7 @@ mod tests {
     fn test_config_testnet() {
         let config = ClobClientConfig::testnet();
         assert_eq!(config.base_url, CLOB_API_TESTNET);
-        assert!(config.neg_risk);
+        assert!(!config.neg_risk);
     }
 
     #[test]
@@ -1286,7 +1305,7 @@ mod tests {
             price: dec!(0.50),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1304,7 +1323,7 @@ mod tests {
             price: dec!(0.005),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1323,7 +1342,7 @@ mod tests {
             price: dec!(0.995),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1342,7 +1361,7 @@ mod tests {
             price: dec!(0.50),
             size: dec!(0),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1361,7 +1380,7 @@ mod tests {
             price: dec!(0.50),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1381,7 +1400,7 @@ mod tests {
             price: dec!(0.45),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1421,7 +1440,7 @@ mod tests {
             price: dec!(0.45),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1451,7 +1470,7 @@ mod tests {
             price: dec!(0.45),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1503,7 +1522,7 @@ mod tests {
             price: dec!(0.45),
             size: dec!(100),
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 

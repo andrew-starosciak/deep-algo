@@ -287,11 +287,15 @@ impl CircuitBreaker {
                     remaining_secs: remaining.as_secs(),
                 });
             }
-            // Pause has expired, continue to check failures
+            // Pause has expired - reset failures so trading can resume
+            drop(state);
+            let mut state = self.state.write();
+            state.consecutive_failures = 0;
+            state.pause_started = None;
+            return Ok(());
         }
 
         // Check consecutive failures
-        // After pause expires, still blocked until a success resets the counter
         if state.consecutive_failures >= self.config.max_consecutive_failures {
             return Err(CircuitBreakerError::ConsecutiveFailuresExceeded {
                 failures: state.consecutive_failures,

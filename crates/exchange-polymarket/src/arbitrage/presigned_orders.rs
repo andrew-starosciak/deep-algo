@@ -203,7 +203,7 @@ impl Default for PreSignedPoolConfig {
             price_step: DEFAULT_PRICE_STEP,
             order_size: dec!(100),
             expiration_secs: DEFAULT_EXPIRATION_SECS,
-            neg_risk: true,
+            neg_risk: false,
         }
     }
 }
@@ -1111,7 +1111,7 @@ mod tests {
             price_step: dec!(0.01),
             order_size: dec!(50),
             expiration_secs: 300,
-            neg_risk: true,
+            neg_risk: false,
         };
 
         let pool = PreSignedOrderPool::new("token123", Side::Buy, config, signer).unwrap();

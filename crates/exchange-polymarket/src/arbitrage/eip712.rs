@@ -323,6 +323,12 @@ pub fn sign_hash(hash: &[u8; 32], private_key_hex: &str) -> Result<String, Eip71
 ///
 /// Amounts are in USDC raw units (6 decimals, so $1.00 = 1_000_000).
 ///
+/// Matches the Polymarket Python SDK's `get_order_amounts()`:
+/// 1. Round size down to 2 decimal places
+/// 2. Compute amounts in natural units (USDC / shares)
+/// 3. Round to meet API precision requirements
+/// 4. Convert to raw units (* 10^6)
+///
 /// - BUY: taker_amount = size (shares we receive), maker_amount = size * price (USDC we pay)
 /// - SELL: maker_amount = size (shares we give), taker_amount = size * price (USDC we receive)
 pub fn calculate_amounts(
@@ -344,22 +350,35 @@ pub fn calculate_amounts(
         ));
     }
 
+    // Round size down to 2 decimal places (matching Python SDK's round_config.size=2)
+    let size_rounded = round_down(size, 2);
+
     let (maker_amount, taker_amount) = if side == SIDE_BUY {
-        // BUY: we pay price * size USDC to receive `size` shares
-        let taker = (size * scale).floor();
-        let maker = (taker * price).floor();
-        (maker, taker)
+        // BUY: taker = shares we receive, maker = USDC we pay
+        let taker_natural = size_rounded;
+        let maker_natural = round_down(taker_natural * price, 2);
+        let taker_raw = (taker_natural * scale).floor();
+        let maker_raw = (maker_natural * scale).floor();
+        (maker_raw, taker_raw)
     } else {
-        // SELL: we give `size` shares to receive price * size USDC
-        let maker = (size * scale).floor();
-        let taker = (maker * price).floor();
-        (maker, taker)
+        // SELL: maker = shares we give, taker = USDC we receive
+        let maker_natural = size_rounded;
+        let taker_natural = round_down(maker_natural * price, 2);
+        let maker_raw = (maker_natural * scale).floor();
+        let taker_raw = (taker_natural * scale).floor();
+        (maker_raw, taker_raw)
     };
 
     let maker_u64 = decimal_to_u64(maker_amount)?;
     let taker_u64 = decimal_to_u64(taker_amount)?;
 
     Ok((maker_u64, taker_u64))
+}
+
+/// Rounds a Decimal down to the given number of decimal places.
+fn round_down(value: Decimal, dp: u32) -> Decimal {
+    let factor = Decimal::from(10u64.pow(dp));
+    (value * factor).floor() / factor
 }
 
 fn decimal_to_u64(d: Decimal) -> Result<u64, Eip712Error> {
@@ -615,6 +634,18 @@ mod tests {
     }
 
     #[test]
+    fn calculate_amounts_rounds_correctly() {
+        // BUY: price=0.19, size=10.752688 (from real trading scenario)
+        // size_rounded = 10.75, taker = 10.75 * 10^6 = 10_750_000
+        // maker = round_down(10.75 * 0.19, 2) = round_down(2.0425, 2) = 2.04
+        // maker_raw = 2.04 * 10^6 = 2_040_000
+        let (maker, taker) =
+            calculate_amounts(SIDE_BUY, dec!(0.19), dec!(10.752688)).unwrap();
+        assert_eq!(taker, 10_750_000); // Rounded down to 2 dp
+        assert_eq!(maker, 2_040_000); // Rounded down to 2 dp in USDC
+    }
+
+    #[test]
     fn calculate_amounts_rejects_invalid_price() {
         assert!(calculate_amounts(SIDE_BUY, dec!(0.00), dec!(100)).is_err());
         assert!(calculate_amounts(SIDE_BUY, dec!(1.00), dec!(100)).is_err());
@@ -799,5 +830,108 @@ mod tests {
             side: SIDE_BUY,
             signature_type: SIGNATURE_TYPE_EOA,
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Python SDK test vector compatibility
+    // -------------------------------------------------------------------------
+
+    /// Test vector from Polymarket/python-order-utils test_order_builder.py.
+    /// Uses Amoy testnet (chain_id=80002) with known key and order params.
+    #[test]
+    fn test_vector_standard_exchange_signing_hash_and_signature() {
+        let private_key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let maker = parse_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+        let exchange = "0xdFE02Eb6733538f8Ea35D585af8DE5958AD99E40";
+        let chain_id: u64 = 80002;
+
+        let order = Eip712Order {
+            salt: 479249096354,
+            maker,
+            signer: maker,
+            taker: ZERO_ADDRESS,
+            token_id: "1234".to_string(),
+            maker_amount: 100_000_000,
+            taker_amount: 50_000_000,
+            expiration: 0,
+            nonce: 0,
+            fee_rate_bps: 100,
+            side: SIDE_BUY,
+            signature_type: SIGNATURE_TYPE_EOA,
+        };
+
+        // Compute intermediate hashes for debugging
+        let type_hash = order_type_hash();
+        eprintln!("Order type hash: 0x{}", hex::encode(type_hash));
+
+        let domain_sep = compute_domain_separator(chain_id, exchange).unwrap();
+        eprintln!("Domain separator: 0x{}", hex::encode(domain_sep));
+
+        let struct_hash = compute_order_struct_hash(&order);
+        eprintln!("Struct hash: 0x{}", hex::encode(struct_hash));
+
+        let signing_hash = compute_signing_hash(&domain_sep, &struct_hash);
+        eprintln!("Signing hash: 0x{}", hex::encode(signing_hash));
+
+        // Python SDK _create_struct_hash returns the FINAL signing hash
+        // (confusing name - it's keccak256(\x19\x01 || domainSep || structHash))
+        let expected_signing_hash =
+            "02ca1d1aa31103804173ad1acd70066cb6c1258a4be6dada055111f9a7ea4e55";
+        assert_eq!(
+            hex::encode(signing_hash),
+            expected_signing_hash,
+            "Signing hash mismatch with Python SDK test vector"
+        );
+
+        // Verify signature matches
+        let signature = sign_hash(&signing_hash, private_key).unwrap();
+        let expected_signature = "0x302cd9abd0b5fcaa202a344437ec0b6660da984e24ae9ad915a592a90facf5a51bb8a873cd8d270f070217fea1986531d5eec66f1162a81f66e026db653bf7ce1c";
+        assert_eq!(
+            signature, expected_signature,
+            "Signature mismatch with Python SDK test vector"
+        );
+    }
+
+    /// Test vector for neg-risk exchange (same order, different domain).
+    #[test]
+    fn test_vector_neg_risk_exchange_signing_hash_and_signature() {
+        let private_key = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+        let maker = parse_address("0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266").unwrap();
+        let exchange = "0xC5d563A36AE78145C45a50134d48A1215220f80a"; // neg-risk
+        let chain_id: u64 = 80002;
+
+        let order = Eip712Order {
+            salt: 479249096354,
+            maker,
+            signer: maker,
+            taker: ZERO_ADDRESS,
+            token_id: "1234".to_string(),
+            maker_amount: 100_000_000,
+            taker_amount: 50_000_000,
+            expiration: 0,
+            nonce: 0,
+            fee_rate_bps: 100,
+            side: SIDE_BUY,
+            signature_type: SIGNATURE_TYPE_EOA,
+        };
+
+        let domain_sep = compute_domain_separator(chain_id, exchange).unwrap();
+        let struct_hash = compute_order_struct_hash(&order);
+        let signing_hash = compute_signing_hash(&domain_sep, &struct_hash);
+
+        let expected_signing_hash =
+            "f15790d3edc4b5aed427b0b543a9206fcf4b1a13dfed016d33bfb313076263b8";
+        assert_eq!(
+            hex::encode(signing_hash),
+            expected_signing_hash,
+            "Neg-risk signing hash mismatch"
+        );
+
+        let signature = sign_hash(&signing_hash, private_key).unwrap();
+        let expected_signature = "0x1b3646ef347e5bd144c65bd3357ba19c12c12abaeedae733cf8579bc51a2752c0454c3bc6b236957e393637982c769b8dc0706c0f5c399983d933850afd1cbcd1c";
+        assert_eq!(
+            signature, expected_signature,
+            "Neg-risk signature mismatch"
+        );
     }
 }

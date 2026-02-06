@@ -695,6 +695,10 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
 
     /// Session ID for grouping trades.
     session_id: String,
+
+    /// Cooldown after execution failures to avoid wasting API calls.
+    /// Tracks when the last execution attempt failed (FOK not filled, etc.)
+    last_both_rejected_at: Option<std::time::Instant>,
 }
 
 impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
@@ -723,6 +727,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             should_stop: Arc::new(AtomicBool::new(false)),
             db_pool: None,
             session_id,
+            last_both_rejected_at: None,
         }
     }
 
@@ -757,6 +762,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             should_stop: Arc::new(AtomicBool::new(false)),
             db_pool: Some(db_pool),
             session_id,
+            last_both_rejected_at: None,
         }
     }
 
@@ -878,6 +884,37 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         {
             let mut stats = self.stats.write().await;
             stats.opportunities_received += 1;
+        }
+
+        // Cooldown after both legs rejected (e.g., FOK not filled due to low liquidity).
+        // Wait 30 seconds before retrying to avoid wasting API calls on illiquid markets.
+        if let Some(rejected_at) = self.last_both_rejected_at {
+            let cooldown = std::time::Duration::from_secs(30);
+            if rejected_at.elapsed() < cooldown {
+                debug!(
+                    remaining_secs = (cooldown - rejected_at.elapsed()).as_secs(),
+                    "Skipping opportunity - cooldown after both legs rejected"
+                );
+                self.stats.write().await.opportunities_skipped += 1;
+                return Ok(());
+            }
+            // Cooldown expired
+            self.last_both_rejected_at = None;
+        }
+
+        // Block new trades while incomplete trades are pending recovery.
+        // One-sided positions are directional bets (~50/50), not the hedged arb (~96%).
+        // Don't stack more exposure until existing positions are fully hedged.
+        {
+            let incomplete = self.incomplete_trades.read().await;
+            if !incomplete.is_empty() {
+                debug!(
+                    count = incomplete.len(),
+                    "Skipping opportunity - incomplete trades pending recovery"
+                );
+                self.stats.write().await.opportunities_skipped += 1;
+                return Ok(());
+            }
         }
 
         // Apply filters
@@ -1002,6 +1039,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
                 CrossMarketExecutionResult::BothRejected { .. } => {
                     stats.both_rejected += 1;
+                    drop(stats);
+                    // Start cooldown to avoid spamming API when there's no liquidity
+                    self.last_both_rejected_at = Some(std::time::Instant::now());
                 }
             }
         }
@@ -1190,7 +1230,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 price: current_price,
                 size: trade.shares,
                 order_type: OrderType::Fok,
-                neg_risk: true,
+                neg_risk: false,
                 presigned: None,
             };
 
@@ -1368,7 +1408,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             price: opp.leg1_price,
             size: shares,
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1378,7 +1418,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             price: opp.leg2_price,
             size: shares,
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -1393,75 +1433,86 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             "Executing cross-market trade"
         );
 
-        // Submit both orders (with latency tracking)
+        // Sequential leg execution to prevent one-sided exposure:
+        // 1. Try leg1 first
+        // 2. Only submit leg2 if leg1 fills
+        // This prevents buying one side without the other.
         let start = std::time::Instant::now();
-        let results = self
-            .executor
-            .submit_orders_batch(vec![leg1_order, leg2_order])
-            .await?;
+
+        // Submit leg 1
+        let leg1_result = match self.executor.submit_order(leg1_order).await {
+            Ok(result) => result,
+            Err(e) => {
+                let leg1_rejected = OrderResult::rejected("leg1-error", e.to_string());
+                let leg2_skipped = OrderResult::rejected("leg2-skipped", "Skipped: leg1 failed");
+                warn!("Leg 1 error, skipping leg 2: {}", e);
+                return Ok(CrossMarketExecutionResult::BothRejected {
+                    leg1_result: leg1_rejected,
+                    leg2_result: leg2_skipped,
+                });
+            }
+        };
+
+        // If leg 1 didn't fill, skip leg 2 entirely
+        if leg1_result.status != OrderStatus::Filled {
+            let leg2_skipped =
+                OrderResult::rejected("leg2-skipped", "Skipped: leg1 not filled (no liquidity)");
+            info!(
+                leg1_status = ?leg1_result.status,
+                "Leg 1 not filled, skipping leg 2 to prevent one-sided exposure"
+            );
+            let latency_ms = start.elapsed().as_millis() as u64;
+            self.update_latency_stats(latency_ms).await;
+            return Ok(CrossMarketExecutionResult::BothRejected {
+                leg1_result,
+                leg2_result: leg2_skipped,
+            });
+        }
+
+        info!(
+            leg1_filled = %leg1_result.filled_size,
+            "Leg 1 filled, proceeding to leg 2"
+        );
+
+        // Submit leg 2
+        let leg2_result = match self.executor.submit_order(leg2_order).await {
+            Ok(result) => result,
+            Err(e) => OrderResult::rejected("leg2-error", e.to_string()),
+        };
+
         let latency_ms = start.elapsed().as_millis() as u64;
+        self.update_latency_stats(latency_ms).await;
 
-        // Update latency stats
-        {
-            let mut stats = self.stats.write().await;
-            stats.last_latency_ms = latency_ms;
-            stats.latency_samples += 1;
-            // Running average
-            stats.avg_latency_ms = ((stats.avg_latency_ms * (stats.latency_samples - 1))
-                + latency_ms)
-                / stats.latency_samples;
-        }
-
-        if results.len() != 2 {
-            return Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("Expected 2 results, got {}", results.len())),
-            ));
-        }
-
-        let leg1_result = results[0].clone();
-        let leg2_result = results[1].clone();
-
-        let leg1_filled = leg1_result.status == OrderStatus::Filled;
         let leg2_filled = leg2_result.status == OrderStatus::Filled;
 
-        let result = match (leg1_filled, leg2_filled) {
-            (true, true) => {
-                let total_cost = leg1_result.fill_notional() + leg2_result.fill_notional();
-                info!(
-                    total_cost = %total_cost,
-                    "Both legs filled successfully"
-                );
-                CrossMarketExecutionResult::Success {
-                    leg1_result,
-                    leg2_result,
-                    total_cost,
-                    expected_payout: Decimal::ONE, // One leg wins = $1.00
-                }
+        let result = if leg2_filled {
+            let total_cost = leg1_result.fill_notional() + leg2_result.fill_notional();
+            info!(total_cost = %total_cost, "Both legs filled successfully");
+            CrossMarketExecutionResult::Success {
+                leg1_result,
+                leg2_result,
+                total_cost,
+                expected_payout: Decimal::ONE,
             }
-            (true, false) => {
-                warn!("Only leg 1 filled - directional exposure!");
-                CrossMarketExecutionResult::Leg1OnlyFilled {
-                    leg1_result,
-                    leg2_result,
-                }
-            }
-            (false, true) => {
-                warn!("Only leg 2 filled - directional exposure!");
-                CrossMarketExecutionResult::Leg2OnlyFilled {
-                    leg1_result,
-                    leg2_result,
-                }
-            }
-            (false, false) => {
-                debug!("Both legs rejected - no exposure");
-                CrossMarketExecutionResult::BothRejected {
-                    leg1_result,
-                    leg2_result,
-                }
+        } else {
+            warn!("Leg 1 filled but leg 2 failed - directional exposure!");
+            CrossMarketExecutionResult::Leg1OnlyFilled {
+                leg1_result,
+                leg2_result,
             }
         };
 
         Ok(result)
+    }
+
+    /// Updates latency statistics.
+    async fn update_latency_stats(&self, latency_ms: u64) {
+        let mut stats = self.stats.write().await;
+        stats.last_latency_ms = latency_ms;
+        stats.latency_samples += 1;
+        stats.avg_latency_ms = ((stats.avg_latency_ms * (stats.latency_samples - 1))
+            + latency_ms)
+            / stats.latency_samples;
     }
 
     /// Records a trade in history.

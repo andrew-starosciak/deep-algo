@@ -197,6 +197,170 @@ pub async fn set_polymarket_allowances(
 }
 
 // =============================================================================
+// Redemption
+// =============================================================================
+
+/// Gas limit for redeemPositions (uses ~80-120k gas).
+const REDEEM_GAS_LIMIT: u64 = 200_000;
+
+/// Builds `redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)` calldata.
+///
+/// The function selector is computed from keccak256 of the canonical signature.
+fn build_redeem_positions(condition_id: &[u8; 32], index_sets: &[u32]) -> Vec<u8> {
+    use sha3::{Digest, Keccak256};
+
+    // Compute function selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")
+    let selector = {
+        let mut hasher = Keccak256::new();
+        hasher.update(b"redeemPositions(address,bytes32,bytes32,uint256[])");
+        let hash = hasher.finalize();
+        [hash[0], hash[1], hash[2], hash[3]]
+    };
+
+    // ABI encode:
+    // [0]  selector (4 bytes)
+    // [4]  collateralToken (address, padded to 32 bytes) - USDCe
+    // [36] parentCollectionId (bytes32) - all zeros
+    // [68] conditionId (bytes32)
+    // [100] offset to indexSets array (0x80 = 128 from start of params)
+    // [132] length of indexSets
+    // [164+] indexSets elements (each 32 bytes)
+
+    let usdce_bytes = hex::decode("2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+        .expect("valid USDCe hex");
+
+    let mut data = Vec::with_capacity(164 + index_sets.len() * 32);
+
+    // Function selector
+    data.extend_from_slice(&selector);
+
+    // collateralToken (USDCe address, left-padded)
+    data.extend_from_slice(&[0u8; 12]);
+    data.extend_from_slice(&usdce_bytes);
+
+    // parentCollectionId (bytes32 zero)
+    data.extend_from_slice(&[0u8; 32]);
+
+    // conditionId
+    data.extend_from_slice(condition_id);
+
+    // offset to dynamic array (4 params * 32 = 128 = 0x80)
+    let mut offset = [0u8; 32];
+    offset[31] = 0x80;
+    data.extend_from_slice(&offset);
+
+    // array length
+    let mut len = [0u8; 32];
+    len[31] = index_sets.len() as u8;
+    data.extend_from_slice(&len);
+
+    // array elements
+    for &idx in index_sets {
+        let mut val = [0u8; 32];
+        val[28..32].copy_from_slice(&(idx as u32).to_be_bytes());
+        data.extend_from_slice(&val);
+    }
+
+    data
+}
+
+/// Redeems winning positions from resolved Polymarket markets.
+///
+/// For each condition ID, calls `CTF.redeemPositions(USDCe, 0x0, conditionId, indexSets)`
+/// which burns the conditional tokens and returns USDCe.
+///
+/// # Arguments
+/// * `wallet` - Wallet to sign and send from
+/// * `rpc_url` - Polygon RPC URL
+/// * `conditions` - List of (conditionId_hex, indexSets) to redeem
+///
+/// # Returns
+/// Transaction hashes for each redemption.
+pub async fn redeem_positions(
+    wallet: &Wallet,
+    rpc_url: &str,
+    conditions: &[(&str, Vec<u32>)],
+) -> Result<Vec<String>, TxError> {
+    let http = Client::new();
+    let ctf_addr = parse_address(CTF)?;
+
+    let mut nonce = polygon_tx::get_nonce(&http, rpc_url, wallet.address()).await?;
+    let gas_price = polygon_tx::get_gas_price(&http, rpc_url).await?;
+    let gas_price = gas_price + gas_price / 5; // 20% buffer
+
+    info!(
+        nonce,
+        gas_price_gwei = gas_price / 1_000_000_000,
+        count = conditions.len(),
+        "Starting redemption transactions"
+    );
+
+    let mut tx_hashes = Vec::new();
+
+    for (condition_id_hex, index_sets) in conditions {
+        let stripped = condition_id_hex.strip_prefix("0x").unwrap_or(condition_id_hex);
+        let cid_bytes = hex::decode(stripped)
+            .map_err(|e| TxError::Rlp(format!("Invalid conditionId '{}': {}", condition_id_hex, e)))?;
+        if cid_bytes.len() != 32 {
+            return Err(TxError::Rlp(format!(
+                "conditionId wrong length: {} bytes",
+                cid_bytes.len()
+            )));
+        }
+        let mut cid = [0u8; 32];
+        cid.copy_from_slice(&cid_bytes);
+
+        let calldata = build_redeem_positions(&cid, index_sets);
+
+        let tx = LegacyTx {
+            nonce,
+            gas_price,
+            gas_limit: REDEEM_GAS_LIMIT,
+            to: ctf_addr,
+            value: [0u8; 32],
+            data: calldata,
+        };
+
+        let signed = polygon_tx::sign_legacy_tx(&tx, POLYGON_CHAIN_ID, wallet.expose_private_key())?;
+        let hash = polygon_tx::broadcast_tx(&http, rpc_url, &signed).await?;
+        info!(
+            tx_hash = %hash,
+            condition_id = %condition_id_hex,
+            index_sets = ?index_sets,
+            "Redemption tx sent"
+        );
+        tx_hashes.push(hash);
+        nonce += 1;
+    }
+
+    // Wait for receipts
+    info!("Waiting for {} redemption transactions to confirm...", tx_hashes.len());
+    let mut all_success = true;
+
+    for hash in &tx_hashes {
+        match polygon_tx::wait_for_receipt(&http, rpc_url, hash, 60).await {
+            Ok(true) => info!(tx_hash = %hash, "Redemption confirmed"),
+            Ok(false) => {
+                warn!(tx_hash = %hash, "Redemption reverted!");
+                all_success = false;
+            }
+            Err(e) => {
+                warn!(tx_hash = %hash, error = %e, "Failed to get receipt");
+                all_success = false;
+            }
+        }
+    }
+
+    if all_success {
+        info!("All {} redemptions confirmed", tx_hashes.len());
+    } else {
+        warn!("Some redemptions failed — check hashes on Polygonscan");
+    }
+
+    Ok(tx_hashes)
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 

@@ -106,7 +106,7 @@ pub struct LiveExecutorConfig {
     /// Timeout in seconds for order operations.
     pub order_timeout_secs: u64,
 
-    /// Whether to use neg_risk flag (required for binary markets).
+    /// Whether to use neg_risk flag (check market's neg_risk field via CLOB API).
     pub neg_risk: bool,
 }
 
@@ -121,7 +121,7 @@ impl Default for LiveExecutorConfig {
             hard_limits: HardLimits::default(),
             max_retries: 3,
             order_timeout_secs: 10,
-            neg_risk: true,
+            neg_risk: false,
         }
     }
 }
@@ -168,7 +168,7 @@ impl LiveExecutorConfig {
             hard_limits: HardLimits::micro_testing(),
             max_retries: 2,
             order_timeout_secs: 15,
-            neg_risk: true,
+            neg_risk: false,
         }
     }
 
@@ -1003,7 +1003,7 @@ mod tests {
         assert_eq!(config.base_url, POLYMARKET_MAINNET_URL);
         assert_eq!(config.max_retries, 3);
         assert_eq!(config.order_timeout_secs, 10);
-        assert!(config.neg_risk);
+        assert!(!config.neg_risk);
     }
 
     #[test]

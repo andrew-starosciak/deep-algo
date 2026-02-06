@@ -23,6 +23,7 @@ pub mod latency_monitor;
 pub mod phase1_arbitrage;
 pub mod polymarket_paper_trade;
 pub mod preflight;
+pub mod redeem_positions;
 pub mod validate_signals;
 pub mod window_timing;
 
@@ -49,4 +50,5 @@ pub use latency_monitor::{run as run_latency_monitor, LatencyMonitorArgs};
 pub use phase1_arbitrage::{run_phase1_arbitrage, Phase1ArbitrageArgs};
 pub use polymarket_paper_trade::{run_polymarket_paper_trade, PolymarketPaperTradeArgs};
 pub use preflight::{run as run_preflight, PreflightArgs};
+pub use redeem_positions::{run as run_redeem_positions, RedeemPositionsArgs};
 pub use validate_signals::{run_validate_signals, ValidateSignalsArgs};

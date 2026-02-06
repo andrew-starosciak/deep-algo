@@ -11,7 +11,8 @@ use commands::{
     CollectPolymarketArgs, CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs,
     CrossMarketBacktestArgs, CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
     EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs, LatencyMonitorArgs,
-    Phase1ArbitrageArgs, PolymarketPaperTradeArgs, PreflightArgs, ValidateSignalsArgs,
+    Phase1ArbitrageArgs, PolymarketPaperTradeArgs, PreflightArgs, RedeemPositionsArgs,
+    ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -159,6 +160,8 @@ enum Commands {
     Preflight(PreflightArgs),
     /// Set Polymarket exchange contract allowances (required once before live trading)
     ApproveAllowances(ApproveAllowancesArgs),
+    /// Redeem winning positions from resolved Polymarket markets
+    RedeemPositions(RedeemPositionsArgs),
 }
 
 #[tokio::main]
@@ -332,6 +335,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::ApproveAllowances(args) => {
             commands::run_approve_allowances(args).await?;
+        }
+        Commands::RedeemPositions(args) => {
+            commands::run_redeem_positions(args).await?;
         }
     }
 

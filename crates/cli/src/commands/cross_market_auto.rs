@@ -299,7 +299,9 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
             .await
         }
         ExecutionMode::Live => {
-            let live_config = LiveExecutorConfig::micro_testing();
+            let mut live_config = LiveExecutorConfig::micro_testing();
+            // Set taker fee to match the 15-min crypto market's taker_base_fee
+            live_config.clob_config.taker_fee_bps = 1000;
             let mut executor = LiveExecutor::new(live_config).await?;
             executor.authenticate().await?;
             let balance = executor.get_balance().await?;

@@ -114,8 +114,8 @@ pub struct OrderParams {
     /// Order type determining fill behavior.
     pub order_type: OrderType,
 
-    /// Neg-risk flag required for certain market types.
-    /// Must be true for BTC 15-minute binary markets.
+    /// Neg-risk flag for market types that use the Neg Risk CTF Exchange.
+    /// Check the market's `neg_risk` field via CLOB API.
     pub neg_risk: bool,
 
     /// Pre-signed order data (optional).
@@ -150,7 +150,7 @@ impl OrderParams {
             price,
             size,
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         }
     }
@@ -164,7 +164,7 @@ impl OrderParams {
             price,
             size,
             order_type: OrderType::Fak,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         }
     }
@@ -1007,7 +1007,7 @@ mod tests {
         assert_eq!(order.price, dec!(0.45));
         assert_eq!(order.size, dec!(100));
         assert_eq!(order.order_type, OrderType::Fok);
-        assert!(order.neg_risk);
+        assert!(!order.neg_risk);
     }
 
     #[test]
@@ -1026,8 +1026,8 @@ mod tests {
 
     #[test]
     fn test_order_params_with_neg_risk() {
-        let order = OrderParams::buy_fok("token", dec!(0.50), dec!(100)).with_neg_risk(false);
-        assert!(!order.neg_risk);
+        let order = OrderParams::buy_fok("token", dec!(0.50), dec!(100)).with_neg_risk(true);
+        assert!(order.neg_risk);
     }
 
     // ==================== OrderStatus Tests ====================

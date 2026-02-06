@@ -261,7 +261,7 @@ impl<E: PolymarketExecutor> DualLegExecutor<E> {
             price: opportunity.yes_worst_fill,
             size: shares,
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -271,7 +271,7 @@ impl<E: PolymarketExecutor> DualLegExecutor<E> {
             price: opportunity.no_worst_fill,
             size: shares,
             order_type: OrderType::Fok,
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
@@ -373,7 +373,7 @@ impl<E: PolymarketExecutor> DualLegExecutor<E> {
             price: dec!(0.01), // Accept any price (will fill at best bid)
             size,
             order_type: OrderType::Fak, // Fill what we can
-            neg_risk: true,
+            neg_risk: false,
             presigned: None,
         };
 
