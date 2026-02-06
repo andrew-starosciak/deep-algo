@@ -118,6 +118,10 @@ pub struct CrossMarketAutoExecutorConfig {
 
     /// Fraction of visible bid depth to sell into per cycle (default: 0.50).
     pub early_exit_depth_fraction: Decimal,
+
+    /// Minimum excess shares to trigger a trim sell after parallel fill (default: 0.5).
+    /// Below this threshold, asymmetric fills are accepted as negligible.
+    pub trim_threshold: Decimal,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -136,6 +140,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             early_exit_enabled: true,
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
+            trim_threshold: dec!(0.5),
         }
     }
 }
@@ -158,6 +163,7 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_enabled: true,
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
+            trim_threshold: dec!(0.5),
         }
     }
 
@@ -178,6 +184,7 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_enabled: true,
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
+            trim_threshold: dec!(0.5),
         }
     }
 
@@ -1086,11 +1093,13 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
                 CrossMarketExecutionResult::Leg1OnlyFilled { leg1_result, .. } => {
                     // Record the filled leg's cost — capital is deployed
-                    let leg1_cost = shares * leg1_result.avg_fill_price.unwrap_or(opp.leg1_price);
+                    let leg1_cost =
+                        leg1_result.filled_size * leg1_result.avg_fill_price.unwrap_or(opp.leg1_price);
                     pos.record_position(leg1_cost);
                 }
                 CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
-                    let leg2_cost = shares * leg2_result.avg_fill_price.unwrap_or(opp.leg2_price);
+                    let leg2_cost =
+                        leg2_result.filled_size * leg2_result.avg_fill_price.unwrap_or(opp.leg2_price);
                     pos.record_position(leg2_cost);
                 }
                 CrossMarketExecutionResult::BothRejected { .. } => {
@@ -1114,12 +1123,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     stats.incomplete_trades += 1;
                     warn!("Partial fill - leg 1 only. Adding to recovery queue.");
 
-                    // Create incomplete trade for recovery
+                    // Create incomplete trade for recovery (use actual filled size)
                     let incomplete = self.create_incomplete_trade(
                         &opp,
                         FilledLeg::Leg1,
                         leg1_result.avg_fill_price.unwrap_or(opp.leg1_price),
-                        shares,
+                        leg1_result.filled_size,
                     );
                     drop(stats); // Release lock before acquiring another
                     self.incomplete_trades.write().await.push(incomplete);
@@ -1129,12 +1138,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     stats.incomplete_trades += 1;
                     warn!("Partial fill - leg 2 only. Adding to recovery queue.");
 
-                    // Create incomplete trade for recovery
+                    // Create incomplete trade for recovery (use actual filled size)
                     let incomplete = self.create_incomplete_trade(
                         &opp,
                         FilledLeg::Leg2,
                         leg2_result.avg_fill_price.unwrap_or(opp.leg2_price),
-                        shares,
+                        leg2_result.filled_size,
                     );
                     drop(stats); // Release lock before acquiring another
                     self.incomplete_trades.write().await.push(incomplete);
@@ -1626,7 +1635,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         true
     }
 
-    /// Executes both legs of the cross-market opportunity.
+    /// Executes both legs of the cross-market opportunity in parallel.
+    ///
+    /// Both legs are submitted concurrently via `tokio::join!` to minimize
+    /// latency and improve fill rates. If fills are asymmetric (different
+    /// sizes), the excess on the over-filled leg is trimmed via a FAK sell.
     async fn execute_both_legs(
         &self,
         opp: &CrossMarketOpportunity,
@@ -1661,79 +1674,186 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             shares = %shares,
             total_cost = %opp.total_cost,
             win_prob = opp.win_probability,
-            "Executing cross-market trade"
+            "Executing cross-market trade (parallel)"
         );
 
-        // Sequential leg execution to prevent one-sided exposure:
-        // 1. Try leg1 first
-        // 2. Only submit leg2 if leg1 fills
-        // This prevents buying one side without the other.
         let start = std::time::Instant::now();
 
-        // Submit leg 1
-        let leg1_result = match self.executor.submit_order(leg1_order).await {
-            Ok(result) => result,
-            Err(e) => {
-                let leg1_rejected = OrderResult::rejected("leg1-error", e.to_string());
-                let leg2_skipped = OrderResult::rejected("leg2-skipped", "Skipped: leg1 failed");
-                warn!("Leg 1 error, skipping leg 2: {}", e);
-                return Ok(CrossMarketExecutionResult::BothRejected {
-                    leg1_result: leg1_rejected,
-                    leg2_result: leg2_skipped,
-                });
-            }
-        };
-
-        // If leg 1 didn't fill, skip leg 2 entirely
-        if leg1_result.status != OrderStatus::Filled {
-            let leg2_skipped =
-                OrderResult::rejected("leg2-skipped", "Skipped: leg1 not filled (no liquidity)");
-            info!(
-                leg1_status = ?leg1_result.status,
-                "Leg 1 not filled, skipping leg 2 to prevent one-sided exposure"
-            );
-            let latency_ms = start.elapsed().as_millis() as u64;
-            self.update_latency_stats(latency_ms).await;
-            return Ok(CrossMarketExecutionResult::BothRejected {
-                leg1_result,
-                leg2_result: leg2_skipped,
-            });
-        }
-
-        info!(
-            leg1_filled = %leg1_result.filled_size,
-            "Leg 1 filled, proceeding to leg 2"
+        // Submit both legs concurrently
+        let (leg1_raw, leg2_raw) = tokio::join!(
+            self.executor.submit_order(leg1_order),
+            self.executor.submit_order(leg2_order),
         );
 
-        // Submit leg 2
-        let leg2_result = match self.executor.submit_order(leg2_order).await {
-            Ok(result) => result,
-            Err(e) => OrderResult::rejected("leg2-error", e.to_string()),
-        };
+        // Convert errors to rejected results
+        let leg1_result = leg1_raw.unwrap_or_else(|e| {
+            warn!(error = %e, "Leg 1 submission error");
+            OrderResult::rejected("leg1-error", e.to_string())
+        });
+        let leg2_result = leg2_raw.unwrap_or_else(|e| {
+            warn!(error = %e, "Leg 2 submission error");
+            OrderResult::rejected("leg2-error", e.to_string())
+        });
 
         let latency_ms = start.elapsed().as_millis() as u64;
         self.update_latency_stats(latency_ms).await;
 
+        let leg1_filled = leg1_result.status == OrderStatus::Filled;
         let leg2_filled = leg2_result.status == OrderStatus::Filled;
 
-        let result = if leg2_filled {
-            let total_cost = leg1_result.fill_notional() + leg2_result.fill_notional();
-            info!(total_cost = %total_cost, "Both legs filled successfully");
-            CrossMarketExecutionResult::Success {
-                leg1_result,
-                leg2_result,
-                total_cost,
-                expected_payout: Decimal::ONE,
+        let result = match (leg1_filled, leg2_filled) {
+            (true, true) if leg1_result.filled_size <= Decimal::ZERO
+                || leg2_result.filled_size <= Decimal::ZERO =>
+            {
+                // Edge case: status says Filled but zero actual size — treat as rejected
+                warn!(
+                    leg1_filled_size = %leg1_result.filled_size,
+                    leg2_filled_size = %leg2_result.filled_size,
+                    "Both legs report Filled but zero fill size — treating as rejected"
+                );
+                CrossMarketExecutionResult::BothRejected {
+                    leg1_result,
+                    leg2_result,
+                }
             }
-        } else {
-            warn!("Leg 1 filled but leg 2 failed - directional exposure!");
-            CrossMarketExecutionResult::Leg1OnlyFilled {
-                leg1_result,
-                leg2_result,
+            (true, true) => {
+                // Both filled — check for asymmetry and trim excess
+                let paired = leg1_result.filled_size.min(leg2_result.filled_size);
+                let excess_leg1 = (leg1_result.filled_size - paired).max(Decimal::ZERO);
+                let excess_leg2 = (leg2_result.filled_size - paired).max(Decimal::ZERO);
+
+                if excess_leg1 > self.config.trim_threshold {
+                    info!(
+                        excess = %excess_leg1,
+                        leg1_filled = %leg1_result.filled_size,
+                        leg2_filled = %leg2_result.filled_size,
+                        "Asymmetric fill — trimming leg1 excess"
+                    );
+                    self.trim_excess_shares(
+                        &opp.leg1_token_id,
+                        excess_leg1,
+                        opp.leg1_price,
+                    )
+                    .await;
+                }
+                if excess_leg2 > self.config.trim_threshold {
+                    info!(
+                        excess = %excess_leg2,
+                        leg1_filled = %leg1_result.filled_size,
+                        leg2_filled = %leg2_result.filled_size,
+                        "Asymmetric fill — trimming leg2 excess"
+                    );
+                    self.trim_excess_shares(
+                        &opp.leg2_token_id,
+                        excess_leg2,
+                        opp.leg2_price,
+                    )
+                    .await;
+                }
+
+                // Use paired size for cost calculation
+                let leg1_price = leg1_result.avg_fill_price.unwrap_or(opp.leg1_price);
+                let leg2_price = leg2_result.avg_fill_price.unwrap_or(opp.leg2_price);
+                let total_cost = paired * (leg1_price + leg2_price);
+
+                info!(
+                    paired = %paired,
+                    total_cost = %total_cost,
+                    latency_ms = latency_ms,
+                    "Both legs filled (parallel)"
+                );
+
+                CrossMarketExecutionResult::Success {
+                    leg1_result,
+                    leg2_result,
+                    total_cost,
+                    expected_payout: Decimal::ONE,
+                }
+            }
+            (true, false) => {
+                warn!(
+                    leg1_filled_size = %leg1_result.filled_size,
+                    leg2_status = ?leg2_result.status,
+                    "Parallel: leg1 filled, leg2 rejected — directional exposure"
+                );
+                CrossMarketExecutionResult::Leg1OnlyFilled {
+                    leg1_result,
+                    leg2_result,
+                }
+            }
+            (false, true) => {
+                warn!(
+                    leg1_status = ?leg1_result.status,
+                    leg2_filled_size = %leg2_result.filled_size,
+                    "Parallel: leg2 filled, leg1 rejected — directional exposure"
+                );
+                CrossMarketExecutionResult::Leg2OnlyFilled {
+                    leg1_result,
+                    leg2_result,
+                }
+            }
+            (false, false) => {
+                info!(
+                    leg1_status = ?leg1_result.status,
+                    leg2_status = ?leg2_result.status,
+                    "Both legs rejected"
+                );
+                CrossMarketExecutionResult::BothRejected {
+                    leg1_result,
+                    leg2_result,
+                }
             }
         };
 
         Ok(result)
+    }
+
+    /// Trims excess shares from an over-filled leg by selling at best bid.
+    ///
+    /// When parallel leg submission results in asymmetric fills (e.g., 26.2 vs 24.5 shares),
+    /// the excess on the over-filled leg is sold via FAK to restore delta-neutral pairing.
+    /// Uses a 2% discount from reference price to ensure the sell fills quickly.
+    async fn trim_excess_shares(
+        &self,
+        token_id: &str,
+        excess: Decimal,
+        reference_price: Decimal,
+    ) {
+        // Sell at 2% below reference to ensure fill, but floor at 0.01
+        let sell_price = (reference_price * dec!(0.98)).max(dec!(0.01));
+
+        let sell_order = OrderParams {
+            token_id: token_id.to_string(),
+            side: Side::Sell,
+            price: sell_price,
+            size: excess,
+            order_type: OrderType::Fak,
+            neg_risk: false,
+            presigned: None,
+        };
+
+        info!(
+            token_id = %token_id,
+            excess = %excess,
+            sell_price = %sell_price,
+            "Trimming excess shares to match paired position"
+        );
+
+        match self.executor.submit_order(sell_order).await {
+            Ok(result) => {
+                if result.filled_size > Decimal::ZERO {
+                    info!(
+                        filled = %result.filled_size,
+                        "Trim sell filled"
+                    );
+                } else {
+                    warn!("Trim sell not filled — small unhedged exposure remains");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Trim sell failed — small unhedged exposure remains");
+            }
+        }
     }
 
     /// Updates latency statistics.
@@ -1803,8 +1923,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         // Add to pending settlements for paper trading (if successful)
-        if result.is_success() {
-            self.add_pending_settlement(opp, shares).await;
+        // Use actual paired size (min of both fills) instead of requested shares,
+        // since parallel execution may produce asymmetric fills that get trimmed.
+        if let CrossMarketExecutionResult::Success {
+            ref leg1_result,
+            ref leg2_result,
+            ..
+        } = result
+        {
+            let paired_shares = leg1_result.filled_size.min(leg2_result.filled_size);
+            self.add_pending_settlement(opp, paired_shares).await;
         }
 
         // Persist to database if configured
@@ -2547,21 +2675,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                             && s.remaining_shares_leg2 <= Decimal::ZERO
                         {
                             let early_proceeds = s.early_exit_proceeds;
-                            let pnl = early_proceeds - settlement.total_cost;
                             let trade_id = settlement.trade_id.clone();
-
-                            info!(
-                                trade_id = %trade_id,
-                                proceeds = %early_proceeds,
-                                cost = %settlement.total_cost,
-                                pnl = %pnl,
-                                "Early exit: FULLY EXITED"
-                            );
-
-                            // Credit balance while holding pending lock (no other lock needed)
-                            if let Err(e) = self.executor.credit_balance(early_proceeds).await {
-                                warn!(error = %e, "Failed to credit early exit proceeds");
-                            }
 
                             // Remove from pending
                             pending.retain(|s| s.trade_id != trade_id);
@@ -2575,6 +2689,22 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         None
                     }
                 }; // pending lock dropped here
+
+                // Credit balance and log outside lock scope
+                if let Some((early_proceeds, ref trade_id, _)) = fully_exited_data {
+                    let pnl = early_proceeds - settlement.total_cost;
+                    info!(
+                        trade_id = %trade_id,
+                        proceeds = %early_proceeds,
+                        cost = %settlement.total_cost,
+                        pnl = %pnl,
+                        "Early exit: FULLY EXITED"
+                    );
+
+                    if let Err(e) = self.executor.credit_balance(early_proceeds).await {
+                        warn!(error = %e, "Failed to credit early exit proceeds");
+                    }
+                }
 
                 // Update stats without holding pending lock (avoids deadlock)
                 if let Some((early_proceeds, trade_id, pending_len)) = fully_exited_data {
