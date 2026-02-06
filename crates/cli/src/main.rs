@@ -6,10 +6,10 @@ mod tui_backtest_manager;
 mod tui_live_bot;
 
 use commands::{
-    ArbitrageBotArgs, BackfillFundingArgs, BackfillOhlcvArgs, BackfillSignalsArgs,
-    BinaryBacktestArgs, CalculateReturnsArgs, CheckDepthArgs, CollectPolymarketArgs,
-    CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs, CrossMarketBacktestArgs,
-    CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
+    ApproveAllowancesArgs, ArbitrageBotArgs, BackfillFundingArgs, BackfillOhlcvArgs,
+    BackfillSignalsArgs, BinaryBacktestArgs, CalculateReturnsArgs, CheckDepthArgs,
+    CollectPolymarketArgs, CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs,
+    CrossMarketBacktestArgs, CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
     EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs, LatencyMonitorArgs,
     Phase1ArbitrageArgs, PolymarketPaperTradeArgs, PreflightArgs, ValidateSignalsArgs,
 };
@@ -157,6 +157,8 @@ enum Commands {
     CheckDepth(CheckDepthArgs),
     /// Preflight validation before going live (wallet, balance, API connectivity)
     Preflight(PreflightArgs),
+    /// Set Polymarket exchange contract allowances (required once before live trading)
+    ApproveAllowances(ApproveAllowancesArgs),
 }
 
 #[tokio::main]
@@ -327,6 +329,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Preflight(args) => {
             commands::run_preflight(args).await?;
+        }
+        Commands::ApproveAllowances(args) => {
+            commands::run_approve_allowances(args).await?;
         }
     }
 

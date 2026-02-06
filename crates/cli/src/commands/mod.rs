@@ -1,5 +1,6 @@
 //! CLI commands for the statistical trading engine.
 
+pub mod approve_allowances;
 pub mod arbitrage_bot;
 pub mod backfill_funding;
 pub mod backfill_ohlcv;
@@ -25,6 +26,7 @@ pub mod preflight;
 pub mod validate_signals;
 pub mod window_timing;
 
+pub use approve_allowances::{run as run_approve_allowances, ApproveAllowancesArgs};
 pub use arbitrage_bot::{run_arbitrage_bot, ArbitrageBotArgs};
 pub use backfill_funding::{run_backfill_funding, BackfillFundingArgs};
 pub use backfill_ohlcv::{run_backfill_ohlcv, BackfillOhlcvArgs};

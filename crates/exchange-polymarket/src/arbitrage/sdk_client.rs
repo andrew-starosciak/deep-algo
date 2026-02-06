@@ -546,55 +546,65 @@ impl ClobClient {
     pub async fn get_balance(&self) -> Result<Decimal, ClobError> {
         // HMAC signs over the base path only; query params are appended to the URL separately
         let hmac_path = "/balance-allowance";
-        let url = format!(
-            "{}/balance-allowance?asset_type=COLLATERAL&signature_type=0",
-            self.config.base_url
-        );
 
-        debug!(url = %url, "Fetching balance");
+        // Try both signature types: 1 (Poly proxy) then 0 (EOA direct)
+        // Polymarket creates proxy wallets when depositing through the web UI
+        for sig_type in [1u8, 0] {
+            let url = format!(
+                "{}/balance-allowance?asset_type=COLLATERAL&signature_type={}",
+                self.config.base_url, sig_type
+            );
 
-        let mut request = self.http.get(&url);
+            debug!(url = %url, signature_type = sig_type, "Fetching balance");
 
-        // Add L2 auth headers if authenticated
-        if let Some(ref l2_auth) = self.l2_auth {
-            let headers = l2_auth
-                .headers("GET", hmac_path, "")
-                .map_err(|e| ClobError::Auth(format!("L2 header generation failed: {}", e)))?;
-            request = request
-                .header("POLY_ADDRESS", &headers.address)
-                .header("POLY_SIGNATURE", &headers.signature)
-                .header("POLY_TIMESTAMP", &headers.timestamp)
-                .header("POLY_API_KEY", &headers.api_key)
-                .header("POLY_PASSPHRASE", &headers.passphrase);
+            let mut request = self.http.get(&url);
+
+            if let Some(ref l2_auth) = self.l2_auth {
+                let headers = l2_auth
+                    .headers("GET", hmac_path, "")
+                    .map_err(|e| {
+                        ClobError::Auth(format!("L2 header generation failed: {}", e))
+                    })?;
+                request = request
+                    .header("POLY_ADDRESS", &headers.address)
+                    .header("POLY_SIGNATURE", &headers.signature)
+                    .header("POLY_TIMESTAMP", &headers.timestamp)
+                    .header("POLY_API_KEY", &headers.api_key)
+                    .header("POLY_PASSPHRASE", &headers.passphrase);
+            }
+
+            let response = request.send().await?;
+
+            if !response.status().is_success() {
+                continue;
+            }
+
+            let body_text = response.text().await.unwrap_or_default();
+            debug!(raw_body = %body_text, signature_type = sig_type, "Balance response");
+
+            let balance: BalanceResponse =
+                serde_json::from_str(&body_text).map_err(|e| {
+                    ClobError::Parse(format!(
+                        "Failed to parse balance response: {} - body: {}",
+                        e, body_text
+                    ))
+                })?;
+
+            let balance_str = balance.balance.unwrap_or_else(|| "0".to_string());
+            let balance_val = balance_str.parse::<Decimal>().map_err(|e| {
+                ClobError::Parse(format!(
+                    "Failed to parse balance value '{}': {}",
+                    balance_str, e
+                ))
+            })?;
+
+            if balance_val > Decimal::ZERO {
+                info!(balance = %balance_val, signature_type = sig_type, "Found CLOB balance");
+                return Ok(balance_val);
+            }
         }
 
-        let response = request.send().await?;
-
-        if !response.status().is_success() {
-            let status = response.status().as_u16();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ClobError::Api {
-                status,
-                message: body,
-            });
-        }
-
-        let balance: BalanceResponse = response
-            .json()
-            .await
-            .map_err(|e| ClobError::Parse(format!("Failed to parse balance response: {}", e)))?;
-
-        // Parse balance from response
-        let balance_str = balance
-            .balance
-            .unwrap_or_else(|| "0".to_string());
-
-        balance_str.parse::<Decimal>().map_err(|e| {
-            ClobError::Parse(format!(
-                "Failed to parse balance value '{}': {}",
-                balance_str, e
-            ))
-        })
+        Ok(Decimal::ZERO)
     }
 
     /// Gets all positions for the authenticated wallet from the Data API.

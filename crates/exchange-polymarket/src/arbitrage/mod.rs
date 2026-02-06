@@ -64,6 +64,7 @@
 //! - **Timing**: Opportunities may disappear before execution
 //! - **Imbalance**: Partial fills create directional exposure
 
+pub mod approvals;
 pub mod auto_executor;
 pub mod book_feed;
 pub mod circuit_breaker;
@@ -87,6 +88,7 @@ pub mod metrics;
 pub mod orderbook;
 pub mod paper_executor;
 pub mod phase1_config;
+pub mod polygon_tx;
 pub mod position_persistence;
 pub mod presigned_orders;
 pub mod rate_limiter;
