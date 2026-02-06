@@ -6,8 +6,8 @@
 use algo_trade_polymarket::arbitrage::{
     CrossMarketAutoExecutor, CrossMarketAutoExecutorConfig, CrossMarketAutoExecutorStats,
     CrossMarketCombination, CrossMarketRunner, CrossMarketRunnerConfig, CrossMarketRunnerStats,
-    LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig, PendingTradeDisplay,
-    PolymarketExecutor, RecentTradeDisplay,
+    EventKind, LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig,
+    PendingTradeDisplay, PolymarketExecutor, RecentTradeDisplay,
 };
 use algo_trade_polymarket::models::Coin;
 use anyhow::Result;
@@ -492,6 +492,7 @@ async fn print_dashboard(
     let dim = "\x1b[2m";
     let bold = "\x1b[1m";
     let clear_line = "\x1b[2K";
+    let magenta = "\x1b[95m";
 
     let mode_color = if config.mode == ExecutionMode::Live { red } else { yellow };
 
@@ -513,6 +514,13 @@ async fn print_dashboard(
         0.0
     };
 
+    // Fill rate
+    let fill_rate = if auto.executions_attempted > 0 {
+        (auto.both_filled as f64 / auto.executions_attempted as f64) * 100.0
+    } else {
+        0.0
+    };
+
     // P&L color
     let pnl_color = if auto.realized_pnl > Decimal::ZERO {
         green
@@ -522,11 +530,11 @@ async fn print_dashboard(
         reset
     };
 
-    // Latency display (only available after trades execute)
+    // Latency display
     let latency_str = if auto.latency_samples > 0 {
-        format!("{}ms (avg {}ms)", auto.last_latency_ms, auto.avg_latency_ms)
+        format!("{}ms avg", auto.avg_latency_ms)
     } else {
-        "waiting for trade".to_string()
+        "-".to_string()
     };
 
     // Get current prices for the pair
@@ -537,95 +545,134 @@ async fn print_dashboard(
     // Move cursor to top
     print!("\x1b[H");
 
-    // Clear and print each line
+    // Header
     println!("{clear_line}");
-    println!("{clear_line}{bold}{cyan}  CROSS-MARKET CORRELATION ARBITRAGE{reset}");
+    println!("{clear_line}{bold}{cyan}  CROSS-MARKET CORRELATION ARBITRAGE{reset}  {mode_color}[{}]{reset}", config.mode);
+    println!("{clear_line}{dim}  ────────────────────────────────────────────────────────────────{reset}");
+
+    // Compact config + systems line
+    let status_text = if shutting_down { format!("{yellow}STOP{reset}") } else { format!("{green}RUN{reset}") };
+    println!("{clear_line}  {dim}Pair:{reset} {:7} {dim}Bet:{reset} {:7} {dim}Spread:{reset} >${:.2}  {dim}Latency:{reset} {:8}  [{status_text}]",
+        config.pair, config.bet_size, config.min_spread, latency_str);
+    println!("{clear_line}  {scanner_dot}●{reset}Scan {executor_dot}●{reset}Exec {ws_dot}●{reset}WS   {dim}Max:{reset} ${:.0}/win  {dim}Bal:{reset} ${:.2}",
+        config.max_position, config.balance);
     println!("{clear_line}");
 
-    // Config line
-    println!("{clear_line}  {dim}Mode:{reset} {mode_color}{:6}{reset}   {dim}Pair:{reset} {:8}   {dim}Strategy:{reset} {}",
-        config.mode, config.pair, config.combination);
-    println!("{clear_line}  {dim}Bet:{reset}  {:7}  {dim}Spread:{reset} ${:.2}   {dim}Max/Window:{reset} ${:.0}   {dim}Balance:{reset} ${:.2}",
-        config.bet_size, config.min_spread, config.max_position, config.balance);
-    println!("{clear_line}");
-
-    // Systems status
-    let status_text = if shutting_down { format!("{yellow}Stopping{reset}") } else { format!("{green}Running{reset}") };
-    println!("{clear_line}  {bold}Systems{reset}  {scanner_dot}●{reset} Scanner  {executor_dot}●{reset} Executor  {ws_dot}●{reset} WebSocket  [{status_text}]");
-    println!("{clear_line}  {dim}Latency:{reset} {latency_str}");
-    println!("{clear_line}");
-
-    // Live prices
-    println!("{clear_line}  {bold}Live Prices{reset}");
+    // Live prices + strategy spread
+    println!("{clear_line}  {bold}Prices{reset}");
     if let Some((up, down)) = c1_prices {
-        println!("{clear_line}    {coin1}:  {green}UP ${:.2}{reset}  {red}DOWN ${:.2}{reset}", up, down);
+        print!("{clear_line}    {coin1}  {green}UP {:.2}{reset}  {red}DN {:.2}{reset}", up, down);
     } else {
-        println!("{clear_line}    {coin1}:  {dim}waiting...{reset}");
+        print!("{clear_line}    {coin1}  {dim}...{reset}");
     }
     if let Some((up, down)) = c2_prices {
-        println!("{clear_line}    {coin2}:  {green}UP ${:.2}{reset}  {red}DOWN ${:.2}{reset}", up, down);
+        print!("    {coin2}  {green}UP {:.2}{reset}  {red}DN {:.2}{reset}", up, down);
     } else {
-        println!("{clear_line}    {coin2}:  {dim}waiting...{reset}");
+        print!("    {coin2}  {dim}...{reset}");
     }
-    // Show combined cost for the strategy based on combination
+    // Strategy cost inline
     let strategy_cost = match config.combination.as_str() {
-        "Coin1↓ Coin2↑" => c1_prices.zip(c2_prices).map(|((_, c1_down), (c2_up, _))| (c1_down + c2_up, format!("{coin1}↓ + {coin2}↑"))),
-        "Coin1↑ Coin2↓" => c1_prices.zip(c2_prices).map(|((c1_up, _), (_, c2_down))| (c1_up + c2_down, format!("{coin1}↑ + {coin2}↓"))),
-        "Both↑" => c1_prices.zip(c2_prices).map(|((c1_up, _), (c2_up, _))| (c1_up + c2_up, format!("{coin1}↑ + {coin2}↑"))),
-        "Both↓" => c1_prices.zip(c2_prices).map(|((_, c1_down), (_, c2_down))| (c1_down + c2_down, format!("{coin1}↓ + {coin2}↓"))),
-        _ => c1_prices.zip(c2_prices).map(|((_, c1_down), (c2_up, _))| (c1_down + c2_up, format!("{coin1}↓ + {coin2}↑"))),
+        "Coin1↓ Coin2↑" => c1_prices.zip(c2_prices).map(|((_, d), (u, _))| d + u),
+        "Coin1↑ Coin2↓" => c1_prices.zip(c2_prices).map(|((u, _), (_, d))| u + d),
+        "Both↑" => c1_prices.zip(c2_prices).map(|((u1, _), (u2, _))| u1 + u2),
+        "Both↓" => c1_prices.zip(c2_prices).map(|((_, d1), (_, d2))| d1 + d2),
+        _ => c1_prices.zip(c2_prices).map(|((_, d), (u, _))| d + u),
     };
-    if let Some((total, combo_str)) = strategy_cost {
+    if let Some(total) = strategy_cost {
         let spread = Decimal::ONE - total;
-        let spread_color = if spread >= Decimal::from_str("0.03").unwrap_or_default() { green } else { yellow };
-        println!("{clear_line}    {dim}Strategy:{reset} {combo_str} = ${:.2}  {dim}Spread:{reset} {spread_color}${:.2}{reset}", total, spread);
+        let sc = if spread >= Decimal::from_str("0.03").unwrap_or_default() { green } else { yellow };
+        println!("    {dim}Sprd:{reset} {sc}{:.3}{reset}", spread);
+    } else {
+        println!();
     }
     println!("{clear_line}");
 
-    // Trading stats
-    println!("{clear_line}  {bold}Trading{reset}");
-    println!("{clear_line}    Scans: {:<6}  Opportunities: {:<6}  Executed: {}",
-        runner.scans_performed, runner.opportunities_detected, auto.both_filled);
-    println!("{clear_line}    Pending: {:<4}  Settled: {:<4}  Skipped: {:<4}  Rejected: {}",
-        auto.pending_settlement, total_settled, auto.opportunities_skipped, auto.both_rejected);
-    println!("{clear_line}");
-
-    // Performance
-    println!("{clear_line}  {bold}Performance{reset}");
-    println!("{clear_line}    Wins: {green}{}{reset}  Losses: {red}{}{reset}  Win Rate: {:.1}%",
+    // ── Trading Stats ──
+    println!("{clear_line}  {bold}Trading{reset}                              {bold}Performance{reset}");
+    println!("{clear_line}    Scans: {:<6} Opps: {:<5} Exec: {:<4}    Wins: {green}{}{reset}  Losses: {red}{}{reset}  Rate: {:.0}%",
+        runner.scans_performed, runner.opportunities_detected, auto.both_filled,
         auto.settled_wins, auto.settled_losses, win_rate);
-    println!("{clear_line}    P&L: {pnl_color}${:.2}{reset}  Volume: ${:.2}",
+    println!("{clear_line}    Partial: {:<4} Reject: {:<4} Fill: {:.0}%    P&L: {pnl_color}${:.2}{reset}  Vol: ${:.2}",
+        auto.partial_fills, auto.both_rejected, fill_rate,
         auto.realized_pnl, auto.total_volume);
+
+    // Extra stats row (trims, early exits, recovery)
+    let extras: Vec<String> = [
+        (auto.trim_count > 0).then(|| format!("Trims:{}", auto.trim_count)),
+        (auto.early_exits > 0).then(|| format!("EarlyExits:{}", auto.early_exits)),
+        (auto.incomplete_recovered > 0).then(|| format!("Recovered:{}", auto.incomplete_recovered)),
+        (auto.incomplete_escaped > 0).then(|| format!("Escaped:{}", auto.incomplete_escaped)),
+        (auto.pending_settlement > 0).then(|| format!("Pending:{}", auto.pending_settlement)),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    if !extras.is_empty() {
+        println!("{clear_line}    {dim}{}{reset}", extras.join("  "));
+    }
     println!("{clear_line}");
 
-    // Trades this window
-    if !auto.recent_trades.is_empty() || !auto.pending_trades.is_empty() {
-        println!("{clear_line}  {bold}Trades This Window{reset}");
-        for trade in auto.recent_trades.iter().rev().take(3) {
-            // Convert to local time for display
-            let local_time: chrono::DateTime<chrono::Local> = trade.executed_at.into();
-            println!("{clear_line}    {dim}[{}]{reset} {}: {}${:.2} + {}${:.2} = ${:.2}",
-                local_time.format("%H:%M:%S"),
-                trade.pair,
-                trade.leg1_dir.chars().next().unwrap_or('-'), trade.leg1_price,
-                trade.leg2_dir.chars().next().unwrap_or('-'), trade.leg2_price,
-                trade.total_cost);
-        }
-        for pending in auto.pending_trades.iter().take(2) {
-            let remaining = (pending.window_end - chrono::Utc::now()).num_seconds().max(0);
-            let status = if remaining > 0 {
-                format!("{yellow}settles in {}s{reset}", remaining)
+    // ── Holdings (positions we're currently holding) ──
+    if !auto.pending_trades.is_empty() {
+        println!("{clear_line}  {bold}Holdings{reset}");
+        println!("{clear_line}    {dim}Pair        Leg1         Shares   Leg2         Shares   Cost    Status{reset}");
+        for p in auto.pending_trades.iter().take(5) {
+            let remaining_secs = (p.window_end - chrono::Utc::now()).num_seconds().max(0);
+            let status = if p.partially_exited {
+                format!("{magenta}exiting{reset}")
+            } else if remaining_secs > 0 {
+                let mins = remaining_secs / 60;
+                let secs = remaining_secs % 60;
+                format!("{yellow}{mins}:{secs:02}{reset}")
             } else {
-                format!("{green}settling...{reset}")
+                format!("{green}settle{reset}")
             };
-            println!("{clear_line}    {dim}[pending]{reset} {}: {}+{} ${:.2} {status}",
-                pending.pair, pending.leg1_dir.chars().next().unwrap_or('-'),
-                pending.leg2_dir.chars().next().unwrap_or('-'), pending.total_cost);
+
+            // Get current bid prices for P&L comparison
+            let l1_dir_char = p.leg1_dir.chars().next().unwrap_or('-');
+            let l2_dir_char = p.leg2_dir.chars().next().unwrap_or('-');
+
+            println!(
+                "{clear_line}    {:<10}  {l1_dir_char}@{:.2}  {green}{:>6.1}sh{reset}   {l2_dir_char}@{:.2}  {green}{:>6.1}sh{reset}   ${:<6.2}  {status}",
+                p.pair, p.entry_price_leg1, p.shares_leg1,
+                p.entry_price_leg2, p.shares_leg2,
+                p.total_cost,
+            );
+            if p.early_exit_proceeds > Decimal::ZERO {
+                println!(
+                    "{clear_line}    {dim}           early exit proceeds: ${:.2}{reset}",
+                    p.early_exit_proceeds,
+                );
+            }
+        }
+        if auto.pending_trades.len() > 5 {
+            println!("{clear_line}    {dim}... and {} more{reset}", auto.pending_trades.len() - 5);
         }
         println!("{clear_line}");
     }
 
-    // Window progress (15-minute market window)
+    // ── Event Log (last N key events) ──
+    if !auto.event_log.is_empty() {
+        println!("{clear_line}  {bold}Events{reset}");
+        for event in auto.event_log.iter().rev().take(8) {
+            let local_time: chrono::DateTime<chrono::Local> = event.time.into();
+            let time_str = local_time.format("%H:%M:%S");
+            let color = match event.kind {
+                EventKind::Fill => green,
+                EventKind::PartialFill => yellow,
+                EventKind::Reject => dim,
+                EventKind::Trim => magenta,
+                EventKind::EarlyExit => cyan,
+                EventKind::Settlement => if event.message.contains("WIN") { green } else { red },
+                EventKind::Recovery => yellow,
+                EventKind::Error => red,
+            };
+            println!("{clear_line}    {dim}{time_str}{reset} {color}{}{reset}", event.message);
+        }
+        println!("{clear_line}");
+    }
+
+    // ── Progress bars ──
     let (window_pct, window_remaining) = get_window_progress();
     let window_bar_width = 15;
     let window_filled = (window_pct / 100.0 * window_bar_width as f64) as usize;
@@ -634,16 +681,19 @@ async fn print_dashboard(
     let window_mins = window_remaining / 60;
     let window_secs = window_remaining % 60;
 
-    // Session progress bar
     let bar_width = 20;
     let filled = (progress_pct / 100.0 * bar_width as f64) as usize;
     let empty = bar_width - filled;
     let bar = format!("{}{}", "█".repeat(filled), "░".repeat(empty));
 
-    println!("{clear_line}  {dim}Window:{reset}  [{yellow}{window_bar}{reset}] {window_mins}:{window_secs:02} left   {dim}Session:{reset} [{cyan}{bar}{reset}] {remaining_str} left");
-    println!("{clear_line}");
-    println!("{clear_line}  {dim}Time: {}  |  Ctrl+C to stop  |  Logs: /tmp/cross_market_auto.log{reset}",
+    println!("{clear_line}  {dim}Window:{reset} [{yellow}{window_bar}{reset}] {window_mins}:{window_secs:02}   {dim}Session:{reset} [{cyan}{bar}{reset}] {remaining_str}");
+    println!("{clear_line}  {dim}{}  |  Ctrl+C to stop{reset}",
         Local::now().format("%H:%M:%S"));
+
+    // Clear any leftover lines from previous render
+    for _ in 0..5 {
+        println!("{clear_line}");
+    }
 
     let _ = stdout().flush();
 }
@@ -724,9 +774,10 @@ async fn print_summary(
         auto.opportunities_received, auto.opportunities_skipped, auto.both_filled);
     println!("    Partial: {}  Rejected: {}  Volume: ${:.2}",
         auto.partial_fills, auto.both_rejected, auto.total_volume);
-    if auto.incomplete_trades > 0 || auto.incomplete_recovered > 0 {
-        println!("    Incomplete: {} pending, {} recovered, {} expired",
-            auto.incomplete_trades, auto.incomplete_recovered, auto.incomplete_expired);
+    if auto.incomplete_trades > 0 || auto.incomplete_recovered > 0 || auto.incomplete_escaped > 0 {
+        println!("    Recovery: {} pending, {} recovered, {} expired, {} escaped",
+            auto.incomplete_trades, auto.incomplete_recovered,
+            auto.incomplete_expired, auto.incomplete_escaped);
     }
     if auto.executions_attempted > 0 {
         let fill_rate = auto.both_filled as f64 / auto.executions_attempted as f64 * 100.0;
@@ -734,6 +785,12 @@ async fn print_summary(
     }
     if auto.latency_samples > 0 {
         println!("    Avg latency: {}ms ({} samples)", auto.avg_latency_ms, auto.latency_samples);
+    }
+    if auto.trim_count > 0 {
+        println!("    Trims: {} ({:.1} shares trimmed)", auto.trim_count, auto.trim_shares);
+    }
+    if auto.early_exits > 0 {
+        println!("    Early exits: {} (${:.2} proceeds)", auto.early_exits, auto.early_exit_proceeds);
     }
     println!();
     println!("  {bold}Settlement{reset}");
@@ -748,6 +805,15 @@ async fn print_summary(
         println!("    Win Rate: {:.1}%", win_rate);
     }
     println!();
-    println!("  {dim}Full logs: /tmp/cross_market_auto.log{reset}");
+    // Show last few events
+    if !auto.event_log.is_empty() {
+        println!("  {bold}Last Events{reset}");
+        for event in auto.event_log.iter().rev().take(5) {
+            let local_time: chrono::DateTime<chrono::Local> = event.time.into();
+            println!("    {dim}{}{reset} {}", local_time.format("%H:%M:%S"), event.message);
+        }
+        println!();
+    }
+    println!("  {dim}Full logs available via: RUST_LOG=info (see script --verbose flag){reset}");
     println!();
 }

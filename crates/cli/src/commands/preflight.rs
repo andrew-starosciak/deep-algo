@@ -137,6 +137,28 @@ pub async fn run(args: PreflightArgs) -> Result<()> {
         None
     };
 
+    // Redeem any resolved positions before checking balance
+    if let Some(ref client) = client {
+        println!("│  ⏳ Checking for redeemable positions...                     │");
+        let rpc_url = std::env::var("POLYGON_RPC_URL")
+            .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+        match client.redeem_resolved_positions(&rpc_url).await {
+            Ok(0) => {
+                println!("│  ✓ No positions to redeem                                   │");
+            }
+            Ok(n) => {
+                results.push(CheckResult::pass("Redeem", format!("{} conditions redeemed", n)));
+                println!("│  ✓ Redeemed {} condition(s) — USDC recovered                │", n);
+                // Wait a moment for on-chain settlement to reflect in balance
+                println!("│  ⏳ Waiting for on-chain balance update...                   │");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            Err(e) => {
+                println!("│  ⚠ Redeem failed (non-critical): {:28} │", truncate(&e.to_string(), 28));
+            }
+        }
+    }
+
     // Check balance
     if let Some(ref client) = client {
         match client.get_balance().await {

@@ -297,10 +297,15 @@ fi
 # Run
 # =============================================================================
 
+# Always create a log file for tracing output
+mkdir -p "$PROJECT_ROOT/logs"
+if [[ -z "$LOG_FILE" ]]; then
+    LOG_FILE="$PROJECT_ROOT/logs/${MODE}-$(date +%Y%m%d-%H%M%S).log"
+fi
+
 echo -e "${GREEN}Starting bot...${NC}"
 echo -e "${DIM}Press Ctrl+C to stop${NC}"
-echo ""
-echo -e "${DIM}─────────────────────────────────────────────────────────────────────${NC}"
+echo -e "${DIM}Logs: ${LOG_FILE}${NC}"
 echo ""
 
 # Trap to clean up child processes
@@ -310,44 +315,59 @@ cleanup() {
         kill "$BOT_PID" 2>/dev/null || true
         wait "$BOT_PID" 2>/dev/null || true
     fi
+    echo ""
+    echo -e "${DIM}Log file: ${LOG_FILE}${NC}"
 }
 trap cleanup EXIT INT TERM
 
-# Format and colorize output
+# Format and colorize output (for --verbose mode)
 colorize_output() {
     while IFS= read -r line; do
         local timestamp
         timestamp=$(date '+%H:%M:%S')
 
-        if echo "$line" | grep -q "Both legs filled\|Execution successful"; then
+        if echo "$line" | grep -q "Both legs filled\|FILLED\|Execution successful"; then
             echo -e "${GREEN}[$timestamp] $line${NC}"
-        elif echo "$line" | grep -q "Opportunity detected\|Signal:"; then
+        elif echo "$line" | grep -q "TRIM\|Trimming\|trim"; then
             echo -e "${CYAN}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "Early exit\|EARLY EXIT\|FULLY EXITED"; then
+            echo -e "${CYAN}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "SETTLED\|Paper trade settled"; then
+            echo -e "${WHITE}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "RECOVERED\|recovery"; then
+            echo -e "${YELLOW}[$timestamp] $line${NC}"
+        elif echo "$line" | grep -q "Partial fill\|PARTIAL\|directional exposure"; then
+            echo -e "${YELLOW}[$timestamp] $line${NC}"
         elif echo "$line" | grep -q "Opps:\|Vol:\|Bal:"; then
             echo -e "${WHITE}[$timestamp] $line${NC}"
         elif echo "$line" | grep -q "ERROR\|error\|Error"; then
             echo -e "${RED}[$timestamp] $line${NC}"
         elif echo "$line" | grep -q "WARN\|warn\|Warning"; then
             echo -e "${YELLOW}[$timestamp] $line${NC}"
-        elif echo "$line" | grep -q "Position limit\|filtered\|skipped"; then
-            echo -e "${DIM}[$timestamp] $line${NC}"
-        elif echo "$line" | grep -q "Final Summary\|==="; then
+        elif echo "$line" | grep -q "SESSION COMPLETE\|==="; then
             echo ""
             echo -e "${WHITE}$line${NC}"
         else
-            echo -e "${DIM}[$timestamp]${NC} $line"
+            # Skip noisy debug lines in verbose mode
+            if echo "$line" | grep -qv "periodic settlement\|Running periodic\|Window transition"; then
+                echo -e "${DIM}[$timestamp]${NC} $line"
+            fi
         fi
     done
 }
 
-if [[ -n "$LOG_FILE" ]]; then
-    # Overnight mode: tee to log file and colorize terminal output
-    echo -e "${CYAN}OVERNIGHT MODE - logging to: ${LOG_FILE}${NC}"
+export RUST_LOG="${RUST_LOG:-info}"
+
+if [[ -n "$VERBOSE" ]]; then
+    # Verbose mode: merge stdout+stderr, colorize, tee to log
+    echo -e "${DIM}─────────────────────────────────────────────────────────────────────${NC}"
     echo ""
-    RUST_LOG=info "${CMD[@]}" 2>&1 | tee "$LOG_FILE" | colorize_output &
+    "${CMD[@]}" 2>&1 | tee "$LOG_FILE" | colorize_output &
     BOT_PID=$!
 else
-    RUST_LOG=info "${CMD[@]}" 2>&1 | colorize_output &
+    # Dashboard mode: stderr (tracing) goes to log file, stdout (dashboard) to terminal
+    # The Rust dashboard handles its own ANSI formatting and screen clearing
+    "${CMD[@]}" 2>"$LOG_FILE" &
     BOT_PID=$!
 fi
 
@@ -362,12 +382,13 @@ echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════${NC}"
 echo -e "${WHITE}Bot stopped${NC}"
 
-# Show log file location if overnight
-if [[ -n "$LOG_FILE" && -f "$LOG_FILE" ]]; then
+# Always show log file location
+if [[ -f "$LOG_FILE" ]]; then
     LINES=$(wc -l < "$LOG_FILE")
     echo ""
     echo -e "${WHITE}Log file:${NC} $LOG_FILE ($LINES lines)"
-    echo -e "${DIM}View with: less $LOG_FILE${NC}"
+    echo -e "${DIM}View with: less -R $LOG_FILE${NC}"
+    echo -e "${DIM}Tail key events: grep -E 'FILLED|TRIM|SETTLED|EARLY|PARTIAL|ERROR' $LOG_FILE${NC}"
 fi
 
 # Show final database stats if persisting

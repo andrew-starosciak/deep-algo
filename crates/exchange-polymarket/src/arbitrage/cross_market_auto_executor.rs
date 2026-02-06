@@ -403,6 +403,17 @@ pub struct CrossMarketAutoExecutorStats {
     /// Total USDC received from early exit sells.
     pub early_exit_proceeds: Decimal,
 
+    // === Trim Stats ===
+    /// Number of trim sells executed after asymmetric parallel fills.
+    pub trim_count: u64,
+
+    /// Total shares trimmed.
+    pub trim_shares: Decimal,
+
+    // === Event Log (for dashboard) ===
+    /// Recent key events for dashboard display (max 20).
+    pub event_log: VecDeque<EventLogEntry>,
+
     // === Live prices from WebSocket (for settlement) ===
     /// Current prices from WebSocket feed: coin -> (up_price, down_price).
     /// Updated by the CLI from runner stats, used for fast settlement.
@@ -422,7 +433,7 @@ pub struct RecentTradeDisplay {
     pub executed_at: DateTime<Utc>,
 }
 
-/// Pending trade info for dashboard display.
+/// Pending trade info for dashboard display (includes holding details).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PendingTradeDisplay {
     pub trade_id: String,
@@ -431,6 +442,39 @@ pub struct PendingTradeDisplay {
     pub leg2_dir: String,
     pub total_cost: Decimal,
     pub window_end: DateTime<Utc>,
+    /// Remaining shares on leg 1.
+    pub shares_leg1: Decimal,
+    /// Remaining shares on leg 2.
+    pub shares_leg2: Decimal,
+    /// Entry price for leg 1.
+    pub entry_price_leg1: Decimal,
+    /// Entry price for leg 2.
+    pub entry_price_leg2: Decimal,
+    /// Cumulative early exit proceeds collected so far.
+    pub early_exit_proceeds: Decimal,
+    /// Whether any early exit sells have occurred.
+    pub partially_exited: bool,
+}
+
+/// Key event entry for the dashboard event log.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventLogEntry {
+    pub time: DateTime<Utc>,
+    pub kind: EventKind,
+    pub message: String,
+}
+
+/// Type of key event for color-coding in the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventKind {
+    Fill,
+    PartialFill,
+    Reject,
+    Trim,
+    EarlyExit,
+    Settlement,
+    Recovery,
+    Error,
 }
 
 // =============================================================================
@@ -456,6 +500,10 @@ pub struct PendingPaperSettlement {
     pub leg2_token_id: String,
     /// Total cost of the trade.
     pub total_cost: Decimal,
+    /// Entry price for leg 1 (probability/share).
+    pub leg1_entry_price: Decimal,
+    /// Entry price for leg 2 (probability/share).
+    pub leg2_entry_price: Decimal,
     /// Shares bought (same for both legs).
     pub shares: Decimal,
     /// Window end time (when settlement becomes possible).
@@ -492,6 +540,11 @@ const MAX_RECOVERY_RETRIES: u32 = 60;
 /// Maximum age of an incomplete trade before triggering the escape hatch.
 /// 5 minutes gives liquidity time to return without blocking the bot too long.
 const MAX_RECOVERY_AGE_SECS: u64 = 300;
+
+/// Maximum escape sell attempts before hard-abandoning an incomplete trade.
+/// After this many failed escape sells, the trade is removed from the queue
+/// and the loss is accepted (shares may remain in portfolio, recoverable manually).
+const MAX_ESCAPE_ATTEMPTS: u32 = 10;
 
 /// An incomplete trade where one leg filled but the other didn't.
 ///
@@ -541,6 +594,9 @@ pub struct IncompleteTrade {
 
     /// Number of retry attempts.
     pub retry_count: u32,
+
+    /// Number of escape sell attempts (after should_escape() triggers).
+    pub escape_attempts: u32,
 
     /// Combination type for this trade.
     pub combination: CrossMarketCombination,
@@ -906,6 +962,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     warn!(error = %e, "Incomplete trade recovery error");
                 }
 
+                // Sync pending display with actual settlement state (shares, early exits)
+                self.sync_pending_display().await;
+
                 last_settlement_check = std::time::Instant::now();
             }
 
@@ -1157,6 +1216,54 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
+        // Push key events to dashboard event log
+        let pair = format!("{}/{}", opp.coin1, opp.coin2);
+        match &result {
+            CrossMarketExecutionResult::Success {
+                total_cost,
+                leg1_result,
+                leg2_result,
+                ..
+            } => {
+                let paired = leg1_result.filled_size.min(leg2_result.filled_size);
+                self.push_event(
+                    EventKind::Fill,
+                    format!(
+                        "FILLED {} {:.1}sh @ ${:.2} ({}↓${:.2} + {}↑${:.2})",
+                        pair, paired, total_cost, opp.coin1, opp.leg1_price, opp.coin2, opp.leg2_price,
+                    ),
+                )
+                .await;
+            }
+            CrossMarketExecutionResult::Leg1OnlyFilled { leg1_result, .. } => {
+                self.push_event(
+                    EventKind::PartialFill,
+                    format!(
+                        "PARTIAL {} leg1 only {:.1}sh — recovery queue",
+                        pair, leg1_result.filled_size,
+                    ),
+                )
+                .await;
+            }
+            CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
+                self.push_event(
+                    EventKind::PartialFill,
+                    format!(
+                        "PARTIAL {} leg2 only {:.1}sh — recovery queue",
+                        pair, leg2_result.filled_size,
+                    ),
+                )
+                .await;
+            }
+            CrossMarketExecutionResult::BothRejected { .. } => {
+                self.push_event(
+                    EventKind::Reject,
+                    format!("REJECTED {} — both legs rejected", pair),
+                )
+                .await;
+            }
+        }
+
         Ok(())
     }
 
@@ -1203,6 +1310,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 window_end,
                 created_at: Utc::now(),
                 retry_count: 0,
+                escape_attempts: 0,
                 combination: opp.combination,
             },
             FilledLeg::Leg2 => IncompleteTrade {
@@ -1225,6 +1333,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 window_end,
                 created_at: Utc::now(),
                 retry_count: 0,
+                escape_attempts: 0,
                 combination: opp.combination,
             },
         }
@@ -1295,9 +1404,42 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             // Escape hatch: if too many retries or too old, sell the filled leg
             // to recover capital rather than staying stuck indefinitely.
             if trade.should_escape() {
+                // Hard abandon: if escape sell has failed too many times, give up
+                // and remove from queue. Shares remain in portfolio for manual recovery.
+                if trade.escape_attempts >= MAX_ESCAPE_ATTEMPTS {
+                    error!(
+                        trade_id = %trade.trade_id,
+                        escape_attempts = trade.escape_attempts,
+                        shares = %trade.shares,
+                        filled_token = %trade.filled_token_id,
+                        "HARD ABANDON: escape sell failed {} times, removing from queue. \
+                         Orphaned shares remain in portfolio — manual recovery needed.",
+                        trade.escape_attempts,
+                    );
+                    {
+                        let mut incomplete = self.incomplete_trades.write().await;
+                        incomplete.retain(|t| t.trade_id != trade.trade_id);
+                    }
+                    {
+                        let mut stats = self.stats.write().await;
+                        stats.incomplete_escaped += 1;
+                        stats.incomplete_trades = stats.incomplete_trades.saturating_sub(1);
+                    }
+                    self.push_event(
+                        EventKind::Error,
+                        format!(
+                            "ABANDON {}/{} {}sh orphaned — manual sell needed",
+                            trade.coin1, trade.coin2, trade.shares,
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+
                 warn!(
                     trade_id = %trade.trade_id,
                     retry_count = trade.retry_count,
+                    escape_attempt = trade.escape_attempts + 1,
                     age_secs = (Utc::now() - trade.created_at).num_seconds(),
                     "Escape hatch triggered - selling filled leg to recover capital"
                 );
@@ -1306,12 +1448,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     warn!(
                         trade_id = %trade.trade_id,
                         error = %e,
+                        escape_attempt = trade.escape_attempts + 1,
                         "Escape sell failed, will retry next cycle"
                     );
-                    // Increment retry count so it doesn't loop forever
                     let mut incomplete = self.incomplete_trades.write().await;
                     if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
-                        t.retry_count += 1;
+                        t.escape_attempts += 1;
                     }
                     continue;
                 }
@@ -1326,6 +1468,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     stats.incomplete_escaped += 1;
                     stats.incomplete_trades = stats.incomplete_trades.saturating_sub(1);
                 }
+                self.push_event(
+                    EventKind::Recovery,
+                    format!("ESCAPE {}/{} sold filled leg to free capital", trade.coin1, trade.coin2),
+                )
+                .await;
                 continue;
             }
 
@@ -1451,6 +1598,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 stats.both_filled += 1;
                 stats.total_volume += total_cost;
             }
+            self.push_event(
+                EventKind::Recovery,
+                format!(
+                    "RECOVERED {}/{} missing leg filled @ ${:.2}",
+                    trade.coin1, trade.coin2, missing_fill_price,
+                ),
+            )
+            .await;
 
             // Add to pending settlements for paper trading
             let settlement = PendingPaperSettlement {
@@ -1478,6 +1633,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     trade.missing_token_id.clone()
                 },
                 total_cost,
+                leg1_entry_price: trade.filled_price,
+                leg2_entry_price: missing_fill_price,
                 shares: trade.shares,
                 window_end: trade.window_end,
                 executed_at: Utc::now(),
@@ -1524,7 +1681,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             FilledLeg::Leg2 => trade.coin2.to_uppercase(),
         };
 
-        let sell_price = match live_prices.get(&filled_coin) {
+        let market_price = match live_prices.get(&filled_coin) {
             Some(&(up_price, down_price)) => {
                 // We're selling, so we want the bid price for our direction
                 if trade.filled_direction == "UP" {
@@ -1540,52 +1697,76 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         };
 
-        // Sell at slightly below market to ensure fill
-        let sell_price = (sell_price * dec!(0.95)).max(dec!(0.01));
+        // Progressive slippage: more aggressive with each escape attempt
+        // Attempt 0: 95% market, Attempt 1: 92%, Attempt 2: 89%, ..., clamped at 80%
+        let discount = dec!(0.95) - dec!(0.03) * Decimal::from(trade.escape_attempts);
+        let discount = discount.max(dec!(0.80));
+        let sell_price = (market_price * discount).max(dec!(0.01));
 
         info!(
             trade_id = %trade.trade_id,
             filled_token = %trade.filled_token_id,
             shares = %trade.shares,
+            market_price = %market_price,
             sell_price = %sell_price,
+            discount = %discount,
+            escape_attempt = trade.escape_attempts + 1,
             original_buy_price = %trade.filled_price,
             "Escape hatch: selling filled leg to recover capital"
         );
 
+        // Use FAK (Fill-and-Kill / IOC) instead of FOK — accept partial fills
         let order = OrderParams {
             token_id: trade.filled_token_id.clone(),
             side: Side::Sell,
             price: sell_price,
             size: trade.shares,
-            order_type: OrderType::Fok,
+            order_type: OrderType::Fak,
             neg_risk: false,
             presigned: None,
         };
 
         let result = self.executor.submit_order(order).await?;
 
-        match result.status {
-            OrderStatus::Filled => {
-                let recovered = result.fill_notional();
-                let loss = (trade.filled_price - sell_price) * trade.shares;
-                warn!(
-                    trade_id = %trade.trade_id,
-                    recovered = %recovered,
-                    loss = %loss,
-                    "Escape hatch: sold filled leg, accepted loss to free capital"
-                );
-                Ok(())
+        // Accept any fill (full or partial) as success
+        if result.filled_size > Decimal::ZERO {
+            let recovered = result.fill_notional();
+            let loss = (trade.filled_price - sell_price) * result.filled_size;
+            let remaining = trade.shares - result.filled_size;
+            warn!(
+                trade_id = %trade.trade_id,
+                recovered = %recovered,
+                loss = %loss,
+                filled = %result.filled_size,
+                remaining = %remaining,
+                "Escape hatch: sold filled leg, accepted loss to free capital"
+            );
+            // If partially filled, update remaining shares in the incomplete trade
+            if remaining > dec!(0.5) {
+                let mut incomplete = self.incomplete_trades.write().await;
+                if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
+                    t.shares = remaining;
+                    // Don't count this as a fully successful escape — we'll retry
+                    // the rest next cycle
+                    return Err(CrossMarketAutoExecutorError::Filtered {
+                        reason: format!(
+                            "Escape partial fill: sold {}, {} remaining",
+                            result.filled_size, remaining
+                        ),
+                    });
+                }
             }
-            _ => {
-                warn!(
-                    trade_id = %trade.trade_id,
-                    status = ?result.status,
-                    "Escape sell not filled, will retry"
-                );
-                Err(CrossMarketAutoExecutorError::Filtered {
-                    reason: "Escape sell not filled".to_string(),
-                })
-            }
+            Ok(())
+        } else {
+            warn!(
+                trade_id = %trade.trade_id,
+                status = ?result.status,
+                sell_price = %sell_price,
+                "Escape sell not filled, will retry with more slippage"
+            );
+            Err(CrossMarketAutoExecutorError::Filtered {
+                reason: "Escape sell not filled".to_string(),
+            })
         }
     }
 
@@ -1846,6 +2027,15 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         filled = %result.filled_size,
                         "Trim sell filled"
                     );
+                    let mut stats = self.stats.write().await;
+                    stats.trim_count += 1;
+                    stats.trim_shares += result.filled_size;
+                    drop(stats);
+                    self.push_event(
+                        EventKind::Trim,
+                        format!("TRIM {:.1}sh @ ${:.2}", result.filled_size, sell_price),
+                    )
+                    .await;
                 } else {
                     warn!("Trim sell not filled — small unhedged exposure remains");
                 }
@@ -1864,6 +2054,43 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         stats.avg_latency_ms = ((stats.avg_latency_ms * (stats.latency_samples - 1))
             + latency_ms)
             / stats.latency_samples;
+    }
+
+    /// Pushes a key event to the dashboard event log.
+    async fn push_event(&self, kind: EventKind, message: String) {
+        let mut stats = self.stats.write().await;
+        stats.event_log.push_back(EventLogEntry {
+            time: Utc::now(),
+            kind,
+            message,
+        });
+        // Keep max 20 events
+        while stats.event_log.len() > 20 {
+            stats.event_log.pop_front();
+        }
+    }
+
+    /// Syncs pending trade display with actual pending settlements state.
+    async fn sync_pending_display(&self) {
+        let pending = self.pending_settlements.read().await;
+        let mut stats = self.stats.write().await;
+        stats.pending_trades = pending
+            .iter()
+            .map(|s| PendingTradeDisplay {
+                trade_id: s.trade_id.clone(),
+                pair: format!("{}/{}", s.coin1, s.coin2),
+                leg1_dir: s.leg1_direction.clone(),
+                leg2_dir: s.leg2_direction.clone(),
+                total_cost: s.total_cost,
+                window_end: s.window_end,
+                shares_leg1: s.remaining_shares_leg1,
+                shares_leg2: s.remaining_shares_leg2,
+                entry_price_leg1: s.leg1_entry_price,
+                entry_price_leg2: s.leg2_entry_price,
+                early_exit_proceeds: s.early_exit_proceeds,
+                partially_exited: s.partially_exited,
+            })
+            .collect();
     }
 
     /// Records a trade in history.
@@ -2079,6 +2306,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             leg1_token_id: opp.leg1_token_id.clone(),
             leg2_token_id: opp.leg2_token_id.clone(),
             total_cost: opp.total_cost * shares, // Actual USDC spent, not pair ratio
+            leg1_entry_price: opp.leg1_price,
+            leg2_entry_price: opp.leg2_price,
             shares,
             window_end,
             executed_at: Utc::now(),
@@ -2102,6 +2331,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             leg2_dir: settlement.leg2_direction,
             total_cost: settlement.total_cost,
             window_end,
+            shares_leg1: shares,
+            shares_leg2: shares,
+            entry_price_leg1: opp.leg1_price,
+            entry_price_leg2: opp.leg2_price,
+            early_exit_proceeds: Decimal::ZERO,
+            partially_exited: false,
         });
     }
 
@@ -2720,6 +2955,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     } else {
                         stats.settled_losses += 1;
                     }
+                    drop(stats);
+                    let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "" };
+                    self.push_event(
+                        EventKind::EarlyExit,
+                        format!(
+                            "EARLY EXIT {}/{} ${:.2} → {}{:.2}",
+                            settlement.coin1, settlement.coin2, early_proceeds, pnl_sign, pnl,
+                        ),
+                    )
+                    .await;
                 }
 
                 exit_count += 1;
@@ -2946,6 +3191,22 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             // Update paper balance tracking
             stats.paper_balance += net_payout;
         }
+
+        // Push settlement event to dashboard
+        let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "" };
+        let result_emoji = match trade_result {
+            "DOUBLE_WIN" => "WIN",
+            "WIN" => "WIN",
+            _ => "LOSS",
+        };
+        self.push_event(
+            EventKind::Settlement,
+            format!(
+                "SETTLED {}/{} {} {}{:.2} ({}↑ {}↑)",
+                settlement.coin1, settlement.coin2, result_emoji, pnl_sign, pnl, c1_out, c2_out,
+            ),
+        )
+        .await;
 
         // Credit the executor's balance back (essential for paper trading)
         // In live mode, this is a no-op (balance comes from chain)

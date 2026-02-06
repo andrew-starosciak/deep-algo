@@ -234,6 +234,6 @@ pub use correlation_tracker::{
 pub use cross_market_auto_executor::{
     CrossMarketAutoExecutor, CrossMarketAutoExecutorConfig, CrossMarketAutoExecutorError,
     CrossMarketAutoExecutorStats, CrossMarketExecutionResult, CrossMarketKellySizer,
-    CrossMarketTradeRecord, CrossMarketWindowTracker, FilledLeg, IncompleteTrade,
-    PendingTradeDisplay, RecentTradeDisplay,
+    CrossMarketTradeRecord, CrossMarketWindowTracker, EventKind, EventLogEntry, FilledLeg,
+    IncompleteTrade, PendingTradeDisplay, RecentTradeDisplay,
 };
