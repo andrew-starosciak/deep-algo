@@ -1151,6 +1151,22 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
+        // Check actual USDC balance covers both legs.
+        // get_effective_balance() includes redeemable positions which can't be
+        // spent directly, so verify real USDC covers the order.
+        {
+            let usdc_balance = self.executor.get_balance().await?;
+            if usdc_balance < estimated_cost {
+                debug!(
+                    usdc_balance = %usdc_balance,
+                    estimated_cost = %estimated_cost,
+                    "Insufficient USDC balance for both legs"
+                );
+                self.stats.write().await.opportunities_skipped += 1;
+                return Ok(());
+            }
+        }
+
         // Execute both legs
         let result = self.execute_both_legs(&opp, shares).await?;
 
@@ -1480,6 +1496,34 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 );
 
                 if let Err(e) = self.escape_sell_filled_leg(&trade, &live_prices).await {
+                    let err_str = e.to_string();
+
+                    // If the orderbook no longer exists, the market has expired.
+                    // Retrying will never work — abandon immediately and let
+                    // on-chain auto-redeem handle these shares.
+                    if err_str.contains("does not exist") {
+                        error!(
+                            trade_id = %trade.trade_id,
+                            error = %e,
+                            "Orderbook expired — market closed, abandoning to on-chain redemption"
+                        );
+                        let mut incomplete = self.incomplete_trades.write().await;
+                        incomplete.retain(|t| t.trade_id != trade.trade_id);
+                        drop(incomplete);
+                        let mut stats = self.stats.write().await;
+                        stats.incomplete_escaped += 1;
+                        stats.incomplete_trades = stats.incomplete_trades.saturating_sub(1);
+                        self.push_event(
+                            EventKind::Recovery,
+                            format!(
+                                "ABANDON {}/{} orderbook expired — shares await on-chain redemption",
+                                trade.coin1, trade.coin2,
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+
                     warn!(
                         trade_id = %trade.trade_id,
                         error = %e,
@@ -2891,38 +2935,45 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             // Size sells based on bid depth
             let depth_fraction = self.config.early_exit_depth_fraction;
 
-            let (leg1_sell_size, leg1_sell_price) = match leg1_book {
-                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO && best_bid >= MIN_LEG_PRICE => {
-                    let max_sell = bid_depth * depth_fraction;
-                    let sell_size = settlement.remaining_shares_leg1.min(max_sell);
-                    let sell_value = sell_size * best_bid;
-                    if sell_size >= dec!(0.1) && sell_value >= MIN_ORDER_VALUE {
-                        (sell_size, best_bid)
-                    } else {
-                        (Decimal::ZERO, Decimal::ZERO)
+            // Helper: determine sell size and price from orderbook, falling back to
+            // WebSocket live price when REST orderbook returns empty bids.
+            let calc_sell = |book: &Option<(Decimal, Option<Decimal>)>,
+                             ws_bid: Decimal,
+                             remaining: Decimal| -> (Decimal, Decimal) {
+                // Try orderbook first
+                if let Some((bid_depth, Some(best_bid))) = book {
+                    if *bid_depth > Decimal::ZERO && *best_bid >= MIN_LEG_PRICE {
+                        let max_sell = *bid_depth * depth_fraction;
+                        let sell_size = remaining.min(max_sell);
+                        let sell_value = sell_size * *best_bid;
+                        if sell_size >= dec!(0.1) && sell_value >= MIN_ORDER_VALUE {
+                            return (sell_size, *best_bid);
+                        }
                     }
                 }
-                _ => (Decimal::ZERO, Decimal::ZERO),
+                // Fallback: use WebSocket live price with conservative discount
+                if ws_bid >= MIN_LEG_PRICE {
+                    let sell_price = (ws_bid * dec!(0.95)).max(MIN_LEG_PRICE);
+                    let sell_size = remaining;
+                    let sell_value = sell_size * sell_price;
+                    if sell_size >= dec!(0.1) && sell_value >= MIN_ORDER_VALUE {
+                        return (sell_size, sell_price);
+                    }
+                }
+                (Decimal::ZERO, Decimal::ZERO)
             };
 
-            let (leg2_sell_size, leg2_sell_price) = match leg2_book {
-                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO && best_bid >= MIN_LEG_PRICE => {
-                    let max_sell = bid_depth * depth_fraction;
-                    let sell_size = settlement.remaining_shares_leg2.min(max_sell);
-                    let sell_value = sell_size * best_bid;
-                    if sell_size >= dec!(0.1) && sell_value >= MIN_ORDER_VALUE {
-                        (sell_size, best_bid)
-                    } else {
-                        (Decimal::ZERO, Decimal::ZERO)
-                    }
-                }
-                _ => (Decimal::ZERO, Decimal::ZERO),
-            };
+            let (leg1_sell_size, leg1_sell_price) =
+                calc_sell(&leg1_book, leg1_bid, settlement.remaining_shares_leg1);
+            let (leg2_sell_size, leg2_sell_price) =
+                calc_sell(&leg2_book, leg2_bid, settlement.remaining_shares_leg2);
 
             if leg1_sell_size <= Decimal::ZERO && leg2_sell_size <= Decimal::ZERO {
-                debug!(
+                warn!(
                     trade_id = %settlement.trade_id,
-                    "Early exit: insufficient bid depth for either leg"
+                    leg1_book = ?leg1_book,
+                    leg2_book = ?leg2_book,
+                    "Early exit: no sellable depth (bids empty or below minimums)"
                 );
                 continue;
             }
