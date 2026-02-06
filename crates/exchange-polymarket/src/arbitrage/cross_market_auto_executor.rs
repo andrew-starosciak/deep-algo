@@ -122,6 +122,11 @@ pub struct CrossMarketAutoExecutorConfig {
     /// Minimum excess shares to trigger a trim sell after parallel fill (default: 0.5).
     /// Below this threshold, asymmetric fills are accepted as negligible.
     pub trim_threshold: Decimal,
+
+    /// Seconds before window end to stop opening new positions and recovery buys.
+    /// In the final minutes, prices diverge sharply and spreads collapse to zero.
+    /// Default: 120 (stop trading in last 2 minutes of 15-minute window).
+    pub trading_cutoff_secs: i64,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -141,6 +146,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
+            trading_cutoff_secs: 120,
         }
     }
 }
@@ -164,6 +170,7 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
+            trading_cutoff_secs: 120,
         }
     }
 
@@ -185,6 +192,7 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
+            trading_cutoff_secs: 120,
         }
     }
 
@@ -532,6 +540,12 @@ pub enum FilledLeg {
     /// Leg 2 (coin 2) was filled.
     Leg2,
 }
+
+/// Polymarket minimum order price ($0.05). Orders below this are rejected by the API.
+const MIN_LEG_PRICE: Decimal = dec!(0.05);
+
+/// Polymarket minimum order value ($1.00). Orders with maker_amount below this are rejected.
+const MIN_ORDER_VALUE: Decimal = dec!(1);
 
 /// Maximum retry attempts before triggering the escape hatch (sell filled leg).
 /// Recovery runs every 5 seconds, so 60 retries ≈ 5 minutes of actual attempts.
@@ -1284,10 +1298,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             DateTime::from_timestamp(window_end_ts, 0).unwrap_or(opp.detected_at)
         };
 
-        // Target pair cost with some buffer (allow slightly worse price)
-        // Use 0.97 as max pair cost (giving at least $0.03 spread)
-        let target_pair_cost = dec!(0.97);
-        let max_missing_price = target_pair_cost - filled_price;
+        // Recovery max price: only allow recovery if total cost stays within
+        // the original opportunity's combined cost + small buffer (5%).
+        // This prevents recovery from destroying the spread by paying way more
+        // than the original opportunity price for the missing leg.
+        let original_pair_cost = opp.leg1_price + opp.leg2_price;
+        let max_missing_price = (original_pair_cost * dec!(1.05)) - filled_price;
 
         match filled_leg {
             FilledLeg::Leg1 => IncompleteTrade {
@@ -1401,6 +1417,25 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 continue;
             }
 
+            // Trading cutoff: if we're near window end, don't try to recover —
+            // prices have diverged and the missing leg is likely worthless or overpriced.
+            // Force escape instead.
+            {
+                let secs_to_end = (trade.window_end - Utc::now()).num_seconds();
+                if secs_to_end <= self.config.trading_cutoff_secs {
+                    warn!(
+                        trade_id = %trade.trade_id,
+                        secs_to_end = secs_to_end,
+                        "Window cutoff reached — skipping recovery, will escape"
+                    );
+                    let mut incomplete = self.incomplete_trades.write().await;
+                    if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
+                        t.retry_count = MAX_RECOVERY_RETRIES;
+                    }
+                    continue;
+                }
+            }
+
             // Escape hatch: if too many retries or too old, sell the filled leg
             // to recover capital rather than staying stuck indefinitely.
             if trade.should_escape() {
@@ -1504,6 +1539,46 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     current_price = %current_price,
                     max_price = %trade.max_missing_price,
                     "Price not acceptable for recovery"
+                );
+                continue;
+            }
+
+            // Check position limit before recovery buy
+            {
+                let recovery_cost = current_price * trade.shares;
+                let pos = self.position.read().await;
+                let remaining = pos.remaining_capacity(self.config.max_position_per_window);
+                if remaining < recovery_cost {
+                    warn!(
+                        trade_id = %trade.trade_id,
+                        recovery_cost = %recovery_cost,
+                        remaining_capacity = %remaining,
+                        "Recovery would exceed window position limit — triggering escape instead"
+                    );
+                    // Force escape by setting retry_count past threshold
+                    let mut incomplete = self.incomplete_trades.write().await;
+                    if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
+                        t.retry_count = MAX_RECOVERY_RETRIES;
+                    }
+                    continue;
+                }
+            }
+
+            // Check Polymarket minimums for recovery order
+            if current_price < MIN_LEG_PRICE {
+                debug!(
+                    trade_id = %trade.trade_id,
+                    current_price = %current_price,
+                    "Recovery price below Polymarket minimum $0.05"
+                );
+                continue;
+            }
+            let recovery_order_value = current_price * trade.shares;
+            if recovery_order_value < MIN_ORDER_VALUE {
+                debug!(
+                    trade_id = %trade.trade_id,
+                    order_value = %recovery_order_value,
+                    "Recovery order value below Polymarket minimum $1"
                 );
                 continue;
             }
@@ -1803,6 +1878,24 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
+        // Trading cutoff: stop opening new positions near window end.
+        // In the final minutes, prices diverge sharply and spreads collapse.
+        {
+            let ts = opp.detected_at.timestamp();
+            let window_secs: i64 = 900;
+            let window_start = (ts / window_secs) * window_secs;
+            let secs_into_window = ts - window_start;
+            let secs_remaining = window_secs - secs_into_window;
+            if secs_remaining <= self.config.trading_cutoff_secs {
+                debug!(
+                    secs_remaining = secs_remaining,
+                    cutoff = self.config.trading_cutoff_secs,
+                    "Trading cutoff — too close to window end"
+                );
+                return false;
+            }
+        }
+
         // Check spread
         if opp.spread < self.config.min_spread {
             return false;
@@ -1810,6 +1903,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         // Check win probability
         if opp.win_probability < self.config.min_win_probability {
+            return false;
+        }
+
+        // Check minimum leg price (Polymarket rejects orders below $0.05)
+        if opp.leg1_price < MIN_LEG_PRICE || opp.leg2_price < MIN_LEG_PRICE {
             return false;
         }
 
@@ -1826,6 +1924,19 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         opp: &CrossMarketOpportunity,
         shares: Decimal,
     ) -> Result<CrossMarketExecutionResult, CrossMarketAutoExecutorError> {
+        // Validate minimum order value ($1.00 Polymarket minimum)
+        let leg1_value = shares * opp.leg1_price;
+        let leg2_value = shares * opp.leg2_price;
+        if leg1_value < MIN_ORDER_VALUE || leg2_value < MIN_ORDER_VALUE {
+            return Err(CrossMarketAutoExecutorError::Filtered {
+                reason: format!(
+                    "Order value below $1 minimum (leg1=${}, leg2=${})",
+                    leg1_value.round_dp(2),
+                    leg2_value.round_dp(2),
+                ),
+            });
+        }
+
         // Create orders for both legs
         let leg1_order = OrderParams {
             token_id: opp.leg1_token_id.clone(),
@@ -2781,10 +2892,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             let depth_fraction = self.config.early_exit_depth_fraction;
 
             let (leg1_sell_size, leg1_sell_price) = match leg1_book {
-                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO => {
+                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO && best_bid >= MIN_LEG_PRICE => {
                     let max_sell = bid_depth * depth_fraction;
                     let sell_size = settlement.remaining_shares_leg1.min(max_sell);
-                    if sell_size >= dec!(0.1) {
+                    let sell_value = sell_size * best_bid;
+                    if sell_size >= dec!(0.1) && sell_value >= MIN_ORDER_VALUE {
                         (sell_size, best_bid)
                     } else {
                         (Decimal::ZERO, Decimal::ZERO)
@@ -2794,10 +2906,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             };
 
             let (leg2_sell_size, leg2_sell_price) = match leg2_book {
-                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO => {
+                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO && best_bid >= MIN_LEG_PRICE => {
                     let max_sell = bid_depth * depth_fraction;
                     let sell_size = settlement.remaining_shares_leg2.min(max_sell);
-                    if sell_size >= dec!(0.1) {
+                    let sell_value = sell_size * best_bid;
+                    if sell_size >= dec!(0.1) && sell_value >= MIN_ORDER_VALUE {
                         (sell_size, best_bid)
                     } else {
                         (Decimal::ZERO, Decimal::ZERO)
