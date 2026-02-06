@@ -89,9 +89,9 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "0.85")]
     pub min_win_prob: f64,
 
-    /// Maximum position per window in USDC. Default: 200.
-    #[arg(long, default_value = "200")]
-    pub max_position: f64,
+    /// Maximum position per window in USDC (paper default: 200, live default: 10).
+    #[arg(long)]
+    pub max_position: Option<f64>,
 
     /// Initial paper balance in USDC (paper mode only).
     #[arg(long, default_value = "1000")]
@@ -223,17 +223,23 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
         ..Default::default()
     };
 
-    // Build auto executor config
-    let mut auto_config = CrossMarketAutoExecutorConfig {
-        filter_pair: pair.clone(),
-        filter_combination: combination,
-        kelly_fraction: args.kelly_fraction,
-        min_spread: Decimal::from_str(&format!("{:.4}", args.min_spread))?,
-        min_win_probability: args.min_win_prob,
-        max_position_per_window: Decimal::from_str(&format!("{:.2}", args.max_position))?,
-        ..Default::default()
+    // Build auto executor config.
+    // Live mode uses micro_testing() as safe base; paper uses Default.
+    let mut auto_config = if mode == ExecutionMode::Live {
+        CrossMarketAutoExecutorConfig::micro_testing()
+    } else {
+        CrossMarketAutoExecutorConfig::default()
     };
 
+    // Apply CLI overrides
+    auto_config.filter_pair = pair.clone();
+    auto_config.filter_combination = combination;
+    auto_config.kelly_fraction = args.kelly_fraction;
+    auto_config.min_spread = Decimal::from_str(&format!("{:.4}", args.min_spread))?;
+    auto_config.min_win_probability = args.min_win_prob;
+    if let Some(max_pos) = args.max_position {
+        auto_config.max_position_per_window = Decimal::from_str(&format!("{:.2}", max_pos))?;
+    }
     if let Some(fixed) = args.fixed_bet_size() {
         auto_config.fixed_bet_size = Some(fixed);
     }
@@ -278,7 +284,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
                 bet_size: bet_str,
                 kelly_fraction: args.kelly_fraction,
                 min_spread: args.min_spread,
-                max_position: Decimal::from_str(&format!("{:.2}", args.max_position))?,
+                max_position: auto_config.max_position_per_window,
                 balance: args.paper_balance_decimal(),
                 duration,
                 persist: args.persist,
@@ -313,7 +319,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
                 bet_size: bet_str,
                 kelly_fraction: args.kelly_fraction,
                 min_spread: args.min_spread,
-                max_position: Decimal::from_str(&format!("{:.2}", args.max_position))?,
+                max_position: auto_config.max_position_per_window,
                 balance,
                 duration,
                 persist: args.persist,

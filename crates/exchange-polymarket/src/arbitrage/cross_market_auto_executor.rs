@@ -109,6 +109,15 @@ pub struct CrossMarketAutoExecutorConfig {
 
     /// Maximum trade history to keep in memory.
     pub max_history: usize,
+
+    /// Enable early exit when positions are profitable (default: true).
+    pub early_exit_enabled: bool,
+
+    /// Minimum profit percentage to trigger early exit (default: 0.10 = 10%).
+    pub early_exit_profit_threshold: Decimal,
+
+    /// Fraction of visible bid depth to sell into per cycle (default: 0.50).
+    pub early_exit_depth_fraction: Decimal,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -124,6 +133,9 @@ impl Default for CrossMarketAutoExecutorConfig {
             min_spread: dec!(0.03),
             min_win_probability: 0.80,
             max_history: 1000,
+            early_exit_enabled: true,
+            early_exit_profit_threshold: dec!(0.10),
+            early_exit_depth_fraction: dec!(0.50),
         }
     }
 }
@@ -143,6 +155,9 @@ impl CrossMarketAutoExecutorConfig {
             min_spread: dec!(0.03),
             min_win_probability: 0.85,
             max_history: 1000,
+            early_exit_enabled: true,
+            early_exit_profit_threshold: dec!(0.10),
+            early_exit_depth_fraction: dec!(0.50),
         }
     }
 
@@ -153,13 +168,16 @@ impl CrossMarketAutoExecutorConfig {
             filter_pair: Some((Coin::Btc, Coin::Eth)),
             filter_combination: Some(CrossMarketCombination::Coin1DownCoin2Up),
             kelly_fraction: 0.10,
-            fixed_bet_size: Some(dec!(10)),
-            min_bet_size: dec!(5),
-            max_bet_size: dec!(25),
-            max_position_per_window: dec!(50),
+            fixed_bet_size: Some(dec!(2.5)),
+            min_bet_size: dec!(1),
+            max_bet_size: dec!(5),
+            max_position_per_window: dec!(10),
             min_spread: dec!(0.02),
             min_win_probability: 0.75,
             max_history: 100,
+            early_exit_enabled: true,
+            early_exit_profit_threshold: dec!(0.10),
+            early_exit_depth_fraction: dec!(0.50),
         }
     }
 
@@ -317,6 +335,9 @@ pub struct CrossMarketAutoExecutorStats {
     /// Incomplete trades that expired (window closed).
     pub incomplete_expired: u64,
 
+    /// Incomplete trades resolved via escape hatch (sold filled leg).
+    pub incomplete_escaped: u64,
+
     /// Both legs rejected.
     pub both_rejected: u64,
 
@@ -367,6 +388,13 @@ pub struct CrossMarketAutoExecutorStats {
 
     /// Pending settlements for display.
     pub pending_trades: Vec<PendingTradeDisplay>,
+
+    // === Early Exit Stats ===
+    /// Trades exited early (sold before settlement).
+    pub early_exits: u64,
+
+    /// Total USDC received from early exit sells.
+    pub early_exit_proceeds: Decimal,
 
     // === Live prices from WebSocket (for settlement) ===
     /// Current prices from WebSocket feed: coin -> (up_price, down_price).
@@ -427,6 +455,14 @@ pub struct PendingPaperSettlement {
     pub window_end: DateTime<Utc>,
     /// When the trade was executed.
     pub executed_at: DateTime<Utc>,
+    /// Shares remaining for leg 1 (decreases as we partially exit).
+    pub remaining_shares_leg1: Decimal,
+    /// Shares remaining for leg 2.
+    pub remaining_shares_leg2: Decimal,
+    /// USDC received from early exits so far.
+    pub early_exit_proceeds: Decimal,
+    /// Whether this trade has been partially exited.
+    pub partially_exited: bool,
 }
 
 // =============================================================================
@@ -441,6 +477,14 @@ pub enum FilledLeg {
     /// Leg 2 (coin 2) was filled.
     Leg2,
 }
+
+/// Maximum retry attempts before triggering the escape hatch (sell filled leg).
+/// Recovery runs every 5 seconds, so 60 retries ≈ 5 minutes of actual attempts.
+const MAX_RECOVERY_RETRIES: u32 = 60;
+
+/// Maximum age of an incomplete trade before triggering the escape hatch.
+/// 5 minutes gives liquidity time to return without blocking the bot too long.
+const MAX_RECOVERY_AGE_SECS: u64 = 300;
 
 /// An incomplete trade where one leg filled but the other didn't.
 ///
@@ -512,6 +556,19 @@ impl IncompleteTrade {
             FilledLeg::Leg1 => &self.coin2,
             FilledLeg::Leg2 => &self.coin1,
         }
+    }
+
+    /// Returns true if the escape hatch should trigger.
+    ///
+    /// The escape hatch fires when either:
+    /// - Retry count exceeds `MAX_RECOVERY_RETRIES`
+    /// - Trade age exceeds `MAX_RECOVERY_AGE_SECS`
+    pub fn should_escape(&self) -> bool {
+        if self.retry_count >= MAX_RECOVERY_RETRIES {
+            return true;
+        }
+        let age = Utc::now() - self.created_at;
+        age.num_seconds() >= MAX_RECOVERY_AGE_SECS as i64
     }
 }
 
@@ -699,6 +756,9 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
     /// Cooldown after execution failures to avoid wasting API calls.
     /// Tracks when the last execution attempt failed (FOK not filled, etc.)
     last_both_rejected_at: Option<std::time::Instant>,
+
+    /// Tracks the last time we checked for redeemable positions.
+    last_redeem_check: Option<std::time::Instant>,
 }
 
 impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
@@ -728,6 +788,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             db_pool: None,
             session_id,
             last_both_rejected_at: None,
+            last_redeem_check: None,
         }
     }
 
@@ -763,6 +824,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             db_pool: Some(db_pool),
             session_id,
             last_both_rejected_at: None,
+            last_redeem_check: None,
         }
     }
 
@@ -825,12 +887,35 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     warn!(error = %e, "Settlement check error");
                 }
 
+                // Try early exit on profitable positions (before window closes)
+                if self.config.early_exit_enabled {
+                    if let Err(e) = self.try_early_exit().await {
+                        debug!(error = %e, "Early exit check error (non-fatal)");
+                    }
+                }
+
                 // Also try to complete any incomplete trades (partial fill recovery)
                 if let Err(e) = self.try_complete_incomplete_trades().await {
                     warn!(error = %e, "Incomplete trade recovery error");
                 }
 
                 last_settlement_check = std::time::Instant::now();
+            }
+
+            // Auto-redeem: check for redeemable positions every 60 seconds
+            {
+                let should_check = match self.last_redeem_check {
+                    None => true,
+                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(60),
+                };
+                if should_check {
+                    match self.executor.redeem_resolved_positions().await {
+                        Ok(0) => {}
+                        Ok(n) => info!(redeemed = n, "Auto-redeemed {} resolved positions", n),
+                        Err(e) => debug!(error = %e, "Auto-redeem check failed (non-fatal)"),
+                    }
+                    self.last_redeem_check = Some(std::time::Instant::now());
+                }
             }
 
             // Wait for next opportunity with short timeout
@@ -944,23 +1029,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
-        // Check position limits
-        {
-            let pos = self.position.read().await;
-            let remaining = pos.remaining_capacity(self.config.max_position_per_window);
-            if remaining < opp.total_cost {
-                debug!(
-                    remaining = %remaining,
-                    cost = %opp.total_cost,
-                    "Position limit would be exceeded"
-                );
-                self.stats.write().await.opportunities_skipped += 1;
-                return Ok(());
-            }
-        }
-
-        // Calculate bet size
-        let balance = self.executor.get_balance().await?;
+        // Calculate bet size using effective balance (USDC + redeemable positions)
+        let balance = self.executor.get_effective_balance().await?;
         let bet_per_leg = if let Some(fixed) = self.config.fixed_bet_size {
             fixed
         } else {
@@ -983,17 +1053,49 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let avg_leg_price = opp.total_cost / dec!(2);
         let shares = bet_per_leg / avg_leg_price;
 
+        // Estimate actual USDC cost for both legs
+        let estimated_cost = shares * opp.leg1_price + shares * opp.leg2_price;
+
+        // Check position limits against actual USDC cost (not per-share price)
+        {
+            let pos = self.position.read().await;
+            let remaining = pos.remaining_capacity(self.config.max_position_per_window);
+            if remaining < estimated_cost {
+                debug!(
+                    remaining = %remaining,
+                    estimated_cost = %estimated_cost,
+                    "Position limit would be exceeded"
+                );
+                self.stats.write().await.opportunities_skipped += 1;
+                return Ok(());
+            }
+        }
+
         // Execute both legs
         let result = self.execute_both_legs(&opp, shares).await?;
 
         // Record trade
         self.record_trade(&opp, &result, shares).await;
 
-        // Update position tracker if successful
-        if result.is_success() {
+        // Update position tracker for any fills (not just both-filled)
+        {
             let mut pos = self.position.write().await;
-            if let CrossMarketExecutionResult::Success { total_cost, .. } = &result {
-                pos.record_position(*total_cost);
+            match &result {
+                CrossMarketExecutionResult::Success { total_cost, .. } => {
+                    pos.record_position(*total_cost);
+                }
+                CrossMarketExecutionResult::Leg1OnlyFilled { leg1_result, .. } => {
+                    // Record the filled leg's cost — capital is deployed
+                    let leg1_cost = shares * leg1_result.avg_fill_price.unwrap_or(opp.leg1_price);
+                    pos.record_position(leg1_cost);
+                }
+                CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
+                    let leg2_cost = shares * leg2_result.avg_fill_price.unwrap_or(opp.leg2_price);
+                    pos.record_position(leg2_cost);
+                }
+                CrossMarketExecutionResult::BothRejected { .. } => {
+                    // No capital deployed
+                }
             }
         }
 
@@ -1181,6 +1283,43 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 continue;
             }
 
+            // Escape hatch: if too many retries or too old, sell the filled leg
+            // to recover capital rather than staying stuck indefinitely.
+            if trade.should_escape() {
+                warn!(
+                    trade_id = %trade.trade_id,
+                    retry_count = trade.retry_count,
+                    age_secs = (Utc::now() - trade.created_at).num_seconds(),
+                    "Escape hatch triggered - selling filled leg to recover capital"
+                );
+
+                if let Err(e) = self.escape_sell_filled_leg(&trade, &live_prices).await {
+                    warn!(
+                        trade_id = %trade.trade_id,
+                        error = %e,
+                        "Escape sell failed, will retry next cycle"
+                    );
+                    // Increment retry count so it doesn't loop forever
+                    let mut incomplete = self.incomplete_trades.write().await;
+                    if let Some(t) = incomplete.iter_mut().find(|t| t.trade_id == trade.trade_id) {
+                        t.retry_count += 1;
+                    }
+                    continue;
+                }
+
+                // Remove from list and update stats
+                {
+                    let mut incomplete = self.incomplete_trades.write().await;
+                    incomplete.retain(|t| t.trade_id != trade.trade_id);
+                }
+                {
+                    let mut stats = self.stats.write().await;
+                    stats.incomplete_escaped += 1;
+                    stats.incomplete_trades = stats.incomplete_trades.saturating_sub(1);
+                }
+                continue;
+            }
+
             // Get current price for the missing leg's coin
             let missing_coin = trade.missing_coin().to_uppercase();
             let current_price = match live_prices.get(&missing_coin) {
@@ -1288,6 +1427,13 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 incomplete.retain(|t| t.trade_id != trade.trade_id);
             }
 
+            // Record recovered leg's cost in position tracker
+            {
+                let recovery_cost = missing_fill_price * trade.shares;
+                let mut pos = self.position.write().await;
+                pos.record_position(recovery_cost);
+            }
+
             // Update stats
             {
                 let mut stats = self.stats.write().await;
@@ -1326,6 +1472,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 shares: trade.shares,
                 window_end: trade.window_end,
                 executed_at: Utc::now(),
+                remaining_shares_leg1: trade.shares,
+                remaining_shares_leg2: trade.shares,
+                early_exit_proceeds: Decimal::ZERO,
+                partially_exited: false,
             };
 
             {
@@ -1347,6 +1497,87 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         Ok(completed_count)
+    }
+
+    /// Escape hatch: sells the filled leg at market price to recover capital.
+    ///
+    /// When recovery fails after MAX_RECOVERY_RETRIES or MAX_RECOVERY_AGE_SECS,
+    /// we sell the filled position rather than staying stuck indefinitely.
+    /// This accepts a small loss to free up capital for new trades.
+    async fn escape_sell_filled_leg(
+        &self,
+        trade: &IncompleteTrade,
+        live_prices: &std::collections::HashMap<String, (Decimal, Decimal)>,
+    ) -> Result<(), CrossMarketAutoExecutorError> {
+        // Get the current sell price for the filled leg
+        let filled_coin = match trade.filled_leg {
+            FilledLeg::Leg1 => trade.coin1.to_uppercase(),
+            FilledLeg::Leg2 => trade.coin2.to_uppercase(),
+        };
+
+        let sell_price = match live_prices.get(&filled_coin) {
+            Some(&(up_price, down_price)) => {
+                // We're selling, so we want the bid price for our direction
+                if trade.filled_direction == "UP" {
+                    up_price
+                } else {
+                    down_price
+                }
+            }
+            None => {
+                return Err(CrossMarketAutoExecutorError::Filtered {
+                    reason: format!("No price for {} to sell filled leg", filled_coin),
+                });
+            }
+        };
+
+        // Sell at slightly below market to ensure fill
+        let sell_price = (sell_price * dec!(0.95)).max(dec!(0.01));
+
+        info!(
+            trade_id = %trade.trade_id,
+            filled_token = %trade.filled_token_id,
+            shares = %trade.shares,
+            sell_price = %sell_price,
+            original_buy_price = %trade.filled_price,
+            "Escape hatch: selling filled leg to recover capital"
+        );
+
+        let order = OrderParams {
+            token_id: trade.filled_token_id.clone(),
+            side: Side::Sell,
+            price: sell_price,
+            size: trade.shares,
+            order_type: OrderType::Fok,
+            neg_risk: false,
+            presigned: None,
+        };
+
+        let result = self.executor.submit_order(order).await?;
+
+        match result.status {
+            OrderStatus::Filled => {
+                let recovered = result.fill_notional();
+                let loss = (trade.filled_price - sell_price) * trade.shares;
+                warn!(
+                    trade_id = %trade.trade_id,
+                    recovered = %recovered,
+                    loss = %loss,
+                    "Escape hatch: sold filled leg, accepted loss to free capital"
+                );
+                Ok(())
+            }
+            _ => {
+                warn!(
+                    trade_id = %trade.trade_id,
+                    status = ?result.status,
+                    "Escape sell not filled, will retry"
+                );
+                Err(CrossMarketAutoExecutorError::Filtered {
+                    reason: "Escape sell not filled".to_string(),
+                })
+            }
+        }
     }
 
     /// Parses a coin string to Coin enum.
@@ -1723,6 +1954,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             shares,
             window_end,
             executed_at: Utc::now(),
+            remaining_shares_leg1: shares,
+            remaining_shares_leg2: shares,
+            early_exit_proceeds: Decimal::ZERO,
+            partially_exited: false,
         };
 
         let mut pending = self.pending_settlements.write().await;
@@ -2047,6 +2282,331 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         Ok(settled_count)
     }
 
+    /// Attempts early exit on profitable positions before settlement.
+    ///
+    /// For each pending trade where the window is still open:
+    /// 1. Checks if the combined position value exceeds cost by the profit threshold
+    /// 2. Fetches order book depth for each leg
+    /// 3. Sells chunks sized to available bid-side liquidity
+    /// 4. Tracks partial exits and removes fully exited positions
+    async fn try_early_exit(&self) -> Result<u64, CrossMarketAutoExecutorError> {
+        let now = Utc::now();
+
+        // Get live prices
+        let live_prices = {
+            let stats = self.stats.read().await;
+            stats.live_prices.clone()
+        };
+
+        if live_prices.is_empty() {
+            return Ok(0);
+        }
+
+        // Find trades with open windows that could be exited early
+        let candidates: Vec<PendingPaperSettlement> = {
+            let pending = self.pending_settlements.read().await;
+            pending
+                .iter()
+                .filter(|s| now < s.window_end) // Window still open
+                .filter(|s| s.remaining_shares_leg1 > Decimal::ZERO || s.remaining_shares_leg2 > Decimal::ZERO)
+                .cloned()
+                .collect()
+        };
+
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        let mut exit_count = 0u64;
+
+        for settlement in &candidates {
+            let c1_upper = settlement.coin1.to_uppercase();
+            let c2_upper = settlement.coin2.to_uppercase();
+
+            // Look up live bid prices for our legs
+            let (leg1_bid, leg2_bid) = match (live_prices.get(&c1_upper), live_prices.get(&c2_upper)) {
+                (Some(&(c1_up, c1_down)), Some(&(c2_up, c2_down))) => {
+                    // Map leg direction to the correct price
+                    let l1_bid = if settlement.leg1_direction == "UP" { c1_up } else { c1_down };
+                    let l2_bid = if settlement.leg2_direction == "UP" { c2_up } else { c2_down };
+                    (l1_bid, l2_bid)
+                }
+                _ => continue, // No live prices for these coins
+            };
+
+            // Calculate current value and profit
+            let current_value = settlement.remaining_shares_leg1 * leg1_bid
+                + settlement.remaining_shares_leg2 * leg2_bid;
+
+            // Proportional cost basis for remaining shares
+            let original_shares = settlement.shares;
+            let remaining_fraction = if original_shares > Decimal::ZERO {
+                (settlement.remaining_shares_leg1 + settlement.remaining_shares_leg2)
+                    / (Decimal::TWO * original_shares)
+            } else {
+                Decimal::ZERO
+            };
+            let cost_basis = settlement.total_cost * remaining_fraction;
+
+            if cost_basis <= Decimal::ZERO {
+                continue;
+            }
+
+            let profit_pct = (current_value - cost_basis) / cost_basis;
+
+            if profit_pct < self.config.early_exit_profit_threshold {
+                debug!(
+                    trade_id = %settlement.trade_id,
+                    profit_pct = %profit_pct,
+                    threshold = %self.config.early_exit_profit_threshold,
+                    leg1_bid = %leg1_bid,
+                    leg2_bid = %leg2_bid,
+                    "Early exit: profit below threshold"
+                );
+                continue;
+            }
+
+            info!(
+                trade_id = %settlement.trade_id,
+                profit_pct = %profit_pct,
+                current_value = %current_value,
+                cost_basis = %cost_basis,
+                leg1_bid = %leg1_bid,
+                leg2_bid = %leg2_bid,
+                remaining_leg1 = %settlement.remaining_shares_leg1,
+                remaining_leg2 = %settlement.remaining_shares_leg2,
+                "Early exit: profit threshold met, attempting sell"
+            );
+
+            // Fetch order books for both tokens to determine sell size
+            let (leg1_book, leg2_book) = {
+                let url1 = format!(
+                    "https://clob.polymarket.com/book?token_id={}",
+                    settlement.leg1_token_id
+                );
+                let url2 = format!(
+                    "https://clob.polymarket.com/book?token_id={}",
+                    settlement.leg2_token_id
+                );
+
+                let (r1, r2) = tokio::join!(
+                    self.http_client.get(&url1).timeout(std::time::Duration::from_secs(5)).send(),
+                    self.http_client.get(&url2).timeout(std::time::Duration::from_secs(5)).send(),
+                );
+
+                let parse_book = |resp: Result<reqwest::Response, reqwest::Error>, _token_id: &str| async move {
+                    let resp = resp.ok()?;
+                    if !resp.status().is_success() {
+                        return None;
+                    }
+                    let body: serde_json::Value = resp.json().await.ok()?;
+                    let bids = body.get("bids")?.as_array()?;
+                    let total_bid_depth: Decimal = bids.iter().filter_map(|b| {
+                        b.get("size")?.as_str()?.parse::<Decimal>().ok()
+                    }).sum();
+                    let best_bid: Option<Decimal> = bids.first()
+                        .and_then(|b| b.get("price")?.as_str()?.parse::<Decimal>().ok());
+                    Some((total_bid_depth, best_bid))
+                };
+
+                let b1 = parse_book(r1, &settlement.leg1_token_id).await;
+                let b2 = parse_book(r2, &settlement.leg2_token_id).await;
+                (b1, b2)
+            };
+
+            // Size sells based on bid depth
+            let depth_fraction = self.config.early_exit_depth_fraction;
+
+            let (leg1_sell_size, leg1_sell_price) = match leg1_book {
+                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO => {
+                    let max_sell = bid_depth * depth_fraction;
+                    let sell_size = settlement.remaining_shares_leg1.min(max_sell);
+                    if sell_size >= dec!(0.1) {
+                        (sell_size, best_bid)
+                    } else {
+                        (Decimal::ZERO, Decimal::ZERO)
+                    }
+                }
+                _ => (Decimal::ZERO, Decimal::ZERO),
+            };
+
+            let (leg2_sell_size, leg2_sell_price) = match leg2_book {
+                Some((bid_depth, Some(best_bid))) if bid_depth > Decimal::ZERO => {
+                    let max_sell = bid_depth * depth_fraction;
+                    let sell_size = settlement.remaining_shares_leg2.min(max_sell);
+                    if sell_size >= dec!(0.1) {
+                        (sell_size, best_bid)
+                    } else {
+                        (Decimal::ZERO, Decimal::ZERO)
+                    }
+                }
+                _ => (Decimal::ZERO, Decimal::ZERO),
+            };
+
+            if leg1_sell_size <= Decimal::ZERO && leg2_sell_size <= Decimal::ZERO {
+                debug!(
+                    trade_id = %settlement.trade_id,
+                    "Early exit: insufficient bid depth for either leg"
+                );
+                continue;
+            }
+
+            // Submit FAK sell orders
+            let mut leg1_filled = Decimal::ZERO;
+            let mut leg2_filled = Decimal::ZERO;
+            let mut leg1_proceeds = Decimal::ZERO;
+            let mut leg2_proceeds = Decimal::ZERO;
+
+            if leg1_sell_size > Decimal::ZERO {
+                let sell_order = OrderParams::sell_fak(
+                    &settlement.leg1_token_id,
+                    leg1_sell_price,
+                    leg1_sell_size,
+                );
+                match self.executor.submit_order(sell_order).await {
+                    Ok(result) => {
+                        if result.status == OrderStatus::Filled || result.status == OrderStatus::PartiallyFilled {
+                            leg1_filled = result.filled_size;
+                            leg1_proceeds = leg1_filled * result.avg_fill_price.unwrap_or(leg1_sell_price);
+                            info!(
+                                trade_id = %settlement.trade_id,
+                                leg = "leg1",
+                                filled = %leg1_filled,
+                                proceeds = %leg1_proceeds,
+                                "Early exit: leg1 sell filled"
+                            );
+                        } else {
+                            debug!(
+                                trade_id = %settlement.trade_id,
+                                status = ?result.status,
+                                "Early exit: leg1 sell not filled"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, trade_id = %settlement.trade_id, "Early exit: leg1 sell failed");
+                    }
+                }
+            }
+
+            if leg2_sell_size > Decimal::ZERO {
+                let sell_order = OrderParams::sell_fak(
+                    &settlement.leg2_token_id,
+                    leg2_sell_price,
+                    leg2_sell_size,
+                );
+                match self.executor.submit_order(sell_order).await {
+                    Ok(result) => {
+                        if result.status == OrderStatus::Filled || result.status == OrderStatus::PartiallyFilled {
+                            leg2_filled = result.filled_size;
+                            leg2_proceeds = leg2_filled * result.avg_fill_price.unwrap_or(leg2_sell_price);
+                            info!(
+                                trade_id = %settlement.trade_id,
+                                leg = "leg2",
+                                filled = %leg2_filled,
+                                proceeds = %leg2_proceeds,
+                                "Early exit: leg2 sell filled"
+                            );
+                        } else {
+                            debug!(
+                                trade_id = %settlement.trade_id,
+                                status = ?result.status,
+                                "Early exit: leg2 sell not filled"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, trade_id = %settlement.trade_id, "Early exit: leg2 sell failed");
+                    }
+                }
+            }
+
+            let total_proceeds = leg1_proceeds + leg2_proceeds;
+
+            if leg1_filled > Decimal::ZERO || leg2_filled > Decimal::ZERO {
+                // Check if fully exited (extract data, then drop lock before acquiring stats)
+                let fully_exited_data: Option<(Decimal, String, u64)> = {
+                    let mut pending = self.pending_settlements.write().await;
+                    if let Some(s) = pending.iter_mut().find(|s| s.trade_id == settlement.trade_id) {
+                        // Clamp to zero to avoid negative from rounding
+                        s.remaining_shares_leg1 = (s.remaining_shares_leg1 - leg1_filled).max(Decimal::ZERO);
+                        s.remaining_shares_leg2 = (s.remaining_shares_leg2 - leg2_filled).max(Decimal::ZERO);
+                        s.early_exit_proceeds += total_proceeds;
+                        s.partially_exited = true;
+
+                        info!(
+                            trade_id = %settlement.trade_id,
+                            remaining_leg1 = %s.remaining_shares_leg1,
+                            remaining_leg2 = %s.remaining_shares_leg2,
+                            total_early_proceeds = %s.early_exit_proceeds,
+                            "Early exit: position updated"
+                        );
+
+                        // Check if fully exited
+                        if s.remaining_shares_leg1 <= Decimal::ZERO
+                            && s.remaining_shares_leg2 <= Decimal::ZERO
+                        {
+                            let early_proceeds = s.early_exit_proceeds;
+                            let pnl = early_proceeds - settlement.total_cost;
+                            let trade_id = settlement.trade_id.clone();
+
+                            info!(
+                                trade_id = %trade_id,
+                                proceeds = %early_proceeds,
+                                cost = %settlement.total_cost,
+                                pnl = %pnl,
+                                "Early exit: FULLY EXITED"
+                            );
+
+                            // Credit balance while holding pending lock (no other lock needed)
+                            if let Err(e) = self.executor.credit_balance(early_proceeds).await {
+                                warn!(error = %e, "Failed to credit early exit proceeds");
+                            }
+
+                            // Remove from pending
+                            pending.retain(|s| s.trade_id != trade_id);
+                            let pending_len = pending.len();
+
+                            Some((early_proceeds, trade_id, pending_len as u64))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }; // pending lock dropped here
+
+                // Update stats without holding pending lock (avoids deadlock)
+                if let Some((early_proceeds, trade_id, pending_len)) = fully_exited_data {
+                    let pnl = early_proceeds - settlement.total_cost;
+                    let mut stats = self.stats.write().await;
+                    stats.pending_settlement = pending_len;
+                    stats.pending_trades.retain(|t| t.trade_id != trade_id);
+                    stats.early_exits += 1;
+                    stats.early_exit_proceeds += early_proceeds;
+                    stats.realized_pnl += pnl;
+                    if pnl > Decimal::ZERO {
+                        stats.settled_wins += 1;
+                    } else {
+                        stats.settled_losses += 1;
+                    }
+                }
+
+                exit_count += 1;
+            }
+        }
+
+        if exit_count > 0 {
+            info!(
+                count = exit_count,
+                "Early exit: processed {} trade(s)",
+                exit_count
+            );
+        }
+
+        Ok(exit_count)
+    }
+
     /// Checks and settles any pending paper trades whose windows have closed.
     async fn check_pending_settlements(&self) -> Result<(), CrossMarketAutoExecutorError> {
         // First, try fast settlement via CLOB prices for any closed windows
@@ -2204,16 +2764,22 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         };
 
         // Calculate payout
-        let (trade_result, payout) = match (leg1_won, leg2_won) {
-            (true, true) => ("DOUBLE_WIN", Decimal::TWO),
-            (true, false) | (false, true) => ("WIN", Decimal::ONE),
-            (false, false) => ("LOSE", Decimal::ZERO),
+        let trade_result = match (leg1_won, leg2_won) {
+            (true, true) => "DOUBLE_WIN",
+            (true, false) | (false, true) => "WIN",
+            (false, false) => "LOSE",
         };
 
-        // Calculate P&L: payout * shares - fees
-        let gross_payout = payout * settlement.shares;
-        let fees = gross_payout * self.fee_rate;
-        let net_payout = gross_payout - fees;
+        // For partially exited trades, only settle remaining shares
+        // Leg 1 settles at $1 if won, $0 if lost. Same for leg 2.
+        let leg1_payout_rate = if leg1_won { Decimal::ONE } else { Decimal::ZERO };
+        let leg2_payout_rate = if leg2_won { Decimal::ONE } else { Decimal::ZERO };
+        let remaining_payout = settlement.remaining_shares_leg1 * leg1_payout_rate
+            + settlement.remaining_shares_leg2 * leg2_payout_rate;
+        let fees = remaining_payout * self.fee_rate;
+        let net_payout = remaining_payout - fees + settlement.early_exit_proceeds;
+
+        // Cost basis is the full original cost
         let pnl = net_payout - settlement.total_cost;
 
         info!(
@@ -2224,6 +2790,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             result = trade_result,
             payout = %net_payout,
             pnl = %pnl,
+            partially_exited = settlement.partially_exited,
+            early_exit_proceeds = %settlement.early_exit_proceeds,
             "Paper trade settled"
         );
 

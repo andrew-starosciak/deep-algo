@@ -575,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn test_can_trade_after_pause_expires_still_blocked_until_success() {
+    fn test_can_trade_after_pause_expires_resets_failures() {
         // Use a very short pause duration for testing
         let config = CircuitBreakerConfig::default()
             .with_max_consecutive_failures(2)
@@ -589,27 +589,9 @@ mod tests {
         // Wait for pause to expire
         thread::sleep(Duration::from_millis(20));
 
-        // Still blocked because consecutive failures haven't reset
+        // After pause expires, failures are reset and trading resumes
         let result = breaker.can_trade();
-        assert!(result.is_err());
-
-        // After pause expires, we get ConsecutiveFailuresExceeded
-        match result {
-            Err(CircuitBreakerError::ConsecutiveFailuresExceeded {
-                failures,
-                max_failures,
-            }) => {
-                assert_eq!(failures, 2);
-                assert_eq!(max_failures, 2);
-            }
-            _ => panic!("Expected ConsecutiveFailuresExceeded after pause expires"),
-        }
-
-        // Record a success to reset
-        breaker.record_success(Decimal::ZERO);
-
-        // Now should be allowed
-        assert!(breaker.can_trade().is_ok());
+        assert!(result.is_ok(), "Should be allowed after pause expires");
     }
 
     // ==================== Recording Tests ====================

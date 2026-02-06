@@ -48,6 +48,7 @@
 
 use async_trait::async_trait;
 use parking_lot::RwLock;
+use rust_decimal::prelude::FromPrimitive;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
@@ -673,6 +674,7 @@ impl LiveExecutor {
         self.circuit_breaker.trip();
     }
 
+
     /// Resets the circuit breaker to allow trading again.
     pub fn reset_circuit_breaker(&self) {
         self.circuit_breaker.reset();
@@ -938,19 +940,19 @@ impl PolymarketExecutor for LiveExecutor {
         // Convert WalletPosition to Position
         let positions: Vec<Position> = wallet_positions
             .into_iter()
-            .filter_map(|wp| {
-                let size: Decimal = wp.size.parse().ok()?;
-                let avg_price: Decimal = wp.avg_price.parse().ok()?;
-                let current_price: Option<Decimal> = wp.cur_price.parse().ok();
+            .map(|wp| {
+                let size = Decimal::from_f64_retain(wp.size).unwrap_or_default();
+                let avg_price = Decimal::from_f64_retain(wp.avg_price).unwrap_or_default();
+                let current_price = Some(Decimal::from_f64_retain(wp.cur_price).unwrap_or_default());
                 let unrealized_pnl = current_price.map(|cp| (cp - avg_price) * size);
 
-                Some(Position {
+                Position {
                     token_id: wp.asset,
                     size,
                     avg_price,
                     current_price,
                     unrealized_pnl,
-                })
+                }
             })
             .collect();
 
@@ -982,6 +984,48 @@ impl PolymarketExecutor for LiveExecutor {
         }
 
         Ok(balance)
+    }
+
+    async fn get_effective_balance(&self) -> Result<Decimal, ExecutionError> {
+        // Get USDC balance
+        let usdc_balance = self.get_balance().await?;
+
+        // Query positions for redeemable value (non-fatal on failure)
+        let redeemable_value = match self.get_positions().await {
+            Ok(positions) => positions
+                .iter()
+                .filter(|p| {
+                    // Positions with cur_price >= 0.95 are winners ready to redeem
+                    p.current_price.map_or(false, |price| price >= dec!(0.95))
+                })
+                .fold(Decimal::ZERO, |acc, p| acc + p.size),
+            Err(e) => {
+                tracing::warn!("Failed to fetch positions for effective balance, using USDC only: {e}");
+                Decimal::ZERO
+            }
+        };
+
+        let effective = usdc_balance + redeemable_value;
+        if redeemable_value > Decimal::ZERO {
+            tracing::info!(
+                usdc = %usdc_balance,
+                redeemable = %redeemable_value,
+                effective = %effective,
+                "Effective balance includes redeemable positions"
+            );
+        }
+
+        Ok(effective)
+    }
+
+    async fn redeem_resolved_positions(&self) -> Result<u64, ExecutionError> {
+        let rpc_url = std::env::var("POLYGON_RPC_URL")
+            .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+
+        self.client
+            .redeem_resolved_positions(&rpc_url)
+            .await
+            .map_err(|e| self.handle_clob_error(e, false))
     }
 }
 

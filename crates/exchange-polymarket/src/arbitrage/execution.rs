@@ -610,6 +610,30 @@ pub trait PolymarketExecutor: Send + Sync {
         // Default no-op for live executors
         Ok(())
     }
+
+    /// Returns effective balance: USDC + value of redeemable positions.
+    ///
+    /// For live executors, this queries both the USDC balance and any
+    /// redeemable positions (winning resolved markets) to give a more
+    /// accurate picture of available capital.
+    ///
+    /// Default implementation delegates to `get_balance()`.
+    async fn get_effective_balance(&self) -> Result<Decimal, ExecutionError> {
+        self.get_balance().await
+    }
+
+    /// Redeems all resolved positions on-chain.
+    ///
+    /// For live executors, queries the Data API for redeemable positions
+    /// and sends `CTF.redeemPositions()` transactions.
+    /// For paper executors, this is a no-op.
+    ///
+    /// # Returns
+    /// Number of conditions redeemed.
+    async fn redeem_resolved_positions(&self) -> Result<u64, ExecutionError> {
+        // Default no-op for paper executors
+        Ok(0)
+    }
 }
 
 // =============================================================================

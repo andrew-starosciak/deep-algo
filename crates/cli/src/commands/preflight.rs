@@ -166,7 +166,7 @@ pub async fn run(args: PreflightArgs) -> Result<()> {
         match client.get_positions().await {
             Ok(positions) => {
                 let active: Vec<_> = positions.iter()
-                    .filter(|p| p.size.parse::<f64>().unwrap_or(0.0) > 0.0)
+                    .filter(|p| p.size > 0.0)
                     .collect();
 
                 results.push(CheckResult::pass("Positions", format!("{} active", active.len())));

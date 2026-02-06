@@ -35,6 +35,7 @@ use super::clob_auth::{self, L2Auth};
 use super::eip712::{self, Eip712Config, SIDE_BUY, SIDE_SELL};
 use super::execution::{ExecutionError, OrderParams, OrderResult, OrderStatus, OrderType, Side};
 use super::signer::Wallet;
+use super::types::L2OrderBook;
 
 // =============================================================================
 // Constants
@@ -370,6 +371,26 @@ pub struct BalanceResponse {
     pub allowance: Option<String>,
 }
 
+/// Order book level from the CLOB `/book` endpoint.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClobBookLevel {
+    /// Price as a string for precision.
+    pub price: String,
+    /// Size at this price level.
+    pub size: String,
+}
+
+/// Order book response from `GET /book?token_id=...`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClobBookResponse {
+    /// Bid levels (buy orders).
+    #[serde(default)]
+    pub bids: Vec<ClobBookLevel>,
+    /// Ask levels (sell orders).
+    #[serde(default)]
+    pub asks: Vec<ClobBookLevel>,
+}
+
 /// Wallet position from Data API.
 ///
 /// Represents a token position held by the wallet.
@@ -381,19 +402,19 @@ pub struct WalletPosition {
     /// Condition ID for the market
     pub condition_id: String,
     /// Position size (number of shares)
-    pub size: String,
+    pub size: f64,
     /// Average entry price
-    pub avg_price: String,
+    pub avg_price: f64,
     /// Initial value when position was opened
-    pub initial_value: String,
+    pub initial_value: f64,
     /// Current value of position
-    pub current_value: String,
+    pub current_value: f64,
     /// Cash P&L
-    pub cash_pnl: String,
+    pub cash_pnl: f64,
     /// Percent P&L
-    pub percent_pnl: String,
+    pub percent_pnl: f64,
     /// Current price of token (1.0 = won, 0.0 = lost for resolved markets)
-    pub cur_price: String,
+    pub cur_price: f64,
     /// Whether position can be redeemed (market resolved)
     pub redeemable: bool,
     /// Market title
@@ -403,6 +424,9 @@ pub struct WalletPosition {
     /// Outcome index (0 or 1)
     #[serde(default)]
     pub outcome_index: Option<i32>,
+    /// Whether position is negative risk
+    #[serde(default)]
+    pub negative_risk: bool,
 }
 
 // =============================================================================
@@ -712,17 +736,93 @@ impl ClobClient {
         let positions = self.get_positions_for_tokens(&[token_id]).await?;
 
         if let Some(pos) = positions.first() {
-            // Parse current price
-            let cur_price: Decimal = pos.cur_price.parse().unwrap_or_default();
-
             // Check if resolved (redeemable or price at extremes)
-            if pos.redeemable || cur_price >= dec!(0.95) || cur_price <= dec!(0.05) {
+            if pos.redeemable || pos.cur_price >= 0.95 || pos.cur_price <= 0.05 {
                 // Won if price >= 0.95
-                return Ok(Some(cur_price >= dec!(0.95)));
+                return Ok(Some(pos.cur_price >= 0.95));
             }
         }
 
         Ok(None)
+    }
+
+    /// Finds and redeems all resolved positions on-chain.
+    ///
+    /// Queries the Data API for positions with `redeemable = true`,
+    /// groups them by condition ID, and calls `CTF.redeemPositions()`
+    /// for each one.
+    ///
+    /// # Arguments
+    /// * `rpc_url` - Polygon RPC URL for on-chain transactions
+    ///
+    /// # Returns
+    /// Number of conditions redeemed (0 if none found).
+    pub async fn redeem_resolved_positions(
+        &self,
+        rpc_url: &str,
+    ) -> Result<u64, ClobError> {
+        use std::collections::HashMap;
+        use super::approvals;
+
+        let positions = self.get_positions().await?;
+
+        // Group redeemable positions by condition ID → set of index sets
+        let mut redeemable: HashMap<String, Vec<u32>> = HashMap::new();
+        for pos in &positions {
+            if !pos.redeemable {
+                continue;
+            }
+            if pos.size <= 0.0 {
+                continue;
+            }
+            // outcome_index: 0 → indexSet 1 (binary 01), 1 → indexSet 2 (binary 10)
+            let idx_set = match pos.outcome_index {
+                Some(0) => 1u32,
+                Some(1) => 2u32,
+                _ => {
+                    // Fallback: try both
+                    let entry = redeemable.entry(pos.condition_id.clone()).or_default();
+                    if !entry.contains(&1) { entry.push(1); }
+                    if !entry.contains(&2) { entry.push(2); }
+                    continue;
+                }
+            };
+            let entry = redeemable.entry(pos.condition_id.clone()).or_default();
+            if !entry.contains(&idx_set) {
+                entry.push(idx_set);
+            }
+        }
+
+        if redeemable.is_empty() {
+            return Ok(0);
+        }
+
+        info!(
+            count = redeemable.len(),
+            "Found {} redeemable conditions, sending on-chain redemption",
+            redeemable.len()
+        );
+
+        // Build conditions list for the approvals module
+        let conditions: Vec<(String, Vec<u32>)> = redeemable.into_iter().collect();
+        let conditions_ref: Vec<(&str, Vec<u32>)> = conditions
+            .iter()
+            .map(|(cid, idx)| (cid.as_str(), idx.clone()))
+            .collect();
+
+        let tx_hashes = approvals::redeem_positions(&self.wallet, rpc_url, &conditions_ref)
+            .await
+            .map_err(|e| ClobError::Api {
+                status: 0,
+                message: format!("On-chain redemption failed: {}", e),
+            })?;
+
+        info!(
+            tx_count = tx_hashes.len(),
+            "Redemption transactions confirmed"
+        );
+
+        Ok(conditions_ref.len() as u64)
     }
 
     /// Submits an order to the CLOB.
@@ -917,6 +1017,59 @@ impl ClobClient {
         Ok(())
     }
 
+    /// Fetches the L2 order book for a token from the CLOB REST API.
+    ///
+    /// Public endpoint — no authentication required.
+    pub async fn get_clob_book(&self, token_id: &str) -> Result<L2OrderBook, ClobError> {
+        let url = format!("{}/book?token_id={}", self.config.base_url, token_id);
+
+        debug!(token_id = %token_id, "Fetching CLOB order book");
+
+        let response = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ClobError::Api {
+                status,
+                message: body,
+            });
+        }
+
+        let book_response: ClobBookResponse = response
+            .json()
+            .await
+            .map_err(|e| ClobError::Parse(format!("Failed to parse order book: {}", e)))?;
+
+        let mut book = L2OrderBook::new(token_id.to_string());
+        let bids: Vec<(Decimal, Decimal)> = book_response
+            .bids
+            .iter()
+            .filter_map(|level| {
+                let price = level.price.parse::<Decimal>().ok()?;
+                let size = level.size.parse::<Decimal>().ok()?;
+                Some((price, size))
+            })
+            .collect();
+        let asks: Vec<(Decimal, Decimal)> = book_response
+            .asks
+            .iter()
+            .filter_map(|level| {
+                let price = level.price.parse::<Decimal>().ok()?;
+                let size = level.size.parse::<Decimal>().ok()?;
+                Some((price, size))
+            })
+            .collect();
+        book.apply_snapshot(bids, asks);
+
+        Ok(book)
+    }
+
     // =========================================================================
     // Private Helpers
     // =========================================================================
@@ -1005,7 +1158,7 @@ impl ClobClient {
 
         let order_type_str = match params.order_type {
             OrderType::Fok => "FOK",
-            OrderType::Fak => "FOK", // FAK maps to FOK in Polymarket API
+            OrderType::Fak => "IOC", // FAK maps to IOC (Immediate-Or-Cancel) for partial fills
             OrderType::Gtc => "GTC",
         };
 

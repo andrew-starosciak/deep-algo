@@ -486,18 +486,16 @@ impl CrossMarketSettlementHandler {
 
         // Check if both positions are resolved
         let leg1_result = leg1_pos.and_then(|p| {
-            let price: f64 = p.cur_price.parse().ok()?;
-            if p.redeemable || price >= 0.95 || price <= 0.05 {
-                Some(price >= 0.95)
+            if p.redeemable || p.cur_price >= 0.95 || p.cur_price <= 0.05 {
+                Some(p.cur_price >= 0.95)
             } else {
                 None
             }
         });
 
         let leg2_result = leg2_pos.and_then(|p| {
-            let price: f64 = p.cur_price.parse().ok()?;
-            if p.redeemable || price >= 0.95 || price <= 0.05 {
-                Some(price >= 0.95)
+            if p.redeemable || p.cur_price >= 0.95 || p.cur_price <= 0.05 {
+                Some(p.cur_price >= 0.95)
             } else {
                 None
             }

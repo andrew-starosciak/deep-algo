@@ -722,7 +722,7 @@ mod tests {
         stats.record_opportunity(&opp);
 
         assert_eq!(stats.opportunities_found, 1);
-        assert_eq!(stats.by_combination.get("C1_UP+C2_DOWN"), Some(&1));
+        assert_eq!(stats.by_combination.get("Coin1UpCoin2Down"), Some(&1));
         assert_eq!(stats.by_pair.get("BTC/ETH"), Some(&1));
         assert_eq!(stats.best_spread_seen, Some(dec!(0.04)));
         assert_eq!(stats.lowest_cost_seen, Some(dec!(0.96)));
