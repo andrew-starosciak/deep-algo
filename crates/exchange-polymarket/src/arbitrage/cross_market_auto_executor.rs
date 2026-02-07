@@ -1777,8 +1777,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     trade.missing_token_id.clone()
                 },
                 total_cost,
-                leg1_entry_price: trade.filled_price,
-                leg2_entry_price: missing_fill_price,
+                leg1_entry_price: if trade.filled_leg == FilledLeg::Leg1 {
+                    trade.filled_price
+                } else {
+                    missing_fill_price
+                },
+                leg2_entry_price: if trade.filled_leg == FilledLeg::Leg2 {
+                    trade.filled_price
+                } else {
+                    missing_fill_price
+                },
                 shares: trade.shares,
                 window_end: trade.window_end,
                 executed_at: Utc::now(),
@@ -3058,10 +3066,50 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 (Decimal::ZERO, Decimal::ZERO)
             };
 
-            let (leg1_sell_size, leg1_sell_price) =
-                calc_sell(&leg1_book, leg1_bid, settlement.remaining_shares_leg1);
-            let (leg2_sell_size, leg2_sell_price) =
-                calc_sell(&leg2_book, leg2_bid, settlement.remaining_shares_leg2);
+            // Smart leg selection: only sell losing legs, keep winning legs for
+            // potential $1.00 settlement. A "winning" leg has bid >= entry price.
+            // Exception: if both are winning (profit exit), sell both to lock in.
+            let leg1_winning = leg1_bid >= settlement.leg1_entry_price;
+            let leg2_winning = leg2_bid >= settlement.leg2_entry_price;
+
+            let (sell_leg1, sell_leg2) = match (leg1_winning, leg2_winning) {
+                // Both winning: sell both to lock in profit
+                (true, true) => (true, true),
+                // One winning, one losing: only sell the loser, keep winner for settlement
+                (true, false) => {
+                    info!(
+                        trade_id = %settlement.trade_id,
+                        winning_leg = "leg1",
+                        leg1_bid = %leg1_bid,
+                        leg1_entry = %settlement.leg1_entry_price,
+                        "Keeping winning leg for settlement, selling losing leg only"
+                    );
+                    (false, true)
+                }
+                (false, true) => {
+                    info!(
+                        trade_id = %settlement.trade_id,
+                        winning_leg = "leg2",
+                        leg2_bid = %leg2_bid,
+                        leg2_entry = %settlement.leg2_entry_price,
+                        "Keeping winning leg for settlement, selling losing leg only"
+                    );
+                    (true, false)
+                }
+                // Both losing: sell both to cut losses
+                (false, false) => (true, true),
+            };
+
+            let (leg1_sell_size, leg1_sell_price) = if sell_leg1 {
+                calc_sell(&leg1_book, leg1_bid, settlement.remaining_shares_leg1)
+            } else {
+                (Decimal::ZERO, Decimal::ZERO)
+            };
+            let (leg2_sell_size, leg2_sell_price) = if sell_leg2 {
+                calc_sell(&leg2_book, leg2_bid, settlement.remaining_shares_leg2)
+            } else {
+                (Decimal::ZERO, Decimal::ZERO)
+            };
 
             if leg1_sell_size <= Decimal::ZERO && leg2_sell_size <= Decimal::ZERO {
                 warn!(
