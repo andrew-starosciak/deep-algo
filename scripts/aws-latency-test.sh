@@ -7,6 +7,8 @@
 #   ./scripts/aws-latency-test.sh run [bot-args...]    # Run bot on remote instance
 #   ./scripts/aws-latency-test.sh ssh                  # SSH into instance
 #   ./scripts/aws-latency-test.sh logs                 # Tail remote logs
+#   ./scripts/aws-latency-test.sh redeploy             # Rebuild and upload binary
+#   ./scripts/aws-latency-test.sh latency              # Measure latency to Polymarket endpoints
 #   ./scripts/aws-latency-test.sh status               # Show instance status
 #   ./scripts/aws-latency-test.sh teardown             # Terminate and clean up everything
 #
@@ -363,6 +365,131 @@ cmd_logs() {
 }
 
 # =============================================================================
+# redeploy
+# =============================================================================
+
+cmd_redeploy() {
+    load_state
+
+    info "Building release binary..."
+    (
+        cd "$PROJECT_ROOT"
+        set -a
+        # shellcheck disable=SC1091
+        source .env
+        set +a
+        if ! cargo build -p algo-trade-cli --release 2>&1 | tail -5; then
+            error "Build failed"
+            exit 1
+        fi
+    )
+
+    local binary="$PROJECT_ROOT/target/release/algo-trade"
+    local binary_size
+    binary_size=$(du -h "$binary" | cut -f1)
+    info "Binary built ($binary_size), uploading to $PUBLIC_IP..."
+
+    remote_scp "$binary" "$SSH_USER@$PUBLIC_IP:~/algo-trade"
+    remote_ssh "chmod +x ~/algo-trade"
+
+    # Also sync .env in case it changed
+    remote_scp "$PROJECT_ROOT/.env" "$SSH_USER@$PUBLIC_IP:~/.env"
+    remote_ssh "chmod 600 ~/.env"
+
+    info "Redeployed to $PUBLIC_IP"
+}
+
+# =============================================================================
+# latency
+# =============================================================================
+
+cmd_latency() {
+    load_state
+
+    local rounds="${1:-5}"
+
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}        ${WHITE}Polymarket Endpoint Latency (${REGION})${NC}                      ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # Endpoints to test: name|method|url
+    local endpoints=(
+        "CLOB Time|GET|https://clob.polymarket.com/time"
+        "CLOB Prices|GET|https://clob.polymarket.com/prices"
+        "CLOB Book|GET|https://clob.polymarket.com/book"
+        "CLOB Order|POST|https://clob.polymarket.com/order"
+        "Gamma API|GET|https://gamma-api.polymarket.com/markets?limit=1"
+    )
+
+    # Build the remote script
+    local remote_script='
+rounds='"$rounds"'
+fmt="connect:%{time_connect} tls:%{time_appconnect} firstbyte:%{time_starttransfer} total:%{time_total} http:%{http_code}\n"
+
+run_test() {
+    local name="$1" method="$2" url="$3"
+    local totals=() connects=() first_bytes=()
+    local curl_args=(-s -o /dev/null -w "$fmt" --max-time 10)
+    if [[ "$method" == "POST" ]]; then
+        curl_args+=(-X POST -H "Content-Type: application/json" -d "{}")
+    fi
+
+    for i in $(seq 1 $rounds); do
+        result=$(curl "${curl_args[@]}" "$url" 2>/dev/null)
+        total=$(echo "$result" | grep -oP "total:\K[0-9.]+")
+        conn=$(echo "$result" | grep -oP "connect:\K[0-9.]+")
+        fb=$(echo "$result" | grep -oP "firstbyte:\K[0-9.]+")
+        http=$(echo "$result" | grep -oP "http:\K[0-9]+")
+        totals+=("$total")
+        connects+=("$conn")
+        first_bytes+=("$fb")
+    done
+
+    # Calculate averages using awk
+    avg_conn=$(printf "%s\n" "${connects[@]}" | awk "{s+=\$1} END {printf \"%.1f\", s/NR*1000}")
+    avg_fb=$(printf "%s\n" "${first_bytes[@]}" | awk "{s+=\$1} END {printf \"%.1f\", s/NR*1000}")
+    avg_total=$(printf "%s\n" "${totals[@]}" | awk "{s+=\$1} END {printf \"%.1f\", s/NR*1000}")
+    min_total=$(printf "%s\n" "${totals[@]}" | awk "BEGIN{m=999} {if(\$1<m)m=\$1} END {printf \"%.1f\", m*1000}")
+    max_total=$(printf "%s\n" "${totals[@]}" | awk "BEGIN{m=0} {if(\$1>m)m=\$1} END {printf \"%.1f\", m*1000}")
+
+    printf "  %-16s  tcp:%-6s  tls→fb:%-7s  total:%-6s  (min:%-5s max:%-5s)  [%s]\n" \
+        "$name" "${avg_conn}ms" "${avg_fb}ms" "${avg_total}ms" "${min_total}ms" "${max_total}ms" "$http"
+}
+'
+
+    # Add each endpoint test to the remote script
+    for ep in "${endpoints[@]}"; do
+        IFS='|' read -r name method url <<< "$ep"
+        remote_script+="run_test \"$name\" \"$method\" \"$url\""$'\n'
+    done
+
+    # Latency breakdown for CLOB
+    remote_script+='
+echo ""
+echo "  CLOB latency breakdown:"
+breakdown=$(curl -s -o /dev/null -w "dns:%{time_namelookup} tcp:%{time_connect} tls:%{time_appconnect} server:%{time_starttransfer} total:%{time_total}" --max-time 10 https://clob.polymarket.com/time)
+dns=$(echo "$breakdown" | grep -oP "dns:\K[0-9.]+" | awk "{printf \"%.1f\", \$1*1000}")
+tcp=$(echo "$breakdown" | grep -oP "tcp:\K[0-9.]+" | awk "{printf \"%.1f\", \$1*1000}")
+tls=$(echo "$breakdown" | grep -oP "tls:\K[0-9.]+" | awk "{printf \"%.1f\", \$1*1000}")
+server=$(echo "$breakdown" | grep -oP "server:\K[0-9.]+" | awk "{printf \"%.1f\", \$1*1000}")
+total=$(echo "$breakdown" | grep -oP "total:\K[0-9.]+" | awk "{printf \"%.1f\", \$1*1000}")
+tls_only=$(echo "$tls $tcp" | awk "{printf \"%.1f\", \$1-\$2}")
+server_only=$(echo "$server $tls" | awk "{printf \"%.1f\", \$1-\$2}")
+printf "    dns: %sms → tcp: %sms → tls: %sms (+%sms) → server: %sms (+%sms) → total: %sms\n" \
+    "$dns" "$tcp" "$tls" "$tls_only" "$server" "$server_only" "$total"
+echo ""
+echo "  With connection reuse (reqwest::Client), tcp+tls is paid once."
+echo "  Subsequent requests: ~${server_only}ms (server processing only)"
+'
+
+    info "Running $rounds rounds per endpoint from $PUBLIC_IP..."
+    echo ""
+    remote_ssh "$remote_script"
+    echo ""
+}
+
+# =============================================================================
 # status
 # =============================================================================
 
@@ -477,6 +604,13 @@ case "${1:-help}" in
     logs)
         cmd_logs
         ;;
+    redeploy)
+        cmd_redeploy
+        ;;
+    latency)
+        shift
+        cmd_latency "$@"
+        ;;
     status)
         cmd_status
         ;;
@@ -488,7 +622,7 @@ case "${1:-help}" in
         ;;
     *)
         error "Unknown command: $1"
-        echo "Usage: $0 {deploy|run|ssh|logs|status|teardown}"
+        echo "Usage: $0 {deploy|run|ssh|logs|redeploy|latency|status|teardown}"
         exit 1
         ;;
 esac

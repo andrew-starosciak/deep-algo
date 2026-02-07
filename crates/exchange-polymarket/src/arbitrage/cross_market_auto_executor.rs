@@ -2854,19 +2854,19 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     debug!(
                         trade_id = %settlement.trade_id,
                         error = %gamma_err,
-                        "Gamma API failed, trying CLOB"
+                        "Gamma API failed for orphan, trying Chainlink oracle"
                     );
-                    match self.try_settle_via_clob_single(&settlement).await {
+                    match self.try_settle_via_chainlink(&settlement).await {
                         Ok(result) => {
-                            debug!(trade_id = %settlement.trade_id, "DB trade settled via CLOB");
+                            info!(trade_id = %settlement.trade_id, "Orphan settled via Chainlink oracle");
                             Some(result)
                         }
-                        Err(clob_err) => {
+                        Err(chainlink_err) => {
                             warn!(
                                 trade_id = %settlement.trade_id,
                                 gamma_error = %gamma_err,
-                                clob_error = %clob_err,
-                                "Could not settle DB trade via Gamma or CLOB"
+                                chainlink_error = %chainlink_err,
+                                "Could not settle orphan via Gamma or Chainlink"
                             );
                             None
                         }
@@ -3028,16 +3028,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
     }
 
-    /// Tries to settle a single trade via CLOB token prices (for orphaned settlement).
-    /// Unlike `try_settle_via_clob` which operates on the fast-settle batch,
-    /// this operates on a single `PendingPaperSettlement`.
-    async fn try_settle_via_clob_single(
-        &self,
-        settlement: &PendingPaperSettlement,
-    ) -> Result<(bool, bool), CrossMarketAutoExecutorError> {
-        // Reuse the existing per-trade CLOB settlement
-        self.try_settle_via_clob(settlement).await
-    }
 
     /// Expires stale pending records from previous sessions on startup.
     /// Any opportunity still 'pending' with window_end > 30 minutes ago is marked 'expired'.
@@ -4102,24 +4092,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 debug!(
                     trade_id = %settlement.trade_id,
                     error = %e,
-                    "Gamma API settlement not available, trying CLOB"
+                    "Gamma API settlement not available, falling back to Chainlink oracle"
                 );
-                // Try CLOB prices
-                match self.try_settle_via_clob(settlement).await {
-                    Ok(result) => {
-                        info!(trade_id = %settlement.trade_id, "Settled via CLOB prices");
-                        result
-                    }
-                    Err(e2) => {
-                        info!(
-                            trade_id = %settlement.trade_id,
-                            error = %e2,
-                            "CLOB settlement failed, trying Chainlink oracle fallback"
-                        );
-                        // Fall back to Chainlink oracle prices (same source Polymarket uses)
-                        self.try_settle_via_chainlink(settlement).await?
-                    }
-                }
+                // CLOB returns 400 for resolved markets, skip straight to Chainlink
+                // (same price source Polymarket uses for settlement)
+                self.try_settle_via_chainlink(settlement).await?
             }
         };
 
@@ -4394,90 +4371,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 ExecutionError::rejected(
                     "Market outcomes not yet available from Gamma".to_string(),
                 ),
-            )),
-        }
-    }
-
-    /// Tries to settle via CLOB token prices.
-    async fn try_settle_via_clob(
-        &self,
-        settlement: &PendingPaperSettlement,
-    ) -> Result<(bool, bool), CrossMarketAutoExecutorError> {
-        let token_ids = vec![
-            settlement.leg1_token_id.clone(),
-            settlement.leg2_token_id.clone(),
-        ];
-
-        let url = format!(
-            "https://clob.polymarket.com/prices?token_ids={}",
-            token_ids.join(",")
-        );
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
-                    "HTTP error: {}",
-                    e
-                )))
-            })?;
-
-        if !response.status().is_success() {
-            return Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("CLOB API error: {}", response.status())),
-            ));
-        }
-
-        let prices: std::collections::HashMap<String, serde_json::Value> =
-            response.json().await.map_err(|e| {
-                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
-                    "JSON parse error: {}",
-                    e
-                )))
-            })?;
-
-        let leg1_price = prices
-            .get(&settlement.leg1_token_id)
-            .and_then(|v| v.get("price").or(v.get("mid")))
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| {
-                prices
-                    .get(&settlement.leg1_token_id)
-                    .and_then(|v| v.as_f64())
-            });
-
-        let leg2_price = prices
-            .get(&settlement.leg2_token_id)
-            .and_then(|v| v.get("price").or(v.get("mid")))
-            .and_then(|v| v.as_str())
-            .and_then(|s| s.parse::<f64>().ok())
-            .or_else(|| {
-                prices
-                    .get(&settlement.leg2_token_id)
-                    .and_then(|v| v.as_f64())
-            });
-
-        match (leg1_price, leg2_price) {
-            (Some(p1), Some(p2)) => {
-                let l1_won = p1 >= 0.95;
-                let l2_won = p2 >= 0.95;
-                debug!(
-                    trade_id = %settlement.trade_id,
-                    leg1_price = p1,
-                    leg2_price = p2,
-                    leg1_won = l1_won,
-                    leg2_won = l2_won,
-                    "Settled via CLOB prices"
-                );
-                Ok((l1_won, l2_won))
-            }
-            _ => Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Token prices not available in CLOB".to_string()),
             )),
         }
     }
