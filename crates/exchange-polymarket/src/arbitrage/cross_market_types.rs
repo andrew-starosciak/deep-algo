@@ -111,7 +111,7 @@ impl fmt::Display for CrossMarketCombination {
 }
 
 /// Order book depth data for a single token.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TokenDepth {
     /// Total bid depth (shares available to sell into).
     pub bid_depth: Decimal,
@@ -122,7 +122,7 @@ pub struct TokenDepth {
 }
 
 /// Snapshot of a single coin's market prices.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CoinMarketSnapshot {
     /// The coin type.
     pub coin: Coin,

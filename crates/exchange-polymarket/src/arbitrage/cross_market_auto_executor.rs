@@ -45,6 +45,7 @@ use super::cross_market_types::{CrossMarketCombination, CrossMarketOpportunity};
 use super::execution::{
     ExecutionError, OrderParams, OrderResult, OrderStatus, OrderType, PolymarketExecutor, Side,
 };
+use algo_trade_data::chainlink::ChainlinkWindowTracker;
 use crate::gamma::GammaClient;
 use crate::models::Coin;
 
@@ -148,6 +149,10 @@ pub struct CrossMarketAutoExecutorConfig {
     /// filled trades in a window, no new entries are allowed until the next window.
     /// Default: 1 (one trade per window to avoid over-concentration).
     pub max_trades_per_window: u32,
+
+    /// Observe mode: persist ALL detected opportunities (even filtered ones) and
+    /// record CLOB snapshots every scan interval. Default: false.
+    pub observe_mode: bool,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -171,6 +176,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 1,
+            observe_mode: false,
         }
     }
 }
@@ -198,6 +204,7 @@ impl CrossMarketAutoExecutorConfig {
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 1,
+            observe_mode: false,
         }
     }
 
@@ -223,6 +230,7 @@ impl CrossMarketAutoExecutorConfig {
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 1,
+            observe_mode: false,
         }
     }
 
@@ -456,6 +464,11 @@ pub struct CrossMarketAutoExecutorStats {
     /// Current prices from WebSocket feed: coin -> (up_price, down_price).
     /// Updated by the CLI from runner stats, used for fast settlement.
     pub live_prices: std::collections::HashMap<String, (Decimal, Decimal)>,
+
+    // === Live snapshots from scanner (for CLOB persistence) ===
+    /// Latest market snapshots from scanner, updated by CLI stats sync.
+    /// Used for persisting CLOB price history to database.
+    pub live_snapshots: Vec<super::cross_market_types::CoinMarketSnapshot>,
 }
 
 /// Simplified trade info for dashboard display.
@@ -877,6 +890,9 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
 
     /// Tracks the last time we checked for redeemable positions.
     last_redeem_check: Option<std::time::Instant>,
+
+    /// Chainlink oracle price tracker for settlement (replaces Binance).
+    chainlink_tracker: Arc<RwLock<ChainlinkWindowTracker>>,
 }
 
 impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
@@ -889,6 +905,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         );
 
         let session_id = format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S"));
+        let rpc_url = std::env::var("POLYGON_RPC_URL")
+            .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
 
         Self {
             executor,
@@ -907,6 +925,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             session_id,
             last_both_rejected_at: None,
             last_redeem_check: None,
+            chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
         }
     }
 
@@ -925,6 +944,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         let session_id =
             session_id.unwrap_or_else(|| format!("auto-{}", Utc::now().format("%Y%m%d-%H%M%S")));
+        let rpc_url = std::env::var("POLYGON_RPC_URL")
+            .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
 
         Self {
             executor,
@@ -943,6 +964,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             session_id,
             last_both_rejected_at: None,
             last_redeem_check: None,
+            chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
         }
     }
 
@@ -988,14 +1010,43 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             stats.started_at = Some(Utc::now());
         }
 
+        // Startup: settle orphaned trades from previous sessions, then expire truly stale ones
+        self.settle_orphaned_trades().await;
+        self.expire_stale_pending().await;
+
+        // Startup: create session record in database
+        self.create_session_record().await;
+
         // Track last settlement check time - check every 5 seconds for faster settlement
         let mut last_settlement_check = std::time::Instant::now();
         let settlement_check_interval = std::time::Duration::from_secs(5);
+
+        // Track Chainlink polling (every 10 seconds)
+        let mut last_chainlink_poll = std::time::Instant::now();
+        let chainlink_poll_interval = std::time::Duration::from_secs(10);
+
+        // Track last CLOB/Chainlink DB persistence (every 30 seconds)
+        let mut last_price_persist = std::time::Instant::now();
+        let price_persist_interval = std::time::Duration::from_secs(30);
 
         loop {
             if self.should_stop.load(Ordering::SeqCst) {
                 info!("CrossMarketAutoExecutor stopping");
                 break;
+            }
+
+            // Poll Chainlink oracle prices at window boundaries
+            if last_chainlink_poll.elapsed() >= chainlink_poll_interval {
+                let mut tracker = self.chainlink_tracker.write().await;
+                tracker.poll().await;
+                last_chainlink_poll = std::time::Instant::now();
+            }
+
+            // Persist CLOB snapshots and Chainlink window prices periodically
+            if last_price_persist.elapsed() >= price_persist_interval {
+                self.persist_clob_snapshots().await;
+                self.persist_chainlink_windows().await;
+                last_price_persist = std::time::Instant::now();
             }
 
             // Always check settlement if interval has passed (before waiting for opportunities)
@@ -1061,6 +1112,13 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             warn!(error = %e, "Final settlement check error");
         }
 
+        // Final persistence flush
+        self.persist_clob_snapshots().await;
+        self.persist_chainlink_windows().await;
+
+        // Update session record with final stats
+        self.update_session_record().await;
+
         // Log any remaining incomplete trades
         {
             let incomplete = self.incomplete_trades.read().await;
@@ -1085,6 +1143,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         {
             let mut stats = self.stats.write().await;
             stats.opportunities_received += 1;
+        }
+
+        // Observe mode: persist ALL detected opportunities before filtering
+        if self.config.observe_mode {
+            self.persist_detected_opportunity(&opp).await;
         }
 
         // Cooldown after both legs rejected (e.g., FOK not filled due to low liquidity).
@@ -2612,6 +2675,532 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     }
 
     // =========================================================================
+    // Database Lifecycle Methods (startup, periodic, shutdown)
+    // =========================================================================
+
+    /// Settles orphaned trades from previous sessions on startup.
+    ///
+    /// When a session is killed before settlement runs, executed trades remain
+    /// `pending` in the DB forever. This method loads those orphaned records and
+    /// settles them retroactively via Gamma API (official outcomes) or CLOB prices.
+    async fn settle_orphaned_trades(&self) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Load pending executed trades from previous sessions where window has closed
+        let rows = match sqlx::query_as::<_, (
+            i32,                    // id
+            String,                 // session_id
+            DateTime<Utc>,          // timestamp (executed_at)
+            String,                 // coin1
+            String,                 // coin2
+            String,                 // combination
+            String,                 // leg1_direction
+            Decimal,                // leg1_price
+            String,                 // leg1_token_id
+            String,                 // leg2_direction
+            Decimal,                // leg2_price
+            String,                 // leg2_token_id
+            Decimal,                // total_cost
+            DateTime<Utc>,          // window_end
+        )>(
+            r#"
+            SELECT id, session_id, timestamp, coin1, coin2, combination,
+                   leg1_direction, leg1_price, leg1_token_id,
+                   leg2_direction, leg2_price, leg2_token_id,
+                   total_cost, window_end
+            FROM cross_market_opportunities
+            WHERE status = 'pending'
+              AND executed = true
+              AND window_end < NOW() - INTERVAL '30 seconds'
+              AND session_id != $1
+            ORDER BY window_end ASC
+            "#,
+        )
+        .bind(&self.session_id)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Failed to load orphaned trades for settlement");
+                return;
+            }
+        };
+
+        if rows.is_empty() {
+            return;
+        }
+
+        info!(
+            count = rows.len(),
+            "Found {} orphaned trades from previous sessions — attempting settlement",
+            rows.len()
+        );
+
+        let mut settled = 0u64;
+        let mut failed = 0u64;
+
+        for (id, original_session_id, executed_at, coin1, coin2, _combination,
+             leg1_direction, leg1_price, leg1_token_id,
+             leg2_direction, leg2_price, leg2_token_id,
+             total_cost, window_end) in &rows
+        {
+            // Reconstruct a PendingPaperSettlement for the existing settle methods
+            let settlement = PendingPaperSettlement {
+                trade_id: format!("orphan-{}", id),
+                coin1: coin1.clone(),
+                coin2: coin2.clone(),
+                leg1_direction: leg1_direction.clone(),
+                leg2_direction: leg2_direction.clone(),
+                leg1_token_id: leg1_token_id.clone(),
+                leg2_token_id: leg2_token_id.clone(),
+                total_cost: *total_cost,
+                leg1_entry_price: *leg1_price,
+                leg2_entry_price: *leg2_price,
+                shares: Decimal::ONE, // Nominal — pnl recalculated from total_cost
+                window_end: *window_end,
+                executed_at: *executed_at,
+                remaining_shares_leg1: Decimal::ONE,
+                remaining_shares_leg2: Decimal::ONE,
+                early_exit_proceeds: Decimal::ZERO,
+                partially_exited: false,
+                last_exit_attempt: None,
+            };
+
+            // Try Gamma API first (most reliable for past windows), then CLOB
+            let outcome = match self.try_settle_via_gamma(&settlement).await {
+                Ok(result) => {
+                    info!(trade_id = %settlement.trade_id, "Orphan settled via Gamma API");
+                    Some(result)
+                }
+                Err(gamma_err) => {
+                    warn!(
+                        trade_id = %settlement.trade_id,
+                        error = %gamma_err,
+                        "Gamma API failed for orphan, trying CLOB"
+                    );
+                    match self.try_settle_via_clob_single(&settlement).await {
+                        Ok(result) => {
+                            info!(trade_id = %settlement.trade_id, "Orphan settled via CLOB");
+                            Some(result)
+                        }
+                        Err(clob_err) => {
+                            warn!(
+                                trade_id = %settlement.trade_id,
+                                gamma_error = %gamma_err,
+                                clob_error = %clob_err,
+                                "Could not settle orphan via Gamma or CLOB"
+                            );
+                            None
+                        }
+                    }
+                }
+            };
+
+            if let Some((leg1_won, leg2_won)) = outcome {
+                // Derive outcomes
+                let c1_out = if leg1_won {
+                    leg1_direction.clone()
+                } else if leg1_direction == "UP" {
+                    "DOWN".to_string()
+                } else {
+                    "UP".to_string()
+                };
+                let c2_out = if leg2_won {
+                    leg2_direction.clone()
+                } else if leg2_direction == "UP" {
+                    "DOWN".to_string()
+                } else {
+                    "UP".to_string()
+                };
+
+                let trade_result = match (leg1_won, leg2_won) {
+                    (true, true) => "DOUBLE_WIN",
+                    (true, false) | (false, true) => "WIN",
+                    (false, false) => "LOSE",
+                };
+
+                // Calculate PnL based on actual shares (total_cost / sum of prices)
+                let avg_price = (*leg1_price + *leg2_price) / dec!(2);
+                let shares = if avg_price > Decimal::ZERO {
+                    *total_cost / (*leg1_price + *leg2_price)
+                } else {
+                    Decimal::ONE
+                };
+                let leg1_payout = if leg1_won { shares } else { Decimal::ZERO };
+                let leg2_payout = if leg2_won { shares } else { Decimal::ZERO };
+                let gross_payout = leg1_payout + leg2_payout;
+                let fees = gross_payout * self.fee_rate;
+                let pnl = gross_payout - fees - *total_cost;
+
+                // Update DB with original session_id
+                let result = sqlx::query(
+                    r#"
+                    UPDATE cross_market_opportunities
+                    SET status = 'settled',
+                        coin1_outcome = $1,
+                        coin2_outcome = $2,
+                        trade_result = $3,
+                        actual_pnl = $4,
+                        correlation_correct = $5,
+                        settled_at = NOW()
+                    WHERE id = $6
+                    "#,
+                )
+                .bind(&c1_out)
+                .bind(&c2_out)
+                .bind(trade_result)
+                .bind(pnl)
+                .bind(c1_out == c2_out)
+                .bind(id)
+                .execute(pool)
+                .await;
+
+                match result {
+                    Ok(r) if r.rows_affected() > 0 => {
+                        settled += 1;
+                        info!(
+                            id = id,
+                            session = %original_session_id,
+                            pair = %format!("{}/{}", coin1, coin2),
+                            result = trade_result,
+                            pnl = %pnl,
+                            "Settled orphaned trade"
+                        );
+                    }
+                    Ok(_) => {
+                        warn!(id = id, "Orphan settlement update matched no rows");
+                        failed += 1;
+                    }
+                    Err(e) => {
+                        warn!(id = id, error = %e, "Failed to update orphan settlement in DB");
+                        failed += 1;
+                    }
+                }
+            } else {
+                failed += 1;
+            }
+        }
+
+        if settled > 0 || failed > 0 {
+            info!(
+                settled = settled,
+                failed = failed,
+                "Orphaned trade settlement complete"
+            );
+        }
+    }
+
+    /// Tries to settle a single trade via CLOB token prices (for orphaned settlement).
+    /// Unlike `try_settle_via_clob` which operates on the fast-settle batch,
+    /// this operates on a single `PendingPaperSettlement`.
+    async fn try_settle_via_clob_single(
+        &self,
+        settlement: &PendingPaperSettlement,
+    ) -> Result<(bool, bool), CrossMarketAutoExecutorError> {
+        // Reuse the existing per-trade CLOB settlement
+        self.try_settle_via_clob(settlement).await
+    }
+
+    /// Expires stale pending records from previous sessions on startup.
+    /// Any opportunity still 'pending' with window_end > 30 minutes ago is marked 'expired'.
+    async fn expire_stale_pending(&self) {
+        if let Some(pool) = &self.db_pool {
+            let result = sqlx::query(
+                r#"
+                UPDATE cross_market_opportunities
+                SET status = 'expired', settled_at = NOW()
+                WHERE status = 'pending'
+                  AND window_end < NOW() - INTERVAL '30 minutes'
+                "#,
+            )
+            .execute(pool)
+            .await;
+
+            match result {
+                Ok(r) if r.rows_affected() > 0 => {
+                    info!(
+                        expired = r.rows_affected(),
+                        "Expired stale pending records from previous sessions"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "Failed to expire stale pending records"),
+            }
+        }
+    }
+
+    /// Creates a session record in cross_market_sessions at startup.
+    async fn create_session_record(&self) {
+        if let Some(pool) = &self.db_pool {
+            let coins: Vec<String> = self
+                .config
+                .filter_pair
+                .map(|(c1, c2)| {
+                    vec![
+                        c1.slug_prefix().to_uppercase(),
+                        c2.slug_prefix().to_uppercase(),
+                    ]
+                })
+                .unwrap_or_else(|| {
+                    vec![
+                        "BTC".to_string(),
+                        "ETH".to_string(),
+                        "SOL".to_string(),
+                        "XRP".to_string(),
+                    ]
+                });
+
+            let result = sqlx::query(
+                r#"
+                INSERT INTO cross_market_sessions
+                    (session_id, started_at, min_spread_threshold,
+                     assumed_correlation, coins_scanned, status)
+                VALUES ($1, NOW(), $2, $3, $4, 'active')
+                ON CONFLICT (session_id) DO NOTHING
+                "#,
+            )
+            .bind(&self.session_id)
+            .bind(self.config.min_spread)
+            .bind(Decimal::from_f64_retain(self.config.min_win_probability).unwrap_or(Decimal::ZERO))
+            .bind(&coins)
+            .execute(pool)
+            .await;
+
+            match result {
+                Ok(_) => info!(session_id = %self.session_id, "Session record created"),
+                Err(e) => warn!(error = %e, "Failed to create session record"),
+            }
+        }
+    }
+
+    /// Updates the session record with final stats at shutdown.
+    async fn update_session_record(&self) {
+        if let Some(pool) = &self.db_pool {
+            let stats = self.stats.read().await;
+            let total_settled = stats.settled_wins + stats.settled_losses + stats.double_wins;
+            let total_wins = stats.settled_wins + stats.double_wins;
+            let actual_win_rate = if total_settled > 0 {
+                Decimal::from(total_wins) / Decimal::from(total_settled)
+            } else {
+                Decimal::ZERO
+            };
+
+            let result = sqlx::query(
+                r#"
+                UPDATE cross_market_sessions
+                SET ended_at = NOW(),
+                    total_opportunities = $2,
+                    opportunities_settled = $3,
+                    total_wins = $4,
+                    total_losses = $5,
+                    double_wins = $6,
+                    actual_win_rate = $7,
+                    total_pnl = $8,
+                    status = 'completed'
+                WHERE session_id = $1
+                "#,
+            )
+            .bind(&self.session_id)
+            .bind(stats.opportunities_received as i32)
+            .bind(total_settled as i32)
+            .bind(stats.settled_wins as i32)
+            .bind(stats.settled_losses as i32)
+            .bind(stats.double_wins as i32)
+            .bind(actual_win_rate)
+            .bind(stats.realized_pnl)
+            .execute(pool)
+            .await;
+
+            match result {
+                Ok(_) => info!(session_id = %self.session_id, "Session record updated"),
+                Err(e) => warn!(error = %e, "Failed to update session record"),
+            }
+        }
+    }
+
+    /// Persists CLOB price snapshots from the latest scanner data.
+    async fn persist_clob_snapshots(&self) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let snapshots = {
+            let stats = self.stats.read().await;
+            stats.live_snapshots.clone()
+        };
+
+        if snapshots.is_empty() {
+            return;
+        }
+
+        let now = Utc::now();
+        for snap in &snapshots {
+            let coin = snap.coin.slug_prefix().to_uppercase();
+            let (up_bid, up_ask) = snap
+                .up_depth
+                .as_ref()
+                .map(|d| (Some(d.bid_depth), Some(d.ask_depth)))
+                .unwrap_or((None, None));
+            let (down_bid, down_ask) = snap
+                .down_depth
+                .as_ref()
+                .map(|d| (Some(d.bid_depth), Some(d.ask_depth)))
+                .unwrap_or((None, None));
+
+            let result = sqlx::query(
+                r#"
+                INSERT INTO clob_price_snapshots
+                    (timestamp, coin, up_price, down_price,
+                     up_token_id, down_token_id,
+                     up_bid_depth, up_ask_depth, down_bid_depth, down_ask_depth,
+                     session_id)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                ON CONFLICT (timestamp, coin) DO NOTHING
+                "#,
+            )
+            .bind(now)
+            .bind(&coin)
+            .bind(snap.up_price)
+            .bind(snap.down_price)
+            .bind(&snap.up_token_id)
+            .bind(&snap.down_token_id)
+            .bind(up_bid)
+            .bind(up_ask)
+            .bind(down_bid)
+            .bind(down_ask)
+            .bind(&self.session_id)
+            .execute(pool)
+            .await;
+
+            if let Err(e) = result {
+                debug!(error = %e, coin = %coin, "Failed to persist CLOB snapshot");
+            }
+        }
+    }
+
+    /// Persists Chainlink window price records to the database.
+    async fn persist_chainlink_windows(&self) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let tracker = self.chainlink_tracker.read().await;
+        let windows = tracker.get_all_windows();
+
+        for (coin, window_start_ts, record) in &windows {
+            let window_start =
+                DateTime::from_timestamp(*window_start_ts, 0).unwrap_or_else(Utc::now);
+
+            let result = sqlx::query(
+                r#"
+                INSERT INTO chainlink_window_prices
+                    (window_start, coin, start_price, end_price, outcome,
+                     closed, poll_count, first_polled_at, last_polled_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (window_start, coin) DO UPDATE SET
+                    end_price = EXCLUDED.end_price,
+                    outcome = EXCLUDED.outcome,
+                    closed = EXCLUDED.closed,
+                    poll_count = EXCLUDED.poll_count,
+                    last_polled_at = EXCLUDED.last_polled_at
+                "#,
+            )
+            .bind(window_start)
+            .bind(coin)
+            .bind(record.start_price)
+            .bind(record.latest_price)
+            .bind(if record.closed {
+                if record.latest_price >= record.start_price {
+                    Some("UP")
+                } else {
+                    Some("DOWN")
+                }
+            } else {
+                None
+            })
+            .bind(record.closed)
+            .bind(record.poll_count as i32)
+            .bind(record.first_polled_at)
+            .bind(record.last_polled_at)
+            .execute(pool)
+            .await;
+
+            if let Err(e) = result {
+                debug!(error = %e, coin = %coin, "Failed to persist Chainlink window");
+            }
+        }
+    }
+
+    /// Persists a detected opportunity without execution (observe mode).
+    /// Records all opportunities with executed=false so we can track what we *could* have traded.
+    async fn persist_detected_opportunity(&self, opp: &CrossMarketOpportunity) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let window_end = {
+            let ts = opp.detected_at.timestamp();
+            let window_secs = 900;
+            let window_start = (ts / window_secs) * window_secs;
+            let window_end_ts = window_start + window_secs;
+            DateTime::from_timestamp(window_end_ts, 0).unwrap_or(opp.detected_at)
+        };
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO cross_market_opportunities
+                (timestamp, coin1, coin2, combination,
+                 leg1_direction, leg1_price, leg1_token_id,
+                 leg2_direction, leg2_price, leg2_token_id,
+                 total_cost, spread, expected_value, win_probability,
+                 assumed_correlation, session_id, status, window_end,
+                 leg1_bid_depth, leg1_ask_depth,
+                 leg2_bid_depth, leg2_ask_depth,
+                 executed)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18,
+                    $19, $20, $21, $22, $23)
+            "#,
+        )
+        .bind(opp.detected_at)
+        .bind(&opp.coin1)
+        .bind(&opp.coin2)
+        .bind(opp.combination.to_string())
+        .bind(&opp.leg1_direction)
+        .bind(opp.leg1_price)
+        .bind(&opp.leg1_token_id)
+        .bind(&opp.leg2_direction)
+        .bind(opp.leg2_price)
+        .bind(&opp.leg2_token_id)
+        .bind(opp.total_cost)
+        .bind(opp.spread)
+        .bind(opp.expected_value)
+        .bind(Decimal::from_f64_retain(opp.win_probability).unwrap_or(Decimal::ZERO))
+        .bind(Decimal::from_f64_retain(opp.assumed_correlation).unwrap_or(Decimal::ZERO))
+        .bind(&self.session_id)
+        .bind("pending")
+        .bind(window_end)
+        .bind(opp.leg1_bid_depth)
+        .bind(opp.leg1_ask_depth)
+        .bind(opp.leg2_bid_depth)
+        .bind(opp.leg2_ask_depth)
+        .bind(false) // Not executed — just detected
+        .execute(pool)
+        .await;
+
+        if let Err(e) = result {
+            debug!(error = %e, "Failed to persist detected opportunity");
+        }
+    }
+
+    // =========================================================================
     // Paper Settlement Methods
     // =========================================================================
 
@@ -2677,13 +3266,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         });
     }
 
-    /// Tries fast settlement using live WebSocket prices first, then CLOB.
+    /// Tries fast settlement using CLOB token prices for closed windows.
     ///
-    /// For trades where the window has closed:
-    /// 1. Try using live_prices from WebSocket (most reliable)
-    /// 2. Fall back to fetching CLOB prices directly
+    /// Queries the specific token IDs from the CLOB API. If a token's price
+    /// is > $0.50, that outcome won.
     ///
-    /// Simple logic: If UP price > $0.50, coin went UP. Otherwise DOWN.
+    /// NOTE: Previously this used live scanner prices (coin-level) which was
+    /// wrong — those are for the NEXT window's markets, not the resolved one.
+    /// Now we only use token-specific CLOB prices which are correct.
     async fn try_fast_settle_via_clob(&self) -> Result<u64, CrossMarketAutoExecutorError> {
         let now = Utc::now();
         let half = dec!(0.50);
@@ -2702,84 +3292,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             return Ok(0);
         }
 
-        // Get live prices from stats (updated by CLI from runner)
-        let live_prices = {
-            let stats = self.stats.read().await;
-            stats.live_prices.clone()
-        };
-
-        info!(
+        debug!(
             count = trades_to_check.len(),
-            live_prices_available = !live_prices.is_empty(),
-            "Checking {} pending trades for fast settlement",
+            "Checking {} pending trades for fast settlement via CLOB token prices",
             trades_to_check.len()
         );
 
         let mut settled_count = 0u64;
 
         for settlement in trades_to_check {
-            let secs_since_close = (now - settlement.window_end).num_seconds();
-
-            // Try to settle using live WebSocket prices first
-            let c1_upper = settlement.coin1.to_uppercase();
-            let c2_upper = settlement.coin2.to_uppercase();
-
-            if let (Some(&(c1_up, _c1_down)), Some(&(c2_up, _c2_down))) =
-                (live_prices.get(&c1_upper), live_prices.get(&c2_upper))
-            {
-                // Simple: if UP > 0.50, coin went UP. Otherwise DOWN.
-                let c1_outcome = if c1_up > half { "UP" } else { "DOWN" };
-                let c2_outcome = if c2_up > half { "UP" } else { "DOWN" };
-
-                // Determine if our legs won
-                let leg1_won = settlement.leg1_direction == c1_outcome;
-                let leg2_won = settlement.leg2_direction == c2_outcome;
-
-                info!(
-                    trade_id = %settlement.trade_id,
-                    secs_since_close = secs_since_close,
-                    c1 = %c1_upper,
-                    c1_up = %c1_up,
-                    c1_outcome = %c1_outcome,
-                    c2 = %c2_upper,
-                    c2_up = %c2_up,
-                    c2_outcome = %c2_outcome,
-                    leg1_dir = %settlement.leg1_direction,
-                    leg2_dir = %settlement.leg2_direction,
-                    leg1_won = leg1_won,
-                    leg2_won = leg2_won,
-                    "SETTLING via live WebSocket prices"
-                );
-
-                // Finalize
-                self.finalize_settlement(&settlement, leg1_won, leg2_won)
-                    .await;
-
-                // Remove from pending
-                {
-                    let mut pending = self.pending_settlements.write().await;
-                    pending.retain(|s| s.trade_id != settlement.trade_id);
-
-                    let mut stats = self.stats.write().await;
-                    stats.pending_settlement = pending.len() as u64;
-                    stats
-                        .pending_trades
-                        .retain(|t| t.trade_id != settlement.trade_id);
-                }
-
-                settled_count += 1;
-                continue; // Move to next trade
-            } else {
-                info!(
-                    trade_id = %settlement.trade_id,
-                    c1 = %c1_upper,
-                    c2 = %c2_upper,
-                    available_coins = ?live_prices.keys().collect::<Vec<_>>(),
-                    "No live prices for coins, trying CLOB API"
-                );
-            }
-
-            // Fall back to CLOB API if live prices not available or not decisive
+            // Fetch CLOB prices for the specific token IDs of this trade
             let token_ids = vec![
                 settlement.leg1_token_id.clone(),
                 settlement.leg2_token_id.clone(),
@@ -2806,7 +3328,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
             let status = response.status();
             if !status.is_success() {
-                warn!(
+                debug!(
                     status = %status,
                     trade_id = %settlement.trade_id,
                     "CLOB API returned error - tokens may be expired"
@@ -2831,7 +3353,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 match serde_json::from_str(&body) {
                     Ok(p) => p,
                     Err(e) => {
-                        warn!(error = %e, body = %body, "Failed to parse CLOB prices JSON");
+                        debug!(error = %e, "Failed to parse CLOB prices JSON");
                         continue;
                     }
                 };
@@ -2845,7 +3367,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 .and_then(|p| Decimal::from_str(&p.price).ok());
 
             if let (Some(p1), Some(p2)) = (leg1_price, leg2_price) {
-                // Simple: if token price > 0.50, that token won
+                // Token price > 0.50 means that outcome won
                 let leg1_won = p1 > half;
                 let leg2_won = p2 > half;
 
@@ -2874,109 +3396,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
                 settled_count += 1;
             }
-        }
-
-        Ok(settled_count)
-    }
-
-    /// Tries fast settlement using live WebSocket prices.
-    ///
-    /// If prices are decisive (>$0.90 or <$0.10), we can infer the outcome
-    /// without waiting for official resolution. This is faster and more reliable.
-    ///
-    /// # Arguments
-    /// * `current_prices` - Map of coin -> (up_price, down_price) from WebSocket
-    pub async fn try_fast_settle_with_prices(
-        &self,
-        current_prices: &std::collections::HashMap<String, (Decimal, Decimal)>,
-    ) -> Result<u64, CrossMarketAutoExecutorError> {
-        let now = Utc::now();
-        let threshold_high = dec!(0.90); // If price > 0.90, consider it a winner
-        let threshold_low = dec!(0.10); // If price < 0.10, consider it a loser
-
-        let mut settled_count = 0u64;
-
-        // Collect trades ready for fast settlement
-        let mut to_settle = Vec::new();
-        {
-            let pending = self.pending_settlements.read().await;
-            for settlement in pending.iter() {
-                // Only try fast settle after window has closed
-                if now <= settlement.window_end {
-                    continue;
-                }
-
-                // Get prices for both coins
-                let c1_prices = current_prices.get(&settlement.coin1.to_uppercase());
-                let c2_prices = current_prices.get(&settlement.coin2.to_uppercase());
-
-                if let (Some((c1_up, c1_down)), Some((c2_up, c2_down))) = (c1_prices, c2_prices) {
-                    // Determine outcomes from decisive prices
-                    let c1_outcome = if *c1_up > threshold_high {
-                        Some("UP")
-                    } else if *c1_down > threshold_high {
-                        Some("DOWN")
-                    } else if *c1_up < threshold_low {
-                        Some("DOWN") // If UP is near 0, DOWN won
-                    } else if *c1_down < threshold_low {
-                        Some("UP") // If DOWN is near 0, UP won
-                    } else {
-                        None // Prices not decisive yet
-                    };
-
-                    let c2_outcome = if *c2_up > threshold_high {
-                        Some("UP")
-                    } else if *c2_down > threshold_high {
-                        Some("DOWN")
-                    } else if *c2_up < threshold_low {
-                        Some("DOWN")
-                    } else if *c2_down < threshold_low {
-                        Some("UP")
-                    } else {
-                        None
-                    };
-
-                    if let (Some(c1), Some(c2)) = (c1_outcome, c2_outcome) {
-                        to_settle.push((settlement.clone(), c1.to_string(), c2.to_string()));
-                    }
-                }
-            }
-        }
-
-        // Settle the decisive trades
-        for (settlement, c1_outcome, c2_outcome) in to_settle {
-            let leg1_won = settlement.leg1_direction == c1_outcome;
-            let leg2_won = settlement.leg2_direction == c2_outcome;
-
-            info!(
-                trade_id = %settlement.trade_id,
-                c1 = &settlement.coin1,
-                c1_outcome = %c1_outcome,
-                c2 = &settlement.coin2,
-                c2_outcome = %c2_outcome,
-                leg1_won = leg1_won,
-                leg2_won = leg2_won,
-                "Fast settlement via live prices"
-            );
-
-            // Calculate P&L and update stats
-            self.finalize_settlement(&settlement, leg1_won, leg2_won)
-                .await;
-
-            // Remove from pending
-            {
-                let mut pending = self.pending_settlements.write().await;
-                pending.retain(|s| s.trade_id != settlement.trade_id);
-
-                let mut stats = self.stats.write().await;
-                stats.pending_settlement = pending.len() as u64;
-                // Also remove from pending display
-                stats
-                    .pending_trades
-                    .retain(|t| t.trade_id != settlement.trade_id);
-            }
-
-            settled_count += 1;
         }
 
         Ok(settled_count)
@@ -3561,10 +3980,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         info!(
                             trade_id = %settlement.trade_id,
                             error = %e2,
-                            "CLOB settlement failed, trying Binance fallback"
+                            "CLOB settlement failed, trying Chainlink oracle fallback"
                         );
-                        // Fall back to Binance
-                        self.try_settle_via_binance(settlement).await?
+                        // Fall back to Chainlink oracle prices (same source Polymarket uses)
+                        self.try_settle_via_chainlink(settlement).await?
                     }
                 }
             }
@@ -3707,140 +4126,58 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
     }
 
-    /// Fetches coin outcome (UP or DOWN) from Binance using 1m candles.
+    /// Tries to settle via Chainlink oracle prices recorded at window boundaries.
     ///
-    /// Uses 1m candles instead of 15m because Binance candles don't align with
-    /// Polymarket's ET-based windows. We fetch candles for the entire window
-    /// and compare the open of the first candle to the close of the last.
-    async fn get_coin_outcome(
+    /// This is the correct fallback since Polymarket uses Chainlink for resolution.
+    /// The tracker records oracle prices every ~10 seconds and compares
+    /// start vs end price for each window.
+    async fn try_settle_via_chainlink(
         &self,
-        coin: &str,
-        window_start: DateTime<Utc>,
-        window_end: DateTime<Utc>,
-    ) -> Result<Option<String>, CrossMarketAutoExecutorError> {
-        // Convert coin to Binance symbol
-        let symbol = match coin.to_uppercase().as_str() {
-            "BTC" => "BTCUSDT",
-            "ETH" => "ETHUSDT",
-            "SOL" => "SOLUSDT",
-            "XRP" => "XRPUSDT",
-            other => {
-                return Err(CrossMarketAutoExecutorError::Execution(
-                    ExecutionError::rejected(format!("Unknown coin: {}", other)),
-                ));
+        settlement: &PendingPaperSettlement,
+    ) -> Result<(bool, bool), CrossMarketAutoExecutorError> {
+        let window_end = settlement.window_end;
+        let window_start_ts = (window_end - chrono::Duration::minutes(15)).timestamp();
+
+        let tracker = self.chainlink_tracker.read().await;
+
+        let c1_outcome = tracker.get_outcome(&settlement.coin1, window_start_ts);
+        let c2_outcome = tracker.get_outcome(&settlement.coin2, window_start_ts);
+        let c1_available = c1_outcome.is_some();
+        let c2_available = c2_outcome.is_some();
+        let tracked = tracker.tracked_window_count();
+        let closed = tracker.closed_window_count();
+
+        match (c1_outcome, c2_outcome) {
+            (Some(c1), Some(c2)) => {
+                let leg1_won = settlement.leg1_direction == c1;
+                let leg2_won = settlement.leg2_direction == c2;
+
+                info!(
+                    trade_id = %settlement.trade_id,
+                    coin1_outcome = %c1,
+                    coin2_outcome = %c2,
+                    leg1_won = leg1_won,
+                    leg2_won = leg2_won,
+                    "Settled via Chainlink oracle prices"
+                );
+                Ok((leg1_won, leg2_won))
             }
-        };
-
-        let start_ms = window_start.timestamp_millis();
-        let end_ms = window_end.timestamp_millis();
-
-        // Use 1m candles to get precise window boundaries
-        let url = format!(
-            "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&endTime={}&limit=20",
-            symbol, start_ms, end_ms
-        );
-
-        debug!(
-            symbol = symbol,
-            window_start = %window_start,
-            window_end = %window_end,
-            url = %url,
-            "Fetching Binance candles for settlement"
-        );
-
-        let response = self
-            .http_client
-            .get(&url)
-            .header("Accept", "application/json")
-            .send()
-            .await
-            .map_err(|e| {
-                CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
-                    "HTTP error: {}",
-                    e
-                )))
-            })?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            warn!(symbol = symbol, status = %status, "Binance API error");
-            return Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected(format!("Binance API error: {}", status)),
-            ));
+            _ => {
+                debug!(
+                    trade_id = %settlement.trade_id,
+                    c1_available = c1_available,
+                    c2_available = c2_available,
+                    tracked_windows = tracked,
+                    closed_windows = closed,
+                    "Chainlink window data not available for settlement"
+                );
+                Err(CrossMarketAutoExecutorError::Execution(
+                    ExecutionError::rejected(
+                        "Chainlink window prices not available (bot may not have been running during this window)".to_string(),
+                    ),
+                ))
+            }
         }
-
-        // Parse klines: [open_time, open, high, low, close, volume, close_time, ...]
-        let klines: Vec<Vec<serde_json::Value>> = response.json().await.map_err(|e| {
-            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(format!(
-                "JSON parse error: {}",
-                e
-            )))
-        })?;
-
-        if klines.is_empty() {
-            warn!(symbol = symbol, "No candles returned from Binance");
-            return Ok(None);
-        }
-
-        // Get the first candle's open price
-        let first_kline = &klines[0];
-        let open_str = first_kline.get(1).and_then(|v| v.as_str()).ok_or_else(|| {
-            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
-                "Invalid first kline open price".to_string(),
-            ))
-        })?;
-
-        // Get the last candle's close price
-        let last_kline = &klines[klines.len() - 1];
-
-        // Check if the last kline is closed (close_time < now)
-        let close_time_ms = last_kline.get(6).and_then(|v| v.as_i64()).ok_or_else(|| {
-            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
-                "Invalid kline close_time".to_string(),
-            ))
-        })?;
-
-        let now_ms = Utc::now().timestamp_millis();
-        if close_time_ms > now_ms {
-            debug!(
-                symbol = symbol,
-                close_time_ms = close_time_ms,
-                now_ms = now_ms,
-                "Last candle not yet closed"
-            );
-            return Ok(None); // Window not fully closed yet
-        }
-
-        let close_str = last_kline.get(4).and_then(|v| v.as_str()).ok_or_else(|| {
-            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
-                "Invalid last kline close price".to_string(),
-            ))
-        })?;
-
-        let open: f64 = open_str.parse().map_err(|_| {
-            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
-                "Invalid open price format".to_string(),
-            ))
-        })?;
-        let close: f64 = close_str.parse().map_err(|_| {
-            CrossMarketAutoExecutorError::Execution(ExecutionError::rejected(
-                "Invalid close price format".to_string(),
-            ))
-        })?;
-
-        // UP if close > open, DOWN otherwise
-        let outcome = if close > open { "UP" } else { "DOWN" };
-
-        info!(
-            symbol = symbol,
-            open = open,
-            close = close,
-            candle_count = klines.len(),
-            outcome = outcome,
-            "Determined coin outcome from Binance"
-        );
-
-        Ok(Some(outcome.to_string()))
     }
 
     /// Tries to settle via Gamma API (official market outcomes).
@@ -4011,42 +4348,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
     }
 
-    /// Tries to settle via Binance klines (fallback when CLOB fails).
-    async fn try_settle_via_binance(
-        &self,
-        settlement: &PendingPaperSettlement,
-    ) -> Result<(bool, bool), CrossMarketAutoExecutorError> {
-        let window_end = settlement.window_end;
-        let window_start = window_end - chrono::Duration::minutes(15);
-
-        let c1_outcome = self
-            .get_coin_outcome(&settlement.coin1, window_start, window_end)
-            .await?;
-        let c2_outcome = self
-            .get_coin_outcome(&settlement.coin2, window_start, window_end)
-            .await?;
-
-        match (c1_outcome, c2_outcome) {
-            (Some(c1), Some(c2)) => {
-                // Leg won if our bet direction matches actual outcome
-                let leg1_won = settlement.leg1_direction == c1;
-                let leg2_won = settlement.leg2_direction == c2;
-
-                info!(
-                    trade_id = %settlement.trade_id,
-                    coin1_outcome = %c1,
-                    coin2_outcome = %c2,
-                    leg1_won = leg1_won,
-                    leg2_won = leg2_won,
-                    "Settled via Binance fallback"
-                );
-                Ok((leg1_won, leg2_won))
-            }
-            _ => Err(CrossMarketAutoExecutorError::Execution(
-                ExecutionError::rejected("Coin outcomes not available from Binance".to_string()),
-            )),
-        }
-    }
 }
 
 // =============================================================================

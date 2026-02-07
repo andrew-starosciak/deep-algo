@@ -309,6 +309,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
             auto_config.fixed_bet_size = Some(Decimal::ONE); // $1 per leg (nominal)
             auto_config.trading_cutoff_secs = 30; // Observe almost to window end
             auto_config.filter_combination = None; // Observe ALL combinations
+            auto_config.observe_mode = true; // Persist ALL detected opportunities
 
             let dashboard_config = DashboardConfig {
                 mode,
@@ -489,11 +490,12 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
         }
 
         if last_stats.elapsed() >= stats_interval {
-            // Copy live prices from runner to executor for settlement
+            // Copy live prices and snapshots from runner to executor
             {
                 let runner = runner_stats.read().await;
                 let mut auto = auto_stats.write().await;
                 auto.live_prices = runner.current_prices.clone();
+                auto.live_snapshots = runner.current_snapshots.clone();
             }
 
             if verbose {
@@ -609,11 +611,6 @@ async fn print_dashboard(
         "-".to_string()
     };
 
-    // Get current prices for the pair
-    let (coin1, coin2) = config.pair.split_once('/').unwrap_or(("BTC", "ETH"));
-    let c1_prices = runner.current_prices.get(coin1);
-    let c2_prices = runner.current_prices.get(coin2);
-
     // Move cursor to top
     print!("\x1b[H");
 
@@ -630,32 +627,51 @@ async fn print_dashboard(
         config.max_position, config.balance);
     println!("{clear_line}");
 
-    // Live prices + strategy spread
+    // Live prices - all 4 coins in a 2x2 grid
+    let all_coins = ["BTC", "ETH", "SOL", "XRP"];
     println!("{clear_line}  {bold}Prices{reset}");
-    if let Some((up, down)) = c1_prices {
-        print!("{clear_line}    {coin1}  {green}UP {:.2}{reset}  {red}DN {:.2}{reset}", up, down);
-    } else {
-        print!("{clear_line}    {coin1}  {dim}...{reset}");
-    }
-    if let Some((up, down)) = c2_prices {
-        print!("    {coin2}  {green}UP {:.2}{reset}  {red}DN {:.2}{reset}", up, down);
-    } else {
-        print!("    {coin2}  {dim}...{reset}");
-    }
-    // Strategy cost inline
-    let strategy_cost = match config.combination.as_str() {
-        "Coin1↓ Coin2↑" => c1_prices.zip(c2_prices).map(|((_, d), (u, _))| d + u),
-        "Coin1↑ Coin2↓" => c1_prices.zip(c2_prices).map(|((u, _), (_, d))| u + d),
-        "Both↑" => c1_prices.zip(c2_prices).map(|((u1, _), (u2, _))| u1 + u2),
-        "Both↓" => c1_prices.zip(c2_prices).map(|((_, d1), (_, d2))| d1 + d2),
-        _ => c1_prices.zip(c2_prices).map(|((_, d), (u, _))| d + u),
-    };
-    if let Some(total) = strategy_cost {
-        let spread = Decimal::ONE - total;
-        let sc = if spread >= Decimal::from_str("0.03").unwrap_or_default() { green } else { yellow };
-        println!("    {dim}Sprd:{reset} {sc}{:.3}{reset}", spread);
-    } else {
+    for row in all_coins.chunks(2) {
+        print!("{clear_line}  ");
+        for coin in row {
+            if let Some((up, down)) = runner.current_prices.get(*coin) {
+                print!("  {:>3}  {green}▲{:.2}{reset}  {red}▼{:.2}{reset}      ", coin, up, down);
+            } else {
+                print!("  {:>3}  {dim}waiting...{reset}          ", coin);
+            }
+        }
         println!();
+    }
+    println!("{clear_line}");
+
+    // Pairings table - all 6 pairs with spreads for each combination
+    let spread_ok = Decimal::from_str("0.03").unwrap_or_default();
+    println!("{clear_line}  {bold}Spreads{reset}        {dim}↓↑      ↑↓      ↑↑      ↓↓{reset}");
+    let pairs: &[(&str, &str)] = &[
+        ("BTC", "ETH"), ("BTC", "SOL"), ("BTC", "XRP"),
+        ("ETH", "SOL"), ("ETH", "XRP"), ("SOL", "XRP"),
+    ];
+    for (c1, c2) in pairs {
+        let p1 = runner.current_prices.get(*c1);
+        let p2 = runner.current_prices.get(*c2);
+        if let (Some((u1, d1)), Some((u2, d2))) = (p1, p2) {
+            let spreads = [
+                Decimal::ONE - (*d1 + *u2),  // ↓↑: coin1 down + coin2 up
+                Decimal::ONE - (*u1 + *d2),  // ↑↓: coin1 up + coin2 down
+                Decimal::ONE - (*u1 + *u2),  // ↑↑: both up
+                Decimal::ONE - (*d1 + *d2),  // ↓↓: both down
+            ];
+            print!("{clear_line}    {c1}/{c2}    ");
+            for s in &spreads {
+                let color = if *s >= spread_ok { green }
+                           else if *s > Decimal::ZERO { yellow }
+                           else { dim };
+                let sign = if *s > Decimal::ZERO { "+" } else { "" };
+                print!("{color}{sign}{:.3}{reset}   ", s);
+            }
+            println!();
+        } else {
+            println!("{clear_line}    {c1}/{c2}    {dim}...{reset}");
+        }
     }
     println!("{clear_line}");
 
@@ -796,7 +812,7 @@ async fn print_dashboard(
         Local::now().format("%H:%M:%S"));
 
     // Clear any leftover lines from previous render
-    for _ in 0..5 {
+    for _ in 0..10 {
         println!("{clear_line}");
     }
 

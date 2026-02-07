@@ -156,6 +156,8 @@ pub struct CrossMarketRunnerStats {
     pub started_at: Option<chrono::DateTime<Utc>>,
     /// Current market prices (for display).
     pub current_prices: std::collections::HashMap<String, (Decimal, Decimal)>,
+    /// Latest market snapshots (for DB persistence of CLOB prices).
+    pub current_snapshots: Vec<CoinMarketSnapshot>,
     /// Errors encountered.
     pub errors: u64,
 }
@@ -354,7 +356,7 @@ impl CrossMarketRunner {
             .filter_map(|m| self.market_to_snapshot_with_depth(m, now_ms))
             .collect();
 
-        // Update current prices in stats
+        // Update current prices and snapshots in stats
         {
             let mut stats = self.stats.write().await;
             for snapshot in &snapshots {
@@ -363,6 +365,7 @@ impl CrossMarketRunner {
                     (snapshot.up_price, snapshot.down_price),
                 );
             }
+            stats.current_snapshots = snapshots.clone();
         }
 
         if snapshots.len() < 2 {

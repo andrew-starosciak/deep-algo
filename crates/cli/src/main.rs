@@ -200,8 +200,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "/tmp/cross_market_auto.log".to_string());
             let file = std::fs::OpenOptions::new()
                 .create(true)
-                .write(true)
-                .truncate(true)
+                .append(true)
                 .open(&log_path)?;
             tracing_subscriber::fmt()
                 .with_env_filter(

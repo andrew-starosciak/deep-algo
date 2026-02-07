@@ -6,6 +6,7 @@
 use crate::models::{Coin, GammaEvent, Market};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
 use reqwest::Client;
@@ -246,25 +247,45 @@ impl GammaClient {
             }
         };
 
-        // Look for a market with resolved tokens
-        for gamma_market in event.markets {
+        // Look for a market with resolved tokens or resolved outcome prices
+        for gamma_market in &event.markets {
             if let Some(market) = gamma_market.to_market() {
-                // Check if tokens have winner field set
+                // Check if tokens have winner field set (works for live/recently resolved)
                 for token in &market.tokens {
                     if let Some(is_winner) = token.winner {
                         if is_winner {
-                            // This token won - return its outcome
                             let outcome = token.outcome.to_uppercase();
                             tracing::info!(
                                 coin = coin.slug_prefix(),
                                 outcome = %outcome,
                                 token_id = %token.token_id,
-                                "Got market outcome from Gamma API"
+                                "Got market outcome from Gamma API (token winner)"
                             );
                             return Ok(Some(outcome));
                         }
                     }
                 }
+            }
+
+            // Fallback: check outcomePrices for resolved markets where tokens is null.
+            // Resolved markets have outcomePrices like ["1","0"] (Up won) or ["0","1"] (Down won).
+            if let Some((up_price, down_price)) = gamma_market.parse_outcome_prices() {
+                if up_price == Decimal::ONE && down_price == Decimal::ZERO {
+                    tracing::info!(
+                        coin = coin.slug_prefix(),
+                        outcome = "UP",
+                        "Got market outcome from Gamma API (outcomePrices)"
+                    );
+                    return Ok(Some("UP".to_string()));
+                } else if up_price == Decimal::ZERO && down_price == Decimal::ONE {
+                    tracing::info!(
+                        coin = coin.slug_prefix(),
+                        outcome = "DOWN",
+                        "Got market outcome from Gamma API (outcomePrices)"
+                    );
+                    return Ok(Some("DOWN".to_string()));
+                }
+                // Prices are neither 0/1 nor 1/0 — market not yet resolved
             }
         }
 
