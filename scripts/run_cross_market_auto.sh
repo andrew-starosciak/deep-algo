@@ -16,7 +16,8 @@
 #   --combination <type>  Combination filter (default: coin1down_coin2up)
 #   --min-spread <val>    Minimum spread required (default: 0.03)
 #   --min-win-prob <val>  Minimum win probability (default: 0.85)
-#   --max-position <val>  Max position per window in USDC (default: 500)
+#   --max-position <val>  Max position per window in USDC (default: 50)
+#   --max-trades <n>      Max paired trades per 15-min window (default: 20)
 #   --kelly <fraction>    Kelly fraction 0.0-1.0 (default: 0.25)
 #   --paper-balance <amt> Paper mode starting balance (default: 1000)
 #   --no-persist          Disable database persistence
@@ -71,6 +72,7 @@ MIN_SPREAD="0.20"
 MIN_WIN_PROB="0.85"
 MAX_LOSS_PROB="0.50"
 MAX_POSITION="10"
+MAX_TRADES_PER_WINDOW="10"
 PAPER_BALANCE="1000"
 PERSIST="--persist"
 SESSION_ID=""
@@ -124,6 +126,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --max-position)
             MAX_POSITION="$2"
+            shift 2
+            ;;
+        --max-trades)
+            MAX_TRADES_PER_WINDOW="$2"
             shift 2
             ;;
         --paper-balance)
@@ -244,6 +250,7 @@ CMD+=(--min-spread "$MIN_SPREAD")
 CMD+=(--min-win-prob "$MIN_WIN_PROB")
 CMD+=(--max-loss-prob "$MAX_LOSS_PROB")
 CMD+=(--max-position "$MAX_POSITION")
+CMD+=(--max-trades-per-window "$MAX_TRADES_PER_WINDOW")
 CMD+=(--kelly-fraction "$KELLY_FRACTION")
 CMD+=(--stats-interval-secs "$STATS_INTERVAL")
 

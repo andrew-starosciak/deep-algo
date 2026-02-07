@@ -352,7 +352,7 @@ impl Default for CrossMarketConfig {
             min_spread: dec!(0.03),
             assumed_correlation: 0.85,
             min_expected_value: dec!(0.01),
-            signal_cooldown_ms: 5_000,
+            signal_cooldown_ms: 2_000,
             coins: vec![Coin::Btc, Coin::Eth, Coin::Sol, Coin::Xrp],
             combinations: None,       // All combinations
             min_depth: Decimal::ZERO, // No depth filtering by default
@@ -598,7 +598,7 @@ mod tests {
         assert_eq!(config.min_spread, dec!(0.03));
         assert!((config.assumed_correlation - 0.85).abs() < 0.001);
         assert_eq!(config.min_expected_value, dec!(0.01));
-        assert_eq!(config.signal_cooldown_ms, 5_000);
+        assert_eq!(config.signal_cooldown_ms, 2_000);
         assert_eq!(config.coins.len(), 4);
     }
 

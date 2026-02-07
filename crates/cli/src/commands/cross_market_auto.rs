@@ -125,6 +125,11 @@ pub struct CrossMarketAutoArgs {
     #[arg(long)]
     pub max_position: Option<f64>,
 
+    /// Maximum paired trades per 15-minute window. Default: 20 (live), 1 (paper).
+    /// Higher values enable high-frequency small-bet strategies.
+    #[arg(long)]
+    pub max_trades_per_window: Option<u32>,
+
     /// Initial paper balance in USDC (paper mode only).
     #[arg(long, default_value = "1000")]
     pub paper_balance: f64,
@@ -281,6 +286,9 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
     }
     if let Some(fixed) = args.fixed_bet_size() {
         auto_config.fixed_bet_size = Some(fixed);
+    }
+    if let Some(max_trades) = args.max_trades_per_window {
+        auto_config.max_trades_per_window = max_trades;
     }
 
     // Create runner

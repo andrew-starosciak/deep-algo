@@ -226,20 +226,22 @@ impl CrossMarketAutoExecutorConfig {
     }
 
     /// Creates a micro testing configuration with tight limits.
+    /// Designed for high-frequency small FOK orders ($1-2 per leg) that
+    /// fill reliably on thin books and accumulate edge through volume.
     #[must_use]
     pub fn micro_testing() -> Self {
         Self {
             filter_pair: Some((Coin::Btc, Coin::Eth)),
             filter_combination: Some(CrossMarketCombination::Coin1DownCoin2Up),
             kelly_fraction: 0.10,
-            fixed_bet_size: Some(dec!(2.5)),
+            fixed_bet_size: Some(dec!(1)),
             min_bet_size: dec!(1),
             max_bet_size: dec!(5),
             max_position_per_window: dec!(10),
             min_spread: dec!(0.20),
             buy_slippage: dec!(0.02),
             min_win_probability: 0.75,
-            max_history: 100,
+            max_history: 1000,
             early_exit_enabled: false,
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
@@ -248,7 +250,7 @@ impl CrossMarketAutoExecutorConfig {
             entry_window_end_secs: 240,
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
-            max_trades_per_window: 5,
+            max_trades_per_window: 10,
             observe_mode: false,
         }
     }
