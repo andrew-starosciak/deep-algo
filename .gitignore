@@ -19,3 +19,7 @@ secrets/
 
 # Docker volumes (if using bind mounts)
 docker-data/
+
+# AWS latency test state
+scripts/.aws-latency-test.state
+scripts/.aws-latency-key.pem
