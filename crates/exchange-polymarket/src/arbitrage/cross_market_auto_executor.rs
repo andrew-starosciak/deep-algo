@@ -1820,7 +1820,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // Attempt 0: 95% market, Attempt 1: 92%, Attempt 2: 89%, ..., clamped at 80%
         let discount = dec!(0.95) - dec!(0.03) * Decimal::from(trade.escape_attempts);
         let discount = discount.max(dec!(0.80));
-        let sell_price = (market_price * discount).max(dec!(0.01));
+        // Round DOWN to cents — Polymarket requires tick-aligned prices ($0.01)
+        let sell_price = ((market_price * discount) * dec!(100)).floor() / dec!(100);
+        let sell_price = sell_price.max(dec!(0.01));
 
         info!(
             trade_id = %trade.trade_id,
@@ -2155,8 +2157,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         excess: Decimal,
         reference_price: Decimal,
     ) {
-        // Sell at 2% below reference to ensure fill, but floor at 0.01
-        let sell_price = (reference_price * dec!(0.98)).max(dec!(0.01));
+        // Sell at 2% below reference to ensure fill, round to cent tick, floor at 0.01
+        let sell_price = ((reference_price * dec!(0.98)) * dec!(100)).floor() / dec!(100);
+        let sell_price = sell_price.max(dec!(0.01));
 
         let sell_order = OrderParams {
             token_id: token_id.to_string(),
@@ -2953,7 +2956,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
                 // Fallback: use WebSocket live price with conservative discount
                 if ws_bid >= MIN_LEG_PRICE {
-                    let sell_price = (ws_bid * dec!(0.95)).max(MIN_LEG_PRICE);
+                    // Round to cent tick — Polymarket requires tick-aligned prices
+                    let sell_price = ((ws_bid * dec!(0.95)) * dec!(100)).floor() / dec!(100);
+                    let sell_price = sell_price.max(MIN_LEG_PRICE);
                     let sell_size = remaining;
                     let sell_value = sell_size * sell_price;
                     if sell_size >= dec!(0.1) && sell_value >= MIN_ORDER_VALUE {

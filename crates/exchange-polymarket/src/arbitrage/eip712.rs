@@ -331,6 +331,10 @@ pub fn sign_hash(hash: &[u8; 32], private_key_hex: &str) -> Result<String, Eip71
 ///
 /// - BUY: taker_amount = size (shares we receive), maker_amount = size * price (USDC we pay)
 /// - SELL: maker_amount = size (shares we give), taker_amount = size * price (USDC we receive)
+///
+/// Matches Python SDK's ROUNDING_CONFIG for $0.01 tick markets:
+///   price=2dp (round_normal), size=2dp (round_down), amount=4dp
+/// The product of 2dp × 2dp has at most 4dp, so no further rounding is needed.
 pub fn calculate_amounts(
     side: u8,
     price: Decimal,
@@ -350,20 +354,24 @@ pub fn calculate_amounts(
         ));
     }
 
+    // Match Python SDK: round price to tick (2dp for $0.01 markets)
+    let price_tick = round_normal(price, 2);
     // Round size down to 2 decimal places (matching Python SDK's round_config.size=2)
     let size_rounded = round_down(size, 2);
 
     let (maker_amount, taker_amount) = if side == SIDE_BUY {
         // BUY: taker = shares we receive, maker = USDC we pay
         let taker_natural = size_rounded;
-        let maker_natural = round_down(taker_natural * price, 2);
+        // Full precision: 2dp × 2dp = 4dp max (matches round_config.amount=4)
+        let maker_natural = taker_natural * price_tick;
         let taker_raw = (taker_natural * scale).floor();
         let maker_raw = (maker_natural * scale).floor();
         (maker_raw, taker_raw)
     } else {
         // SELL: maker = shares we give, taker = USDC we receive
         let maker_natural = size_rounded;
-        let taker_natural = round_down(maker_natural * price, 2);
+        // Full precision: 2dp × 2dp = 4dp max (matches round_config.amount=4)
+        let taker_natural = maker_natural * price_tick;
         let maker_raw = (maker_natural * scale).floor();
         let taker_raw = (taker_natural * scale).floor();
         (maker_raw, taker_raw)
@@ -375,10 +383,17 @@ pub fn calculate_amounts(
     Ok((maker_u64, taker_u64))
 }
 
-/// Rounds a Decimal down to the given number of decimal places.
+/// Rounds a Decimal down (floor) to the given number of decimal places.
 fn round_down(value: Decimal, dp: u32) -> Decimal {
     let factor = Decimal::from(10u64.pow(dp));
     (value * factor).floor() / factor
+}
+
+/// Rounds a Decimal to nearest (half-up) to the given number of decimal places.
+/// Matches Python SDK's `round_normal`.
+fn round_normal(value: Decimal, dp: u32) -> Decimal {
+    let factor = Decimal::from(10u64.pow(dp));
+    (value * factor).round() / factor
 }
 
 fn decimal_to_u64(d: Decimal) -> Result<u64, Eip712Error> {
@@ -637,12 +652,37 @@ mod tests {
     fn calculate_amounts_rounds_correctly() {
         // BUY: price=0.19, size=10.752688 (from real trading scenario)
         // size_rounded = 10.75, taker = 10.75 * 10^6 = 10_750_000
-        // maker = round_down(10.75 * 0.19, 2) = round_down(2.0425, 2) = 2.04
-        // maker_raw = 2.04 * 10^6 = 2_040_000
+        // price_tick = round_normal(0.19, 2) = 0.19
+        // maker = 10.75 * 0.19 = 2.0425 (full 4dp precision, matching Python SDK amount=4)
+        // maker_raw = 2.0425 * 10^6 = 2_042_500
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.19), dec!(10.752688)).unwrap();
         assert_eq!(taker, 10_750_000); // Rounded down to 2 dp
-        assert_eq!(maker, 2_040_000); // Rounded down to 2 dp in USDC
+        assert_eq!(maker, 2_042_500); // Full precision: 10.75 * 0.19 = 2.0425
+    }
+
+    #[test]
+    fn calculate_amounts_sell_subcent_price_snaps_to_tick() {
+        // Regression test: escape sell at sub-cent price 0.1995 was rejected by API.
+        // round_normal(0.1995, 2) = 0.20, so amounts use price=0.20.
+        // SELL: price=0.20, size=5.8823529... → size_rounded=5.88
+        // maker = 5.88 * 10^6 = 5_880_000
+        // taker = 5.88 * 0.20 = 1.176 * 10^6 = 1_176_000
+        let (maker, taker) =
+            calculate_amounts(SIDE_SELL, dec!(0.1995), dec!(5.8823529411764705)).unwrap();
+        assert_eq!(maker, 5_880_000);
+        assert_eq!(taker, 1_176_000); // 5.88 * 0.20 = 1.176 (not truncated to 1.17)
+    }
+
+    #[test]
+    fn calculate_amounts_sell_exact_cent_price() {
+        // SELL at exact cent price: no rounding needed
+        // size=5.88, price=0.19
+        // taker = 5.88 * 0.19 = 1.1172 * 10^6 = 1_117_200
+        let (maker, taker) =
+            calculate_amounts(SIDE_SELL, dec!(0.19), dec!(5.88)).unwrap();
+        assert_eq!(maker, 5_880_000);
+        assert_eq!(taker, 1_117_200); // Full 4dp precision (was 1_110_000 with old 2dp rounding)
     }
 
     #[test]
