@@ -69,6 +69,7 @@ BET_SIZE=""
 KELLY_FRACTION="0.25"
 MIN_SPREAD="0.03"
 MIN_WIN_PROB="0.85"
+MAX_LOSS_PROB="0.50"
 MAX_POSITION="15"
 PAPER_BALANCE="1000"
 PERSIST="--persist"
@@ -115,6 +116,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --min-win-prob)
             MIN_WIN_PROB="$2"
+            shift 2
+            ;;
+        --max-loss-prob)
+            MAX_LOSS_PROB="$2"
             shift 2
             ;;
         --max-position)
@@ -228,6 +233,7 @@ CMD+=(--mode "$MODE")
 CMD+=(--duration "$DURATION")
 CMD+=(--min-spread "$MIN_SPREAD")
 CMD+=(--min-win-prob "$MIN_WIN_PROB")
+CMD+=(--max-loss-prob "$MAX_LOSS_PROB")
 CMD+=(--max-position "$MAX_POSITION")
 CMD+=(--kelly-fraction "$KELLY_FRACTION")
 CMD+=(--stats-interval-secs "$STATS_INTERVAL")

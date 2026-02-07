@@ -89,6 +89,12 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "0.85")]
     pub min_win_prob: f64,
 
+    /// Maximum implied loss probability (divergence filter). Default: 0.50 (50%).
+    /// Rejects trades where (1-p1)*(1-p2) exceeds this — both prices too low means
+    /// the big spread is a trap (high chance neither leg wins).
+    #[arg(long, default_value = "0.50")]
+    pub max_loss_prob: f64,
+
     /// Maximum position per window in USDC (paper default: 200, live default: 10).
     #[arg(long)]
     pub max_position: Option<f64>,
@@ -165,6 +171,9 @@ impl CrossMarketAutoArgs {
         if !(0.0..=1.0).contains(&self.min_win_prob) {
             anyhow::bail!("--min-win-prob must be between 0.0 and 1.0");
         }
+        if !(0.0..=1.0).contains(&self.max_loss_prob) {
+            anyhow::bail!("--max-loss-prob must be between 0.0 and 1.0");
+        }
         let _ = self.parsed_duration()?;
         let _ = self.execution_mode()?;
         Ok(())
@@ -237,6 +246,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
     auto_config.kelly_fraction = args.kelly_fraction;
     auto_config.min_spread = Decimal::from_str(&format!("{:.4}", args.min_spread))?;
     auto_config.min_win_probability = args.min_win_prob;
+    auto_config.max_loss_prob = args.max_loss_prob;
     if let Some(max_pos) = args.max_position {
         auto_config.max_position_per_window = Decimal::from_str(&format!("{:.2}", max_pos))?;
     }

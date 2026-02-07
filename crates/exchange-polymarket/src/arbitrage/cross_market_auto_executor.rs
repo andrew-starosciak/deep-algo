@@ -28,6 +28,7 @@
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -127,6 +128,13 @@ pub struct CrossMarketAutoExecutorConfig {
     /// In the final minutes, prices diverge sharply and spreads collapse to zero.
     /// Default: 120 (stop trading in last 2 minutes of 15-minute window).
     pub trading_cutoff_secs: i64,
+
+    /// Maximum implied loss probability (divergence filter).
+    /// Calculated as (1 - leg1_price) * (1 - leg2_price) — the probability that
+    /// NEITHER leg wins under independence. When both leg prices are low, this
+    /// value is high, meaning the "big spread" is a trap (high cost of ruin).
+    /// Default: 0.50 (reject if >50% chance of total loss).
+    pub max_loss_prob: f64,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -147,6 +155,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
+            max_loss_prob: 0.50,
         }
     }
 }
@@ -171,6 +180,7 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
+            max_loss_prob: 0.50,
         }
     }
 
@@ -193,6 +203,7 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
+            max_loss_prob: 0.50,
         }
     }
 
@@ -1955,6 +1966,26 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // Check minimum leg price (Polymarket rejects orders below $0.05)
         if opp.leg1_price < MIN_LEG_PRICE || opp.leg2_price < MIN_LEG_PRICE {
             return false;
+        }
+
+        // Divergence filter: reject when implied loss probability is too high.
+        // P(neither leg wins) = (1 - p1) * (1 - p2) under independence.
+        // When both prices are low, this is high → the big spread is a trap.
+        // Correlation helps but can't save us when this is >50%.
+        {
+            let p1 = opp.leg1_price.to_f64().unwrap_or(0.0);
+            let p2 = opp.leg2_price.to_f64().unwrap_or(0.0);
+            let loss_prob = (1.0 - p1) * (1.0 - p2);
+            if loss_prob > self.config.max_loss_prob {
+                debug!(
+                    leg1_price = %opp.leg1_price,
+                    leg2_price = %opp.leg2_price,
+                    loss_prob = format!("{:.1}%", loss_prob * 100.0),
+                    max = format!("{:.1}%", self.config.max_loss_prob * 100.0),
+                    "Divergence filter — implied loss probability too high"
+                );
+                return false;
+            }
         }
 
         true
