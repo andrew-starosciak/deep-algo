@@ -39,7 +39,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::mpsc;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use super::cross_market_types::{CrossMarketCombination, CrossMarketOpportunity};
 use super::execution::{
@@ -140,8 +140,14 @@ pub struct CrossMarketAutoExecutorConfig {
     /// When BOTH legs drop below their entry prices, the combined drop percentage
     /// (leg1_drop + leg2_drop) must exceed this to trigger a loss-cutting exit.
     /// E.g., 0.20 means exit when combined drop >= 20% (leg1 -12% + leg2 -10%).
-    /// Set to 0 to disable. Default: 0.20.
+    /// Set to 0 to disable. Default: 0 (DISABLED — paired positions should always
+    /// be held to settlement since one leg must win).
     pub divergence_exit_threshold: Decimal,
+
+    /// Maximum number of paired trades per 15-minute window. Once we have this many
+    /// filled trades in a window, no new entries are allowed until the next window.
+    /// Default: 1 (one trade per window to avoid over-concentration).
+    pub max_trades_per_window: u32,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -154,16 +160,17 @@ impl Default for CrossMarketAutoExecutorConfig {
             min_bet_size: dec!(5),
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
-            min_spread: dec!(0.03),
+            min_spread: dec!(0.15),
             min_win_probability: 0.80,
             max_history: 1000,
-            early_exit_enabled: true,
+            early_exit_enabled: false,
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
             max_loss_prob: 0.50,
-            divergence_exit_threshold: dec!(0.20),
+            divergence_exit_threshold: Decimal::ZERO,
+            max_trades_per_window: 1,
         }
     }
 }
@@ -180,16 +187,17 @@ impl CrossMarketAutoExecutorConfig {
             min_bet_size: dec!(5),
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
-            min_spread: dec!(0.03),
+            min_spread: dec!(0.15),
             min_win_probability: 0.85,
             max_history: 1000,
-            early_exit_enabled: true,
+            early_exit_enabled: false,
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
             max_loss_prob: 0.50,
-            divergence_exit_threshold: dec!(0.20),
+            divergence_exit_threshold: Decimal::ZERO,
+            max_trades_per_window: 1,
         }
     }
 
@@ -204,16 +212,17 @@ impl CrossMarketAutoExecutorConfig {
             min_bet_size: dec!(1),
             max_bet_size: dec!(5),
             max_position_per_window: dec!(10),
-            min_spread: dec!(0.02),
+            min_spread: dec!(0.15),
             min_win_probability: 0.75,
             max_history: 100,
-            early_exit_enabled: true,
+            early_exit_enabled: false,
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
             max_loss_prob: 0.50,
-            divergence_exit_threshold: dec!(0.20),
+            divergence_exit_threshold: Decimal::ZERO,
+            max_trades_per_window: 1,
         }
     }
 
@@ -467,6 +476,10 @@ pub struct RecentTradeDisplay {
 pub struct PendingTradeDisplay {
     pub trade_id: String,
     pub pair: String,
+    /// Coin 1 slug (e.g., "BTC") for live price lookup.
+    pub coin1: String,
+    /// Coin 2 slug (e.g., "ETH") for live price lookup.
+    pub coin2: String,
     pub leg1_dir: String,
     pub leg2_dir: String,
     pub total_cost: Decimal,
@@ -547,6 +560,9 @@ pub struct PendingPaperSettlement {
     pub early_exit_proceeds: Decimal,
     /// Whether this trade has been partially exited.
     pub partially_exited: bool,
+    /// Last early exit attempt time (for cooldown after failures).
+    #[serde(default)]
+    pub last_exit_attempt: Option<DateTime<Utc>>,
 }
 
 // =============================================================================
@@ -996,11 +1012,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     }
                 }
 
-                // Also try to complete any incomplete trades (partial fill recovery)
-                if let Err(e) = self.try_complete_incomplete_trades().await {
-                    warn!(error = %e, "Incomplete trade recovery error");
-                }
-
                 // Sync pending display with actual settlement state (shares, early exits)
                 self.sync_pending_display().await;
 
@@ -1092,21 +1103,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             self.last_both_rejected_at = None;
         }
 
-        // Block new trades while incomplete trades are pending recovery.
-        // One-sided positions are directional bets (~50/50), not the hedged arb (~96%).
-        // Don't stack more exposure until existing positions are fully hedged.
-        {
-            let incomplete = self.incomplete_trades.read().await;
-            if !incomplete.is_empty() {
-                debug!(
-                    count = incomplete.len(),
-                    "Skipping opportunity - incomplete trades pending recovery"
-                );
-                self.stats.write().await.opportunities_skipped += 1;
-                return Ok(());
-            }
-        }
-
         // Apply filters
         if !self.should_execute(&opp) {
             debug!(
@@ -1131,6 +1127,18 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 );
                 pos.window_start_ms = opp_window_ms;
                 pos.clear();
+            }
+
+            // Per-window entry limit: only allow max_trades_per_window paired trades
+            if pos.position_count >= self.config.max_trades_per_window {
+                debug!(
+                    position_count = pos.position_count,
+                    max = self.config.max_trades_per_window,
+                    "Skipping opportunity — already entered this window"
+                );
+                drop(pos);
+                self.stats.write().await.opportunities_skipped += 1;
+                return Ok(());
             }
         }
 
@@ -1198,26 +1206,23 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // Record trade
         self.record_trade(&opp, &result, shares).await;
 
-        // Update position tracker for any fills (not just both-filled)
+        // Update position tracker — count ALL attempts to prevent retry loops.
+        // Even partial fills that get sold back must increment the count,
+        // otherwise the bot retries endlessly within the same window.
         {
             let mut pos = self.position.write().await;
             match &result {
                 CrossMarketExecutionResult::Success { total_cost, .. } => {
                     pos.record_position(*total_cost);
                 }
-                CrossMarketExecutionResult::Leg1OnlyFilled { leg1_result, .. } => {
-                    // Record the filled leg's cost — capital is deployed
-                    let leg1_cost =
-                        leg1_result.filled_size * leg1_result.avg_fill_price.unwrap_or(opp.leg1_price);
-                    pos.record_position(leg1_cost);
-                }
-                CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
-                    let leg2_cost =
-                        leg2_result.filled_size * leg2_result.avg_fill_price.unwrap_or(opp.leg2_price);
-                    pos.record_position(leg2_cost);
+                CrossMarketExecutionResult::Leg1OnlyFilled { .. }
+                | CrossMarketExecutionResult::Leg2OnlyFilled { .. } => {
+                    // Record attempt (zero cost since we sell back) to block retries.
+                    pos.record_position(Decimal::ZERO);
                 }
                 CrossMarketExecutionResult::BothRejected { .. } => {
-                    // No capital deployed
+                    // Also count rejections — if the book can't fill us, don't keep trying.
+                    pos.record_position(Decimal::ZERO);
                 }
             }
         }
@@ -1234,33 +1239,44 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
                 CrossMarketExecutionResult::Leg1OnlyFilled { leg1_result, .. } => {
                     stats.partial_fills += 1;
-                    stats.incomplete_trades += 1;
-                    warn!("Partial fill - leg 1 only. Adding to recovery queue.");
-
-                    // Create incomplete trade for recovery (use actual filled size)
-                    let incomplete = self.create_incomplete_trade(
-                        &opp,
-                        FilledLeg::Leg1,
-                        leg1_result.avg_fill_price.unwrap_or(opp.leg1_price),
-                        leg1_result.filled_size,
+                    let fill_price = leg1_result.avg_fill_price.unwrap_or(opp.leg1_price);
+                    let filled_size = leg1_result.filled_size;
+                    warn!(
+                        filled_size = %filled_size,
+                        fill_price = %fill_price,
+                        "Partial fill - leg 1 only. Selling back immediately."
                     );
-                    drop(stats); // Release lock before acquiring another
-                    self.incomplete_trades.write().await.push(incomplete);
+                    drop(stats); // Release lock before sell-back
+
+                    // Immediately sell back the filled leg to avoid naked directional exposure.
+                    // Accept a small spread loss (~2-5%) rather than holding a 50/50 bet.
+                    self.sell_back_partial_fill(
+                        &opp.leg1_token_id,
+                        filled_size,
+                        fill_price,
+                        "leg1",
+                    )
+                    .await;
                 }
                 CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
                     stats.partial_fills += 1;
-                    stats.incomplete_trades += 1;
-                    warn!("Partial fill - leg 2 only. Adding to recovery queue.");
-
-                    // Create incomplete trade for recovery (use actual filled size)
-                    let incomplete = self.create_incomplete_trade(
-                        &opp,
-                        FilledLeg::Leg2,
-                        leg2_result.avg_fill_price.unwrap_or(opp.leg2_price),
-                        leg2_result.filled_size,
+                    let fill_price = leg2_result.avg_fill_price.unwrap_or(opp.leg2_price);
+                    let filled_size = leg2_result.filled_size;
+                    warn!(
+                        filled_size = %filled_size,
+                        fill_price = %fill_price,
+                        "Partial fill - leg 2 only. Selling back immediately."
                     );
-                    drop(stats); // Release lock before acquiring another
-                    self.incomplete_trades.write().await.push(incomplete);
+                    drop(stats); // Release lock before sell-back
+
+                    // Immediately sell back the filled leg to avoid naked directional exposure.
+                    self.sell_back_partial_fill(
+                        &opp.leg2_token_id,
+                        filled_size,
+                        fill_price,
+                        "leg2",
+                    )
+                    .await;
                 }
                 CrossMarketExecutionResult::BothRejected { .. } => {
                     stats.both_rejected += 1;
@@ -1294,7 +1310,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 self.push_event(
                     EventKind::PartialFill,
                     format!(
-                        "PARTIAL {} leg1 only {:.1}sh — recovery queue",
+                        "PARTIAL {} leg1 only {:.1}sh — sold back immediately",
                         pair, leg1_result.filled_size,
                     ),
                 )
@@ -1304,7 +1320,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 self.push_event(
                     EventKind::PartialFill,
                     format!(
-                        "PARTIAL {} leg2 only {:.1}sh — recovery queue",
+                        "PARTIAL {} leg2 only {:.1}sh — sold back immediately",
                         pair, leg2_result.filled_size,
                     ),
                 )
@@ -1794,6 +1810,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 remaining_shares_leg2: trade.shares,
                 early_exit_proceeds: Decimal::ZERO,
                 partially_exited: false,
+                last_exit_attempt: None,
             };
 
             {
@@ -1977,16 +1994,35 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         // Check spread
         if opp.spread < self.config.min_spread {
+            trace!(
+                spread = %opp.spread,
+                min = %self.config.min_spread,
+                "Filter: spread too low"
+            );
             return false;
         }
 
         // Check win probability
         if opp.win_probability < self.config.min_win_probability {
+            trace!(
+                win_prob = format!("{:.1}%", opp.win_probability * 100.0),
+                min = format!("{:.1}%", self.config.min_win_probability * 100.0),
+                leg1 = %opp.leg1_price,
+                leg2 = %opp.leg2_price,
+                spread = %opp.spread,
+                "Filter: win probability too low"
+            );
             return false;
         }
 
         // Check minimum leg price (Polymarket rejects orders below $0.05)
         if opp.leg1_price < MIN_LEG_PRICE || opp.leg2_price < MIN_LEG_PRICE {
+            trace!(
+                leg1 = %opp.leg1_price,
+                leg2 = %opp.leg2_price,
+                min = %MIN_LEG_PRICE,
+                "Filter: leg price below minimum"
+            );
             return false;
         }
 
@@ -1999,12 +2035,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             let p2 = opp.leg2_price.to_f64().unwrap_or(0.0);
             let loss_prob = (1.0 - p1) * (1.0 - p2);
             if loss_prob > self.config.max_loss_prob {
-                debug!(
+                trace!(
                     leg1_price = %opp.leg1_price,
                     leg2_price = %opp.leg2_price,
                     loss_prob = format!("{:.1}%", loss_prob * 100.0),
                     max = format!("{:.1}%", self.config.max_loss_prob * 100.0),
-                    "Divergence filter — implied loss probability too high"
+                    "Filter: implied loss probability too high"
                 );
                 return false;
             }
@@ -2257,6 +2293,91 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
     }
 
+    /// Immediately sells back a partially-filled leg to avoid naked directional exposure.
+    ///
+    /// When only one leg of a paired trade fills, we're left with an unhedged directional
+    /// bet (50/50 with no edge). Instead of trying to recover the missing leg (which usually
+    /// fails as the book has moved), we sell the filled leg back immediately. This accepts
+    /// a small known spread loss (~2-5%) rather than risking a 50% chance of total loss.
+    async fn sell_back_partial_fill(
+        &self,
+        token_id: &str,
+        filled_size: Decimal,
+        fill_price: Decimal,
+        leg_label: &str,
+    ) {
+        // Sell at 3% below fill price to ensure it fills quickly via FAK
+        let sell_price = ((fill_price * dec!(0.97)) * dec!(100)).floor() / dec!(100);
+        let sell_price = sell_price.max(dec!(0.01));
+
+        // Check Polymarket minimums
+        let sell_value = sell_price * filled_size;
+        if sell_value < MIN_ORDER_VALUE {
+            warn!(
+                leg = leg_label,
+                sell_value = %sell_value,
+                "Sell-back value below $1 minimum — accepting small directional exposure"
+            );
+            return;
+        }
+
+        let sell_order = OrderParams {
+            token_id: token_id.to_string(),
+            side: Side::Sell,
+            price: sell_price,
+            size: filled_size,
+            order_type: OrderType::Fak,
+            neg_risk: false,
+            presigned: None,
+        };
+
+        info!(
+            leg = leg_label,
+            token_id = %token_id,
+            filled_size = %filled_size,
+            fill_price = %fill_price,
+            sell_price = %sell_price,
+            "Selling back partial fill to avoid directional exposure"
+        );
+
+        match self.executor.submit_order(sell_order).await {
+            Ok(result) => {
+                let recovered = result.filled_size * sell_price;
+                let cost = filled_size * fill_price;
+                let loss = cost - recovered;
+                if result.filled_size > Decimal::ZERO {
+                    info!(
+                        leg = leg_label,
+                        sold = %result.filled_size,
+                        recovered = %recovered,
+                        loss = %loss,
+                        "Sell-back filled — small spread loss accepted"
+                    );
+                    self.push_event(
+                        EventKind::Trim,
+                        format!(
+                            "SELL-BACK {} {:.1}sh @ ${:.2} (loss ${:.2})",
+                            leg_label, result.filled_size, sell_price, loss,
+                        ),
+                    )
+                    .await;
+                } else {
+                    warn!(
+                        leg = leg_label,
+                        "Sell-back not filled — directional exposure remains"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    leg = leg_label,
+                    error = %e,
+                    "Sell-back failed — directional exposure remains"
+                );
+            }
+        }
+    }
+
     /// Updates latency statistics.
     async fn update_latency_stats(&self, latency_ms: u64) {
         let mut stats = self.stats.write().await;
@@ -2290,6 +2411,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             .map(|s| PendingTradeDisplay {
                 trade_id: s.trade_id.clone(),
                 pair: format!("{}/{}", s.coin1, s.coin2),
+                coin1: s.coin1.clone(),
+                coin2: s.coin2.clone(),
                 leg1_dir: s.leg1_direction.clone(),
                 leg2_dir: s.leg2_direction.clone(),
                 total_cost: s.total_cost,
@@ -2521,11 +2644,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             leg2_entry_price: opp.leg2_price,
             shares,
             window_end,
-            executed_at: Utc::now(),
+            executed_at: opp.detected_at, // Must match DB timestamp for settlement updates
             remaining_shares_leg1: shares,
             remaining_shares_leg2: shares,
             early_exit_proceeds: Decimal::ZERO,
             partially_exited: false,
+            last_exit_attempt: None,
         };
 
         let mut pending = self.pending_settlements.write().await;
@@ -2538,6 +2662,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         stats.pending_trades.push(PendingTradeDisplay {
             trade_id: settlement.trade_id,
             pair: format!("{}/{}", opp.coin1, opp.coin2),
+            coin1: opp.coin1.to_string(),
+            coin2: opp.coin2.to_string(),
             leg1_dir: settlement.leg1_direction,
             leg2_dir: settlement.leg2_direction,
             total_cost: settlement.total_cost,
@@ -2876,13 +3002,23 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             return Ok(0);
         }
 
-        // Find trades with open windows that could be exited early
+        // Find trades with open windows that could be exited early.
+        // Cooldown: skip trades where we attempted exit in the last 30 seconds
+        // to avoid spamming the API after failures (circuit breaker, no balance).
+        let exit_cooldown = chrono::Duration::seconds(30);
+
         let candidates: Vec<PendingPaperSettlement> = {
             let pending = self.pending_settlements.read().await;
             pending
                 .iter()
                 .filter(|s| now < s.window_end) // Window still open
                 .filter(|s| s.remaining_shares_leg1 > Decimal::ZERO || s.remaining_shares_leg2 > Decimal::ZERO)
+                .filter(|s| {
+                    // Skip if we recently attempted an exit on this trade
+                    s.last_exit_attempt
+                        .map(|t| now - t > exit_cooldown)
+                        .unwrap_or(true)
+                })
                 .cloned()
                 .collect()
         };
@@ -2934,7 +3070,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             // Divergence detection: both legs dropping below entry = wrong-way move.
             // This means BTC is pumping (BTC DOWN dropping) AND ETH is dumping
             // (ETH UP dropping) simultaneously — the one scenario that kills us.
-            let is_diverging = if self.config.divergence_exit_threshold > Decimal::ZERO {
+            //
+            // IMPORTANT: Only check divergence when BOTH legs still have shares.
+            // If one leg has been sold (remaining = 0), this is a directional position
+            // and divergence logic doesn't apply — let it ride to settlement.
+            let both_legs_held = settlement.remaining_shares_leg1 > Decimal::ZERO
+                && settlement.remaining_shares_leg2 > Decimal::ZERO;
+
+            let is_diverging = if both_legs_held
+                && self.config.divergence_exit_threshold > Decimal::ZERO
+            {
                 let leg1_vs_entry = if settlement.leg1_entry_price > Decimal::ZERO {
                     leg1_bid / settlement.leg1_entry_price
                 } else {
@@ -3119,6 +3264,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     "Early exit: no sellable depth (bids empty or below minimums)"
                 );
                 continue;
+            }
+
+            // Mark exit attempt timestamp (cooldown on failure)
+            {
+                let mut pending = self.pending_settlements.write().await;
+                if let Some(s) = pending.iter_mut().find(|s| s.trade_id == settlement.trade_id) {
+                    s.last_exit_attempt = Some(now);
+                }
             }
 
             // Submit FAK sell orders
@@ -4124,22 +4277,27 @@ mod tests {
     }
 
     fn create_test_opportunity() -> CrossMarketOpportunity {
+        // Use a timestamp 5 minutes into a 15-minute window to avoid
+        // the trading_cutoff_secs filter (120s before window end).
+        let now = Utc::now();
+        let window_start = (now.timestamp() / 900) * 900;
+        let safe_time = DateTime::from_timestamp(window_start + 300, 0).unwrap_or(now);
         CrossMarketOpportunity {
             coin1: "BTC".to_string(),
             coin2: "ETH".to_string(),
             combination: CrossMarketCombination::Coin1DownCoin2Up,
             leg1_direction: "DOWN".to_string(),
-            leg1_price: dec!(0.48),
+            leg1_price: dec!(0.40),
             leg1_token_id: "btc-down-token".to_string(),
             leg2_direction: "UP".to_string(),
-            leg2_price: dec!(0.48),
+            leg2_price: dec!(0.40),
             leg2_token_id: "eth-up-token".to_string(),
-            total_cost: dec!(0.96),
-            spread: dec!(0.04),
-            expected_value: dec!(0.02),
+            total_cost: dec!(0.80),
+            spread: dec!(0.20),
+            expected_value: dec!(0.10),
             assumed_correlation: 0.73,
             win_probability: 0.92,
-            detected_at: Utc::now(),
+            detected_at: safe_time,
             leg1_bid_depth: None,
             leg1_ask_depth: Some(dec!(1000)),
             leg1_spread_bps: None,

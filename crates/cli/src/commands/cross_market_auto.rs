@@ -31,6 +31,11 @@ pub enum ExecutionMode {
     #[default]
     Paper,
     Live,
+    /// Observe mode: detects all opportunities with relaxed filters,
+    /// tracks real market outcomes via settlement, but never risks capital.
+    /// Used to measure true correlation rates, spread distributions,
+    /// and both-lose probabilities before committing to live trading.
+    Observe,
 }
 
 impl std::fmt::Display for ExecutionMode {
@@ -38,6 +43,7 @@ impl std::fmt::Display for ExecutionMode {
         match self {
             ExecutionMode::Paper => write!(f, "PAPER"),
             ExecutionMode::Live => write!(f, "LIVE"),
+            ExecutionMode::Observe => write!(f, "OBSERVE"),
         }
     }
 }
@@ -49,7 +55,11 @@ impl FromStr for ExecutionMode {
         match s.to_lowercase().as_str() {
             "paper" => Ok(ExecutionMode::Paper),
             "live" => Ok(ExecutionMode::Live),
-            _ => Err(format!("Invalid mode '{}'. Valid options: paper, live", s)),
+            "observe" => Ok(ExecutionMode::Observe),
+            _ => Err(format!(
+                "Invalid mode '{}'. Valid options: paper, live, observe",
+                s
+            )),
         }
     }
 }
@@ -57,7 +67,8 @@ impl FromStr for ExecutionMode {
 /// Arguments for the cross-market-auto command.
 #[derive(Args, Debug)]
 pub struct CrossMarketAutoArgs {
-    /// Execution mode: paper (default) or live.
+    /// Execution mode: paper (default), live, or observe.
+    /// Observe mode tracks all opportunities and real outcomes without trading.
     #[arg(long, default_value = "paper")]
     pub mode: String,
 
@@ -81,8 +92,8 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "0.25")]
     pub kelly_fraction: f64,
 
-    /// Minimum spread required to execute. Default: 0.03 ($0.03).
-    #[arg(long, default_value = "0.03")]
+    /// Minimum spread required to execute. Default: 0.15 (15%).
+    #[arg(long, default_value = "0.15")]
     pub min_spread: f64,
 
     /// Minimum win probability required. Default: 0.85 (85%).
@@ -279,6 +290,53 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
 
     // Run based on mode
     match mode {
+        ExecutionMode::Observe => {
+            // Observe mode: 100% fill rate, infinite balance, relaxed filters.
+            // Captures ALL opportunities and their real market outcomes.
+            let paper_config = PaperExecutorConfig {
+                initial_balance: Decimal::from(1_000_000),
+                fill_rate: 1.0,
+                ..Default::default()
+            };
+            let executor = PaperExecutor::new(paper_config);
+
+            // Relax ALL filters to capture maximum data points
+            auto_config.min_spread = Decimal::from_str("0.01").unwrap_or_default();
+            auto_config.min_win_probability = 0.01;
+            auto_config.max_loss_prob = 0.99;
+            auto_config.max_position_per_window = Decimal::from(1_000_000);
+            auto_config.max_trades_per_window = 100;
+            auto_config.fixed_bet_size = Some(Decimal::ONE); // $1 per leg (nominal)
+            auto_config.trading_cutoff_secs = 30; // Observe almost to window end
+            auto_config.filter_combination = None; // Observe ALL combinations
+
+            let dashboard_config = DashboardConfig {
+                mode,
+                pair: pair_str.clone(),
+                combination: combo_str.clone(),
+                bet_size: "OBSERVE".to_string(),
+                kelly_fraction: 0.0,
+                min_spread: 0.01,
+                max_position: auto_config.max_position_per_window,
+                balance: Decimal::from(1_000_000),
+                duration,
+                persist: args.persist,
+            };
+
+            run_auto_trading(
+                runner,
+                executor,
+                opp_rx,
+                auto_config,
+                duration,
+                args.stats_interval_secs,
+                args.verbose,
+                db_pool,
+                session_id,
+                dashboard_config,
+            )
+            .await
+        }
         ExecutionMode::Paper => {
             let paper_config = PaperExecutorConfig {
                 initial_balance: args.paper_balance_decimal(),
@@ -504,7 +562,11 @@ async fn print_dashboard(
     let clear_line = "\x1b[2K";
     let magenta = "\x1b[95m";
 
-    let mode_color = if config.mode == ExecutionMode::Live { red } else { yellow };
+    let mode_color = match config.mode {
+        ExecutionMode::Live => red,
+        ExecutionMode::Observe => cyan,
+        ExecutionMode::Paper => yellow,
+    };
 
     // Status indicators
     let scanner_dot = if scanner_ready { green } else { dim };
@@ -624,8 +686,12 @@ async fn print_dashboard(
 
     // ── Holdings (positions we're currently holding) ──
     if !auto.pending_trades.is_empty() {
+        let mut total_cost = Decimal::ZERO;
+        let mut total_value = Decimal::ZERO;
+        let mut total_proceeds = Decimal::ZERO;
+
         println!("{clear_line}  {bold}Holdings{reset}");
-        println!("{clear_line}    {dim}Pair        Leg1         Shares   Leg2         Shares   Cost    Status{reset}");
+        println!("{clear_line}    {dim}Pair        Leg1    Now     Shares   Leg2    Now     Shares   Cost    Value   P&L     Timer{reset}");
         for p in auto.pending_trades.iter().take(5) {
             let remaining_secs = (p.window_end - chrono::Utc::now()).num_seconds().max(0);
             let status = if p.partially_exited {
@@ -638,26 +704,55 @@ async fn print_dashboard(
                 format!("{green}settle{reset}")
             };
 
-            // Get current bid prices for P&L comparison
             let l1_dir_char = p.leg1_dir.chars().next().unwrap_or('-');
             let l2_dir_char = p.leg2_dir.chars().next().unwrap_or('-');
 
+            // Look up current bid prices from live feed
+            let c1_prices = runner.current_prices.get(p.coin1.as_str());
+            let c2_prices = runner.current_prices.get(p.coin2.as_str());
+
+            // Get current price for each leg based on direction
+            let leg1_now = c1_prices.map(|(up, down)| {
+                if p.leg1_dir == "UP" { *up } else { *down }
+            });
+            let leg2_now = c2_prices.map(|(up, down)| {
+                if p.leg2_dir == "UP" { *up } else { *down }
+            });
+
+            // Calculate current value = shares * current_price for each leg
+            let leg1_val = leg1_now.map(|px| p.shares_leg1 * px).unwrap_or(Decimal::ZERO);
+            let leg2_val = leg2_now.map(|px| p.shares_leg2 * px).unwrap_or(Decimal::ZERO);
+            let current_value = leg1_val + leg2_val + p.early_exit_proceeds;
+
+            // Cost = entry * shares for each leg
+            let cost = p.entry_price_leg1 * p.shares_leg1 + p.entry_price_leg2 * p.shares_leg2;
+            let pnl = current_value - cost;
+
+            total_cost += cost;
+            total_value += current_value;
+            total_proceeds += p.early_exit_proceeds;
+
+            let pnl_c = if pnl > Decimal::ZERO { green } else if pnl < Decimal::ZERO { red } else { reset };
+            let l1_now_str = leg1_now.map(|p| format!("{:.2}", p)).unwrap_or_else(|| "  - ".to_string());
+            let l2_now_str = leg2_now.map(|p| format!("{:.2}", p)).unwrap_or_else(|| "  - ".to_string());
+
             println!(
-                "{clear_line}    {:<10}  {l1_dir_char}@{:.2}  {green}{:>6.1}sh{reset}   {l2_dir_char}@{:.2}  {green}{:>6.1}sh{reset}   ${:<6.2}  {status}",
+                "{clear_line}    {:<10}  {l1_dir_char}@{:.2}  {l1_now_str}  {:>5.1}sh   {l2_dir_char}@{:.2}  {l2_now_str}  {:>5.1}sh   ${:<5.2}  ${:<5.2}  {pnl_c}{:+.2}{reset}  {status}",
                 p.pair, p.entry_price_leg1, p.shares_leg1,
                 p.entry_price_leg2, p.shares_leg2,
-                p.total_cost,
+                cost, current_value, pnl,
             );
-            if p.early_exit_proceeds > Decimal::ZERO {
-                println!(
-                    "{clear_line}    {dim}           early exit proceeds: ${:.2}{reset}",
-                    p.early_exit_proceeds,
-                );
-            }
         }
         if auto.pending_trades.len() > 5 {
             println!("{clear_line}    {dim}... and {} more{reset}", auto.pending_trades.len() - 5);
         }
+
+        // Totals row
+        let total_pnl = total_value - total_cost;
+        let total_pnl_c = if total_pnl > Decimal::ZERO { green } else if total_pnl < Decimal::ZERO { red } else { reset };
+        println!("{clear_line}    {dim}─────────────────────────────────────────────────────────────────────────────────{reset}");
+        println!("{clear_line}    {bold}Total{reset}                                                     ${:<5.2}  ${:<5.2}  {total_pnl_c}{bold}{:+.2}{reset}",
+            total_cost, total_value, total_pnl);
         println!("{clear_line}");
     }
 

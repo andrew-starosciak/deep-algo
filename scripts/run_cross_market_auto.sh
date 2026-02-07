@@ -9,7 +9,7 @@
 #
 # Options:
 #   --overnight           Run overnight (12h duration, persist, log to file)
-#   --mode paper|live     Trading mode (default: paper)
+#   --mode paper|live|observe  Trading mode (default: paper)
 #   --duration <time>     How long to run (default: 1h)
 #   --bet-size <amount>   Fixed bet size per leg in USDC (default: Kelly sizing)
 #   --pair <coins>        Coin pair to trade (default: btc,eth)
@@ -61,13 +61,13 @@ NC='\033[0m'
 # Default configuration
 # =============================================================================
 
-MODE="paper"
-DURATION="1h"
+MODE="live"
+DURATION="30m"
 PAIR="btc,eth"
 COMBINATION="coin1down_coin2up"
-BET_SIZE=""
+BET_SIZE="2.5"
 KELLY_FRACTION="0.25"
-MIN_SPREAD="0.03"
+MIN_SPREAD="0.15"
 MIN_WIN_PROB="0.85"
 MAX_LOSS_PROB="0.50"
 MAX_POSITION="15"
@@ -180,6 +180,15 @@ if [[ "$MODE" == "live" && -z "${POLYMARKET_PRIVATE_KEY:-}" ]]; then
     exit 1
 fi
 
+# Observe mode: override defaults for passive data collection
+if [[ "$MODE" == "observe" ]]; then
+    BET_SIZE=""  # Not used in observe mode
+    MIN_SPREAD="0.01"
+    MIN_WIN_PROB="0.50"
+    MAX_LOSS_PROB="0.99"
+    MAX_POSITION="1000000"
+fi
+
 # Generate session ID if not provided and persisting
 if [[ -n "$PERSIST" && -z "$SESSION_ID" ]]; then
     SESSION_ID="auto-$(date +%Y%m%d-%H%M%S)"
@@ -196,11 +205,11 @@ fi
 # =============================================================================
 
 CARGO_PROFILE=""
-if [[ "$MODE" == "live" ]]; then
+if [[ "$MODE" == "live" || "$MODE" == "observe" ]]; then
     CARGO_PROFILE="--release"
     echo -e "${DIM}Building release binary...${NC}"
     if ! cargo build -p algo-trade-cli --release 2>&1 | tail -3; then
-        echo -e "${RED}Build failed. Fix errors before live trading.${NC}"
+        echo -e "${RED}Build failed.${NC}"
         exit 1
     fi
     echo ""
@@ -266,6 +275,8 @@ echo -e "${WHITE}Configuration:${NC}"
 echo -e "  ${DIM}Mode:${NC}          ${MODE^^}"
 if [[ "$MODE" == "live" ]]; then
     echo -e "                 ${RED}*** REAL FUNDS WILL BE USED ***${NC}"
+elif [[ "$MODE" == "observe" ]]; then
+    echo -e "                 ${CYAN}*** PASSIVE DATA COLLECTION - NO TRADING ***${NC}"
 fi
 echo -e "  ${DIM}Duration:${NC}      $DURATION"
 echo -e "  ${DIM}Pair:${NC}          ${PAIR^^}"
