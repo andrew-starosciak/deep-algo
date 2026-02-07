@@ -534,7 +534,7 @@ wilson AS (
         wins::numeric / n as win_rate,
         -- Wilson score CI: z = 1.96 for 95%
         (wins::numeric + 1.9208) / (n + 3.8416) as center,
-        1.96 * SQRT((wins::numeric * (n - wins) / n + 0.9604) / (n + 3.8416)) as spread
+        1.96 * SQRT(wins::numeric * (n - wins) / n + 0.9604) / (n + 3.8416) as spread
     FROM stats
 )
 SELECT

@@ -125,10 +125,16 @@ pub struct CrossMarketAutoExecutorConfig {
     /// Below this threshold, asymmetric fills are accepted as negligible.
     pub trim_threshold: Decimal,
 
-    /// Seconds before window end to stop opening new positions and recovery buys.
-    /// In the final minutes, prices diverge sharply and spreads collapse to zero.
-    /// Default: 120 (stop trading in last 2 minutes of 15-minute window).
-    pub trading_cutoff_secs: i64,
+    /// Earliest entry time: seconds before window end to START accepting trades.
+    /// Data shows 8-10 min before close is the optimal entry zone.
+    /// Default: 600 (start trading at 10 min before close).
+    pub entry_window_start_secs: i64,
+
+    /// Latest entry time: seconds before window end to STOP accepting trades.
+    /// Below this, prices diverge sharply and the 4-6 min "dead zone" drags win rate.
+    /// Also used as recovery-buy cutoff (stop recovery attempts near window end).
+    /// Default: 360 (stop trading at 6 min before close).
+    pub entry_window_end_secs: i64,
 
     /// Maximum implied loss probability (divergence filter).
     /// Calculated as (1 - leg1_price) * (1 - leg2_price) — the probability that
@@ -172,7 +178,8 @@ impl Default for CrossMarketAutoExecutorConfig {
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
-            trading_cutoff_secs: 120,
+            entry_window_start_secs: 600,
+            entry_window_end_secs: 360,
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 1,
@@ -200,7 +207,8 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
-            trading_cutoff_secs: 120,
+            entry_window_start_secs: 600,
+            entry_window_end_secs: 360,
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 1,
@@ -226,7 +234,8 @@ impl CrossMarketAutoExecutorConfig {
             early_exit_profit_threshold: dec!(0.10),
             early_exit_depth_fraction: dec!(0.50),
             trim_threshold: dec!(0.5),
-            trading_cutoff_secs: 120,
+            entry_window_start_secs: 600,
+            entry_window_end_secs: 360,
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 1,
@@ -1542,7 +1551,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             // Force escape instead.
             {
                 let secs_to_end = (trade.window_end - Utc::now()).num_seconds();
-                if secs_to_end <= self.config.trading_cutoff_secs {
+                if secs_to_end <= self.config.entry_window_end_secs {
                     warn!(
                         trade_id = %trade.trade_id,
                         secs_to_end = secs_to_end,
@@ -2037,19 +2046,29 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
-        // Trading cutoff: stop opening new positions near window end.
-        // In the final minutes, prices diverge sharply and spreads collapse.
+        // Entry timing window: only trade within the optimal time range.
+        // Data shows 8-10 min before close = best, 4-6 min = dead zone.
         {
             let ts = opp.detected_at.timestamp();
             let window_secs: i64 = 900;
             let window_start = (ts / window_secs) * window_secs;
             let secs_into_window = ts - window_start;
             let secs_remaining = window_secs - secs_into_window;
-            if secs_remaining <= self.config.trading_cutoff_secs {
+
+            if secs_remaining > self.config.entry_window_start_secs {
+                trace!(
+                    secs_remaining = secs_remaining,
+                    entry_start = self.config.entry_window_start_secs,
+                    "Too early in window — waiting for entry window"
+                );
+                return false;
+            }
+
+            if secs_remaining <= self.config.entry_window_end_secs {
                 debug!(
                     secs_remaining = secs_remaining,
-                    cutoff = self.config.trading_cutoff_secs,
-                    "Trading cutoff — too close to window end"
+                    entry_end = self.config.entry_window_end_secs,
+                    "Past entry window — too close to window end"
                 );
                 return false;
             }
@@ -4578,11 +4597,11 @@ mod tests {
     }
 
     fn create_test_opportunity() -> CrossMarketOpportunity {
-        // Use a timestamp 5 minutes into a 15-minute window to avoid
-        // the trading_cutoff_secs filter (120s before window end).
+        // Use a timestamp 7 minutes into a 15-minute window (8 min remaining)
+        // to land inside the default entry window (6-10 min before close).
         let now = Utc::now();
         let window_start = (now.timestamp() / 900) * 900;
-        let safe_time = DateTime::from_timestamp(window_start + 300, 0).unwrap_or(now);
+        let safe_time = DateTime::from_timestamp(window_start + 420, 0).unwrap_or(now);
         CrossMarketOpportunity {
             coin1: "BTC".to_string(),
             coin2: "ETH".to_string(),

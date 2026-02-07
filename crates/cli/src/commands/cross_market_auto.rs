@@ -106,6 +106,16 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "0.50")]
     pub max_loss_prob: f64,
 
+    /// Entry window start: minutes before window close to START trading. Default: 10.
+    /// Data shows 8-10 min before close is the optimal entry zone.
+    #[arg(long, default_value = "10")]
+    pub entry_start_mins: i64,
+
+    /// Entry window end: minutes before window close to STOP trading. Default: 6.
+    /// Avoids the 4-6 min "dead zone" where win rate drops.
+    #[arg(long, default_value = "6")]
+    pub entry_end_mins: i64,
+
     /// Maximum position per window in USDC (paper default: 200, live default: 10).
     #[arg(long)]
     pub max_position: Option<f64>,
@@ -258,6 +268,8 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
     auto_config.min_spread = Decimal::from_str(&format!("{:.4}", args.min_spread))?;
     auto_config.min_win_probability = args.min_win_prob;
     auto_config.max_loss_prob = args.max_loss_prob;
+    auto_config.entry_window_start_secs = args.entry_start_mins * 60;
+    auto_config.entry_window_end_secs = args.entry_end_mins * 60;
     if let Some(max_pos) = args.max_position {
         auto_config.max_position_per_window = Decimal::from_str(&format!("{:.2}", max_pos))?;
     }
@@ -307,7 +319,8 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
             auto_config.max_position_per_window = Decimal::from(1_000_000);
             auto_config.max_trades_per_window = 100;
             auto_config.fixed_bet_size = Some(Decimal::ONE); // $1 per leg (nominal)
-            auto_config.trading_cutoff_secs = 30; // Observe almost to window end
+            auto_config.entry_window_start_secs = 870; // Observe from 14:30 onward
+            auto_config.entry_window_end_secs = 30; // Observe almost to window end
             auto_config.filter_combination = None; // Observe ALL combinations
             auto_config.observe_mode = true; // Persist ALL detected opportunities
 
