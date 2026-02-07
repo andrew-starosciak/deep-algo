@@ -135,6 +135,13 @@ pub struct CrossMarketAutoExecutorConfig {
     /// value is high, meaning the "big spread" is a trap (high cost of ruin).
     /// Default: 0.50 (reject if >50% chance of total loss).
     pub max_loss_prob: f64,
+
+    /// Combined leg-drop threshold to trigger a divergence exit.
+    /// When BOTH legs drop below their entry prices, the combined drop percentage
+    /// (leg1_drop + leg2_drop) must exceed this to trigger a loss-cutting exit.
+    /// E.g., 0.20 means exit when combined drop >= 20% (leg1 -12% + leg2 -10%).
+    /// Set to 0 to disable. Default: 0.20.
+    pub divergence_exit_threshold: Decimal,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -156,6 +163,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
             max_loss_prob: 0.50,
+            divergence_exit_threshold: dec!(0.20),
         }
     }
 }
@@ -181,6 +189,7 @@ impl CrossMarketAutoExecutorConfig {
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
             max_loss_prob: 0.50,
+            divergence_exit_threshold: dec!(0.20),
         }
     }
 
@@ -204,6 +213,7 @@ impl CrossMarketAutoExecutorConfig {
             trim_threshold: dec!(0.5),
             trading_cutoff_secs: 120,
             max_loss_prob: 0.50,
+            divergence_exit_threshold: dec!(0.20),
         }
     }
 
@@ -2906,20 +2916,65 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
             let profit_pct = (current_value - cost_basis) / cost_basis;
 
-            if profit_pct < self.config.early_exit_profit_threshold {
+            // Decide: take profit, cut losses on divergence, or skip
+            let is_profitable = profit_pct >= self.config.early_exit_profit_threshold;
+
+            // Divergence detection: both legs dropping below entry = wrong-way move.
+            // This means BTC is pumping (BTC DOWN dropping) AND ETH is dumping
+            // (ETH UP dropping) simultaneously — the one scenario that kills us.
+            let is_diverging = if self.config.divergence_exit_threshold > Decimal::ZERO {
+                let leg1_vs_entry = if settlement.leg1_entry_price > Decimal::ZERO {
+                    leg1_bid / settlement.leg1_entry_price
+                } else {
+                    Decimal::ONE
+                };
+                let leg2_vs_entry = if settlement.leg2_entry_price > Decimal::ZERO {
+                    leg2_bid / settlement.leg2_entry_price
+                } else {
+                    Decimal::ONE
+                };
+
+                // Both legs must be below entry (divergence, not just one-sided)
+                let both_dropping = leg1_vs_entry < Decimal::ONE && leg2_vs_entry < Decimal::ONE;
+                // Combined loss magnitude
+                let combined_loss = (Decimal::ONE - leg1_vs_entry) + (Decimal::ONE - leg2_vs_entry);
+
+                if both_dropping && combined_loss >= self.config.divergence_exit_threshold {
+                    warn!(
+                        trade_id = %settlement.trade_id,
+                        leg1_entry = %settlement.leg1_entry_price,
+                        leg2_entry = %settlement.leg2_entry_price,
+                        leg1_bid = %leg1_bid,
+                        leg2_bid = %leg2_bid,
+                        leg1_drop = format!("{:.1}%", (Decimal::ONE - leg1_vs_entry) * dec!(100)),
+                        leg2_drop = format!("{:.1}%", (Decimal::ONE - leg2_vs_entry) * dec!(100)),
+                        combined_loss = format!("{:.1}%", combined_loss * dec!(100)),
+                        "Divergence detected — both legs dropping, cutting losses"
+                    );
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if !is_profitable && !is_diverging {
                 debug!(
                     trade_id = %settlement.trade_id,
                     profit_pct = %profit_pct,
                     threshold = %self.config.early_exit_profit_threshold,
                     leg1_bid = %leg1_bid,
                     leg2_bid = %leg2_bid,
-                    "Early exit: profit below threshold"
+                    "Early exit: no trigger (profit below threshold, no divergence)"
                 );
                 continue;
             }
 
+            let exit_reason = if is_diverging { "DIVERGENCE" } else { "PROFIT" };
             info!(
                 trade_id = %settlement.trade_id,
+                reason = exit_reason,
                 profit_pct = %profit_pct,
                 current_value = %current_value,
                 cost_basis = %cost_basis,
@@ -2927,7 +2982,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 leg2_bid = %leg2_bid,
                 remaining_leg1 = %settlement.remaining_shares_leg1,
                 remaining_leg2 = %settlement.remaining_shares_leg2,
-                "Early exit: profit threshold met, attempting sell"
+                "Early exit triggered, attempting sell"
             );
 
             // Fetch order books for both tokens to determine sell size
@@ -3157,11 +3212,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     }
                     drop(stats);
                     let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "" };
+                    let label = if is_diverging { "DIVERGENCE EXIT" } else { "EARLY EXIT" };
                     self.push_event(
                         EventKind::EarlyExit,
                         format!(
-                            "EARLY EXIT {}/{} ${:.2} → {}{:.2}",
-                            settlement.coin1, settlement.coin2, early_proceeds, pnl_sign, pnl,
+                            "{} {}/{} ${:.2} → {}{:.2}",
+                            label, settlement.coin1, settlement.coin2, early_proceeds, pnl_sign, pnl,
                         ),
                     )
                     .await;
