@@ -333,8 +333,14 @@ pub fn sign_hash(hash: &[u8; 32], private_key_hex: &str) -> Result<String, Eip71
 /// - SELL: maker_amount = size (shares we give), taker_amount = size * price (USDC we receive)
 ///
 /// Matches Python SDK's ROUNDING_CONFIG for $0.01 tick markets:
-///   price=2dp (round_normal), size=2dp (round_down), amount=4dp
-/// The product of 2dp × 2dp has at most 4dp, so no further rounding is needed.
+///   price=2dp (round_normal), size=2dp (round_down)
+///
+/// API precision constraints (from error messages):
+/// - BUY: maker (USDC out) max 2dp, taker (shares in) max 4dp
+/// - SELL: maker (shares out) max 2dp, taker (USDC in) max 4dp
+///
+/// For BUY, maker = size * price can exceed 2dp (e.g., 5.55 * 0.30 = 1.665),
+/// so we ceil to 2dp to avoid underpaying (which would miss fills).
 pub fn calculate_amounts(
     side: u8,
     price: Decimal,
@@ -362,15 +368,17 @@ pub fn calculate_amounts(
     let (maker_amount, taker_amount) = if side == SIDE_BUY {
         // BUY: taker = shares we receive, maker = USDC we pay
         let taker_natural = size_rounded;
-        // Full precision: 2dp × 2dp = 4dp max (matches round_config.amount=4)
         let maker_natural = taker_natural * price_tick;
+        // API requires BUY maker (USDC) to have max 2dp.
+        // Ceil so we don't underpay (effective price slightly above limit = still fills).
+        let maker_2dp = round_up(maker_natural, 2);
         let taker_raw = (taker_natural * scale).floor();
-        let maker_raw = (maker_natural * scale).floor();
+        let maker_raw = (maker_2dp * scale).floor();
         (maker_raw, taker_raw)
     } else {
-        // SELL: maker = shares we give, taker = USDC we receive
+        // SELL: maker = shares we give (already 2dp), taker = USDC we receive
         let maker_natural = size_rounded;
-        // Full precision: 2dp × 2dp = 4dp max (matches round_config.amount=4)
+        // Full precision: 2dp × 2dp = 4dp max (API allows 4dp for SELL taker)
         let taker_natural = maker_natural * price_tick;
         let maker_raw = (maker_natural * scale).floor();
         let taker_raw = (taker_natural * scale).floor();
@@ -387,6 +395,12 @@ pub fn calculate_amounts(
 fn round_down(value: Decimal, dp: u32) -> Decimal {
     let factor = Decimal::from(10u64.pow(dp));
     (value * factor).floor() / factor
+}
+
+/// Rounds a Decimal up (ceil) to the given number of decimal places.
+fn round_up(value: Decimal, dp: u32) -> Decimal {
+    let factor = Decimal::from(10u64.pow(dp));
+    (value * factor).ceil() / factor
 }
 
 /// Rounds a Decimal to nearest (half-up) to the given number of decimal places.
@@ -653,12 +667,13 @@ mod tests {
         // BUY: price=0.19, size=10.752688 (from real trading scenario)
         // size_rounded = 10.75, taker = 10.75 * 10^6 = 10_750_000
         // price_tick = round_normal(0.19, 2) = 0.19
-        // maker = 10.75 * 0.19 = 2.0425 (full 4dp precision, matching Python SDK amount=4)
-        // maker_raw = 2.0425 * 10^6 = 2_042_500
+        // maker = 10.75 * 0.19 = 2.0425
+        // BUY maker ceiled to 2dp: ceil(2.0425, 2) = 2.05
+        // maker_raw = 2.05 * 10^6 = 2_050_000
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.19), dec!(10.752688)).unwrap();
         assert_eq!(taker, 10_750_000); // Rounded down to 2 dp
-        assert_eq!(maker, 2_042_500); // Full precision: 10.75 * 0.19 = 2.0425
+        assert_eq!(maker, 2_050_000); // Ceiled to 2dp: 2.0425 → 2.05
     }
 
     #[test]
@@ -683,6 +698,27 @@ mod tests {
             calculate_amounts(SIDE_SELL, dec!(0.19), dec!(5.88)).unwrap();
         assert_eq!(maker, 5_880_000);
         assert_eq!(taker, 1_117_200); // Full 4dp precision (was 1_110_000 with old 2dp rounding)
+    }
+
+    #[test]
+    fn calculate_amounts_buy_maker_ceiled_to_2dp() {
+        // Regression: BUY price=0.30, size=5.55 → maker = 5.55 * 0.30 = 1.665 (3dp)
+        // API rejects >2dp for BUY maker. Ceil to 2dp: 1.67.
+        // maker_raw = 1.67 * 10^6 = 1_670_000
+        let (maker, taker) =
+            calculate_amounts(SIDE_BUY, dec!(0.30), dec!(5.5555555)).unwrap();
+        assert_eq!(taker, 5_550_000); // size_rounded = 5.55
+        assert_eq!(maker, 1_670_000); // ceil(1.665, 2) = 1.67
+    }
+
+    #[test]
+    fn calculate_amounts_buy_exact_2dp_no_change() {
+        // When maker is already 2dp, ceil doesn't change it.
+        // BUY price=0.50, size=10 → maker = 10 * 0.50 = 5.00 (exactly 2dp)
+        let (maker, taker) =
+            calculate_amounts(SIDE_BUY, dec!(0.50), dec!(10)).unwrap();
+        assert_eq!(taker, 10_000_000);
+        assert_eq!(maker, 5_000_000); // No change needed
     }
 
     #[test]

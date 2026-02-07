@@ -562,11 +562,15 @@ pub enum FilledLeg {
     Leg2,
 }
 
-/// Polymarket minimum order price ($0.05). Orders below this are rejected by the API.
-const MIN_LEG_PRICE: Decimal = dec!(0.05);
+/// Minimum leg price for the correlation arbitrage to be meaningful.
+/// At very low prices (e.g. $0.07), the leg is essentially dead weight — the market
+/// is saying "this won't happen" so there's no real hedge benefit from correlation.
+/// Both legs need meaningful probability for the arbitrage to work.
+const MIN_LEG_PRICE: Decimal = dec!(0.15);
 
-/// Polymarket minimum order value ($1.00). Orders with maker_amount below this are rejected.
-const MIN_ORDER_VALUE: Decimal = dec!(1);
+/// Minimum order value per leg in USDC. With MIN_LEG_PRICE=$0.15 and small bet sizes,
+/// the cheaper leg can be ~$0.38, so $0.25 accommodates asymmetric pairs.
+const MIN_ORDER_VALUE: Decimal = dec!(0.25);
 
 /// Maximum retry attempts before triggering the escape hatch (sell filled leg).
 /// Recovery runs every 5 seconds, so 60 retries ≈ 5 minutes of actual attempts.
