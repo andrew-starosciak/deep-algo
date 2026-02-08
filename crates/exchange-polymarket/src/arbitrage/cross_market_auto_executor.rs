@@ -106,6 +106,13 @@ pub struct CrossMarketAutoExecutorConfig {
     /// Minimum spread required to execute.
     pub min_spread: Decimal,
 
+    /// Slippage tolerance added to buy prices to improve fill rate.
+    /// With 500-700ms latency, the book moves between detection and order arrival.
+    /// E.g., 0.02 means buy up to 2 cents above detected price.
+    /// The effective spread shrinks by 2x this value (both legs).
+    /// Default: 0.02 ($0.02 per share).
+    pub buy_slippage: Decimal,
+
     /// Minimum win probability required to execute.
     pub min_win_probability: f64,
 
@@ -172,6 +179,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
+            buy_slippage: dec!(0.02),
             min_win_probability: 0.80,
             max_history: 1000,
             early_exit_enabled: false,
@@ -182,7 +190,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             entry_window_end_secs: 240,
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
-            max_trades_per_window: 1,
+            max_trades_per_window: 5,
             observe_mode: false,
         }
     }
@@ -201,6 +209,7 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
+            buy_slippage: dec!(0.02),
             min_win_probability: 0.85,
             max_history: 1000,
             early_exit_enabled: false,
@@ -211,7 +220,7 @@ impl CrossMarketAutoExecutorConfig {
             entry_window_end_secs: 240,
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
-            max_trades_per_window: 1,
+            max_trades_per_window: 5,
             observe_mode: false,
         }
     }
@@ -228,6 +237,7 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(5),
             max_position_per_window: dec!(10),
             min_spread: dec!(0.20),
+            buy_slippage: dec!(0.02),
             min_win_probability: 0.75,
             max_history: 100,
             early_exit_enabled: false,
@@ -238,7 +248,7 @@ impl CrossMarketAutoExecutorConfig {
             entry_window_end_secs: 240,
             max_loss_prob: 0.50,
             divergence_exit_threshold: Decimal::ZERO,
-            max_trades_per_window: 1,
+            max_trades_per_window: 5,
             observe_mode: false,
         }
     }
@@ -468,6 +478,10 @@ pub struct CrossMarketAutoExecutorStats {
     // === Event Log (for dashboard) ===
     /// Recent key events for dashboard display (max 20).
     pub event_log: VecDeque<EventLogEntry>,
+
+    /// Last known on-chain balance (USDC + redeemable positions).
+    /// Updated from actual API calls during trading, used by dashboard.
+    pub live_balance: Option<Decimal>,
 
     // === Live prices from WebSocket (for settlement) ===
     /// Current prices from WebSocket feed: coin -> (up_price, down_price).
@@ -1019,8 +1033,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             stats.started_at = Some(Utc::now());
         }
 
-        // Startup: settle orphaned trades from previous sessions, then expire truly stale ones
-        self.settle_orphaned_trades().await;
+        // Startup: settle any pending DB trades (orphans + partial fills), then expire stale ones
+        self.settle_db_trades().await;
         self.expire_stale_pending().await;
 
         // Startup: create session record in database
@@ -1061,6 +1075,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             // Always check settlement if interval has passed (before waiting for opportunities)
             if last_settlement_check.elapsed() >= settlement_check_interval {
                 debug!("Running periodic settlement check...");
+
+                // Settle DB trades (handles partial fills + orphans from any session)
+                self.settle_db_trades().await;
+
+                // Settle in-memory pending trades (paired trades from current session)
                 if let Err(e) = self.check_pending_settlements().await {
                     warn!(error = %e, "Settlement check error");
                 }
@@ -1199,6 +1218,13 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 );
                 pos.window_start_ms = opp_window_ms;
                 pos.clear();
+
+                // Settle any pending DB trades from the previous window so balance/P&L
+                // are up to date before we start trading in the new window.
+                drop(pos);
+                self.settle_db_trades().await;
+                // Re-acquire the position lock after settlement
+                pos = self.position.write().await;
             }
 
             // Per-window entry limit: only allow max_trades_per_window paired trades
@@ -1216,6 +1242,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         // Calculate bet size using effective balance (USDC + redeemable positions)
         let balance = self.executor.get_effective_balance().await?;
+        // Update live balance in stats for dashboard display
+        self.stats.write().await.live_balance = Some(balance);
         let bet_per_leg = if let Some(fixed) = self.config.fixed_bet_size {
             fixed
         } else {
@@ -1235,8 +1263,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // Calculate shares (same for both legs)
         // shares = bet_per_leg / leg_price
         // For simplicity, use the average leg price
+        // Floor at 5 shares — Polymarket's minimum order size. Without this,
+        // partial-fill sell-backs get rejected and we're stuck holding naked exposure.
         let avg_leg_price = opp.total_cost / dec!(2);
-        let shares = bet_per_leg / avg_leg_price;
+        let shares = (bet_per_leg / avg_leg_price).max(dec!(5));
 
         // Estimate actual USDC cost for both legs
         let estimated_cost = shares * opp.leg1_price + shares * opp.leg2_price;
@@ -2154,11 +2184,19 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             });
         }
 
-        // Create orders for both legs
+        // Create orders for both legs.
+        // Add slippage tolerance to buy prices — with 500-700ms latency the book
+        // moves between detection and order arrival. Round up to $0.01 tick grid.
+        let slippage = self.config.buy_slippage;
+        let leg1_buy_price = ((opp.leg1_price + slippage) * dec!(100)).ceil() / dec!(100);
+        let leg2_buy_price = ((opp.leg2_price + slippage) * dec!(100)).ceil() / dec!(100);
+        let leg1_buy_price = leg1_buy_price.min(dec!(0.99));
+        let leg2_buy_price = leg2_buy_price.min(dec!(0.99));
+
         let leg1_order = OrderParams {
             token_id: opp.leg1_token_id.clone(),
             side: Side::Buy,
-            price: opp.leg1_price,
+            price: leg1_buy_price,
             size: shares,
             order_type: OrderType::Fok,
             neg_risk: false,
@@ -2168,7 +2206,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let leg2_order = OrderParams {
             token_id: opp.leg2_token_id.clone(),
             side: Side::Buy,
-            price: opp.leg2_price,
+            price: leg2_buy_price,
             size: shares,
             order_type: OrderType::Fok,
             neg_risk: false,
@@ -2697,18 +2735,25 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     // Database Lifecycle Methods (startup, periodic, shutdown)
     // =========================================================================
 
-    /// Settles orphaned trades from previous sessions on startup.
+    /// Settles pending DB trades from any session whose windows have closed.
     ///
-    /// When a session is killed before settlement runs, executed trades remain
-    /// `pending` in the DB forever. This method loads those orphaned records and
-    /// settles them retroactively via Gamma API (official outcomes) or CLOB prices.
-    async fn settle_orphaned_trades(&self) {
+    /// This runs at startup, on window transitions, and periodically. It handles:
+    /// - Orphaned trades from previous sessions (killed before settlement)
+    /// - Current-session trades not yet in the in-memory pending list (partial fills)
+    /// - Partial fills correctly: only the filled leg contributes to PnL
+    async fn settle_db_trades(&self) {
         let pool = match &self.db_pool {
             Some(p) => p,
             None => return,
         };
 
-        // Load pending executed trades from previous sessions where window has closed
+        // Load pending executed trades where window has closed.
+        // Skip current-session fully-paired trades (both fills present) — those are
+        // handled by the in-memory settlement in check_pending_settlements().
+        // We DO pick up:
+        //   - All trades from other sessions (orphans)
+        //   - Current-session partial fills (one NULL fill price) that never enter the
+        //     in-memory pending list
         let rows = match sqlx::query_as::<_, (
             i32,                    // id
             String,                 // session_id
@@ -2724,17 +2769,24 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             String,                 // leg2_token_id
             Decimal,                // total_cost
             DateTime<Utc>,          // window_end
+            Option<Decimal>,        // leg1_fill_price
+            Option<Decimal>,        // leg2_fill_price
         )>(
             r#"
             SELECT id, session_id, timestamp, coin1, coin2, combination,
                    leg1_direction, leg1_price, leg1_token_id,
                    leg2_direction, leg2_price, leg2_token_id,
-                   total_cost, window_end
+                   total_cost, window_end,
+                   leg1_fill_price, leg2_fill_price
             FROM cross_market_opportunities
             WHERE status = 'pending'
               AND executed = true
               AND window_end < NOW() - INTERVAL '30 seconds'
-              AND session_id != $1
+              AND (
+                  session_id != $1
+                  OR leg1_fill_price IS NULL
+                  OR leg2_fill_price IS NULL
+              )
             ORDER BY window_end ASC
             "#,
         )
@@ -2744,7 +2796,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         {
             Ok(r) => r,
             Err(e) => {
-                warn!(error = %e, "Failed to load orphaned trades for settlement");
+                warn!(error = %e, "Failed to load pending trades for DB settlement");
                 return;
             }
         };
@@ -2755,8 +2807,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         info!(
             count = rows.len(),
-            "Found {} orphaned trades from previous sessions — attempting settlement",
-            rows.len()
+            "Found {} pending DB trades to settle", rows.len()
         );
 
         let mut settled = 0u64;
@@ -2765,11 +2816,15 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         for (id, original_session_id, executed_at, coin1, coin2, _combination,
              leg1_direction, leg1_price, leg1_token_id,
              leg2_direction, leg2_price, leg2_token_id,
-             total_cost, window_end) in &rows
+             total_cost, window_end,
+             leg1_fill_price, leg2_fill_price) in &rows
         {
+            // Detect partial fills: one fill price is NULL
+            let is_partial = leg1_fill_price.is_none() != leg2_fill_price.is_none();
+
             // Reconstruct a PendingPaperSettlement for the existing settle methods
             let settlement = PendingPaperSettlement {
-                trade_id: format!("orphan-{}", id),
+                trade_id: format!("db-settle-{}", id),
                 coin1: coin1.clone(),
                 coin2: coin2.clone(),
                 leg1_direction: leg1_direction.clone(),
@@ -2779,7 +2834,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 total_cost: *total_cost,
                 leg1_entry_price: *leg1_price,
                 leg2_entry_price: *leg2_price,
-                shares: Decimal::ONE, // Nominal — pnl recalculated from total_cost
+                shares: Decimal::ONE, // Nominal — pnl recalculated from actual fills
                 window_end: *window_end,
                 executed_at: *executed_at,
                 remaining_shares_leg1: Decimal::ONE,
@@ -2792,18 +2847,18 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             // Try Gamma API first (most reliable for past windows), then CLOB
             let outcome = match self.try_settle_via_gamma(&settlement).await {
                 Ok(result) => {
-                    info!(trade_id = %settlement.trade_id, "Orphan settled via Gamma API");
+                    debug!(trade_id = %settlement.trade_id, "DB trade settled via Gamma API");
                     Some(result)
                 }
                 Err(gamma_err) => {
-                    warn!(
+                    debug!(
                         trade_id = %settlement.trade_id,
                         error = %gamma_err,
-                        "Gamma API failed for orphan, trying CLOB"
+                        "Gamma API failed, trying CLOB"
                     );
                     match self.try_settle_via_clob_single(&settlement).await {
                         Ok(result) => {
-                            info!(trade_id = %settlement.trade_id, "Orphan settled via CLOB");
+                            debug!(trade_id = %settlement.trade_id, "DB trade settled via CLOB");
                             Some(result)
                         }
                         Err(clob_err) => {
@@ -2811,7 +2866,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                                 trade_id = %settlement.trade_id,
                                 gamma_error = %gamma_err,
                                 clob_error = %clob_err,
-                                "Could not settle orphan via Gamma or CLOB"
+                                "Could not settle DB trade via Gamma or CLOB"
                             );
                             None
                         }
@@ -2836,26 +2891,50 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     "UP".to_string()
                 };
 
-                let trade_result = match (leg1_won, leg2_won) {
-                    (true, true) => "DOUBLE_WIN",
-                    (true, false) | (false, true) => "WIN",
-                    (false, false) => "LOSE",
-                };
+                // Calculate PnL differently for partial fills vs full paired trades
+                let (trade_result, pnl) = if is_partial {
+                    // Partial fill: only the filled leg matters.
+                    // The sell-back may have failed, so the position was held to settlement.
+                    let (filled_leg_won, fill_price) = if leg1_fill_price.is_some() {
+                        (leg1_won, leg1_fill_price.unwrap_or(*leg1_price))
+                    } else {
+                        (leg2_won, leg2_fill_price.unwrap_or(*leg2_price))
+                    };
 
-                // Calculate PnL based on actual shares (total_cost / sum of prices)
-                let avg_price = (*leg1_price + *leg2_price) / dec!(2);
-                let shares = if avg_price > Decimal::ZERO {
-                    *total_cost / (*leg1_price + *leg2_price)
+                    // Shares = total_cost / fill_price (single leg cost)
+                    let shares = if fill_price > Decimal::ZERO {
+                        *total_cost / fill_price
+                    } else {
+                        Decimal::ONE
+                    };
+                    let payout = if filled_leg_won { shares } else { Decimal::ZERO };
+                    let fees = payout * self.fee_rate;
+                    let pnl = payout - fees - *total_cost;
+
+                    // Partial fills are either win or lose based on the single filled leg
+                    let result = if filled_leg_won { "WIN" } else { "LOSE" };
+                    (result, pnl)
                 } else {
-                    Decimal::ONE
+                    // Full paired trade
+                    let result = match (leg1_won, leg2_won) {
+                        (true, true) => "DOUBLE_WIN",
+                        (true, false) | (false, true) => "WIN",
+                        (false, false) => "LOSE",
+                    };
+                    let shares = if (*leg1_price + *leg2_price) > Decimal::ZERO {
+                        *total_cost / (*leg1_price + *leg2_price)
+                    } else {
+                        Decimal::ONE
+                    };
+                    let leg1_payout = if leg1_won { shares } else { Decimal::ZERO };
+                    let leg2_payout = if leg2_won { shares } else { Decimal::ZERO };
+                    let gross_payout = leg1_payout + leg2_payout;
+                    let fees = gross_payout * self.fee_rate;
+                    let pnl = gross_payout - fees - *total_cost;
+                    (result, pnl)
                 };
-                let leg1_payout = if leg1_won { shares } else { Decimal::ZERO };
-                let leg2_payout = if leg2_won { shares } else { Decimal::ZERO };
-                let gross_payout = leg1_payout + leg2_payout;
-                let fees = gross_payout * self.fee_rate;
-                let pnl = gross_payout - fees - *total_cost;
 
-                // Update DB with original session_id
+                // Update DB
                 let result = sqlx::query(
                     r#"
                     UPDATE cross_market_opportunities
@@ -2881,21 +2960,57 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 match result {
                     Ok(r) if r.rows_affected() > 0 => {
                         settled += 1;
+
+                        // Update in-memory stats so dashboard reflects this settlement
+                        {
+                            let mut stats = self.stats.write().await;
+                            stats.realized_pnl += pnl;
+                            match trade_result {
+                                "DOUBLE_WIN" => {
+                                    stats.settled_wins += 1;
+                                    stats.double_wins += 1;
+                                }
+                                "WIN" => {
+                                    stats.settled_wins += 1;
+                                }
+                                _ => {
+                                    stats.settled_losses += 1;
+                                }
+                            }
+                        }
+
                         info!(
                             id = id,
                             session = %original_session_id,
                             pair = %format!("{}/{}", coin1, coin2),
+                            partial = is_partial,
                             result = trade_result,
                             pnl = %pnl,
-                            "Settled orphaned trade"
+                            "Settled DB trade"
                         );
+
+                        // Push settlement event to dashboard
+                        let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "" };
+                        let result_label = if is_partial {
+                            format!("{} (partial)", trade_result)
+                        } else {
+                            trade_result.to_string()
+                        };
+                        self.push_event(
+                            EventKind::Settlement,
+                            format!(
+                                "SETTLED {}/{} {} {}{:.2} ({}↑ {}↑)",
+                                coin1, coin2, result_label, pnl_sign, pnl, c1_out, c2_out,
+                            ),
+                        )
+                        .await;
                     }
                     Ok(_) => {
-                        warn!(id = id, "Orphan settlement update matched no rows");
+                        warn!(id = id, "DB settlement update matched no rows");
                         failed += 1;
                     }
                     Err(e) => {
-                        warn!(id = id, error = %e, "Failed to update orphan settlement in DB");
+                        warn!(id = id, error = %e, "Failed to update DB settlement");
                         failed += 1;
                     }
                 }
@@ -2908,7 +3023,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             info!(
                 settled = settled,
                 failed = failed,
-                "Orphaned trade settlement complete"
+                "DB trade settlement complete"
             );
         }
     }

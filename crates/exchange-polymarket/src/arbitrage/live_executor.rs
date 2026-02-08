@@ -273,7 +273,7 @@ impl Default for HardLimits {
     fn default() -> Self {
         Self {
             max_order_size: dec!(10000),    // Max 10k shares per order
-            min_order_size: dec!(1),        // Min 1 share
+            min_order_size: dec!(5),        // Min 1 share
             max_price: dec!(0.99),          // Max 99 cents
             min_price: dec!(0.01),          // Min 1 cent
             max_order_value: dec!(5000),    // Max $5k per order
@@ -289,7 +289,7 @@ impl HardLimits {
     pub fn conservative() -> Self {
         Self {
             max_order_size: dec!(1000),
-            min_order_size: dec!(1),
+            min_order_size: dec!(5),
             max_price: dec!(0.95),
             min_price: dec!(0.05),
             max_order_value: dec!(500),
@@ -303,7 +303,7 @@ impl HardLimits {
     pub fn micro_testing() -> Self {
         Self {
             max_order_size: dec!(200),
-            min_order_size: dec!(1),
+            min_order_size: dec!(5),
             max_price: dec!(0.95),
             min_price: dec!(0.05),
             max_order_value: dec!(10),
@@ -317,7 +317,7 @@ impl HardLimits {
     pub fn aggressive() -> Self {
         Self {
             max_order_size: dec!(50000),
-            min_order_size: dec!(1),
+            min_order_size: dec!(5),
             max_price: dec!(0.99),
             min_price: dec!(0.01),
             max_order_value: dec!(20000),
@@ -1095,7 +1095,7 @@ mod tests {
         let limits = HardLimits::default();
 
         assert_eq!(limits.max_order_size, dec!(10000));
-        assert_eq!(limits.min_order_size, dec!(1));
+        assert_eq!(limits.min_order_size, dec!(5));
         assert_eq!(limits.max_price, dec!(0.99));
         assert_eq!(limits.min_price, dec!(0.01));
         assert_eq!(limits.max_order_value, dec!(5000));
@@ -1352,8 +1352,8 @@ mod tests {
     fn test_order_validation_boundary_values() {
         let limits = HardLimits::default();
 
-        // At minimum size
-        let order_min = OrderParams::buy_fok("token", dec!(0.50), dec!(1));
+        // At minimum size (Polymarket requires 5 shares minimum)
+        let order_min = OrderParams::buy_fok("token", dec!(0.50), dec!(5));
         assert!(limits.validate_order(&order_min).is_ok());
 
         // At maximum size (but within value limit)

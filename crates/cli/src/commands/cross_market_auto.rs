@@ -96,6 +96,11 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "0.20")]
     pub min_spread: f64,
 
+    /// Slippage tolerance on buy price in dollars. Default: 0.02 ($0.02/share).
+    /// Compensates for price movement during order latency (~700ms).
+    #[arg(long, default_value = "0.02")]
+    pub buy_slippage: f64,
+
     /// Minimum win probability required. Default: 0.85 (85%).
     #[arg(long, default_value = "0.85")]
     pub min_win_prob: f64,
@@ -220,7 +225,7 @@ struct DashboardConfig {
     kelly_fraction: f64,
     min_spread: f64,
     max_position: Decimal,
-    balance: Decimal,
+    initial_balance: Decimal,
     duration: Duration,
     persist: bool,
 }
@@ -268,6 +273,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
     auto_config.min_spread = Decimal::from_str(&format!("{:.4}", args.min_spread))?;
     auto_config.min_win_probability = args.min_win_prob;
     auto_config.max_loss_prob = args.max_loss_prob;
+    auto_config.buy_slippage = Decimal::from_str(&format!("{:.2}", args.buy_slippage))?;
     auto_config.entry_window_start_secs = args.entry_start_mins * 60;
     auto_config.entry_window_end_secs = args.entry_end_mins * 60;
     if let Some(max_pos) = args.max_position {
@@ -332,7 +338,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
                 kelly_fraction: 0.0,
                 min_spread: 0.01,
                 max_position: auto_config.max_position_per_window,
-                balance: Decimal::from(1_000_000),
+                initial_balance: Decimal::from(1_000_000),
                 duration,
                 persist: args.persist,
             };
@@ -367,7 +373,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
                 kelly_fraction: args.kelly_fraction,
                 min_spread: args.min_spread,
                 max_position: auto_config.max_position_per_window,
-                balance: args.paper_balance_decimal(),
+                initial_balance: args.paper_balance_decimal(),
                 duration,
                 persist: args.persist,
             };
@@ -402,7 +408,7 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
                 kelly_fraction: args.kelly_fraction,
                 min_spread: args.min_spread,
                 max_position: auto_config.max_position_per_window,
-                balance,
+                initial_balance: balance,
                 duration,
                 persist: args.persist,
             };
@@ -636,8 +642,15 @@ async fn print_dashboard(
     let status_text = if shutting_down { format!("{yellow}STOP{reset}") } else { format!("{green}RUN{reset}") };
     println!("{clear_line}  {dim}Pair:{reset} {:7} {dim}Bet:{reset} {:7} {dim}Spread:{reset} >${:.2}  {dim}Latency:{reset} {:8}  [{status_text}]",
         config.pair, config.bet_size, config.min_spread, latency_str);
-    println!("{clear_line}  {scanner_dot}●{reset}Scan {executor_dot}●{reset}Exec {ws_dot}●{reset}WS   {dim}Max:{reset} ${:.0}/win  {dim}Bal:{reset} ${:.2}",
-        config.max_position, config.balance);
+    // Use live on-chain balance if available, otherwise fall back to computed balance
+    let current_balance = auto.live_balance.unwrap_or(config.initial_balance + auto.realized_pnl);
+    let session_pnl = current_balance - config.initial_balance;
+    let bal_color = if session_pnl > Decimal::ZERO { green }
+                    else if session_pnl < Decimal::ZERO { red }
+                    else { reset };
+    let pnl_sign = if session_pnl >= Decimal::ZERO { "+" } else { "" };
+    println!("{clear_line}  {scanner_dot}●{reset}Scan {executor_dot}●{reset}Exec {ws_dot}●{reset}WS   {dim}Max:{reset} ${:.0}/win  {dim}Bal:{reset} {bal_color}${:.2}{reset} ({bal_color}{pnl_sign}{:.2}{reset})",
+        config.max_position, current_balance, session_pnl);
     println!("{clear_line}");
 
     // Live prices - all 4 coins in a 2x2 grid
