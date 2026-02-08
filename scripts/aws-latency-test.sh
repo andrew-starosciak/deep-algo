@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# AWS Latency Test - Deploy algo-trade bot to us-east-1 for latency testing
+# AWS Deploy - Deploy algo-trade bot to eu-west-2 (London) for Polymarket trading
 #
 # Usage:
 #   ./scripts/aws-latency-test.sh deploy              # Build, provision EC2, deploy binary
@@ -34,7 +34,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
-REGION="us-east-1"
+REGION="eu-west-1"
 INSTANCE_TYPE="t3.micro"
 KEY_NAME="algo-trade-latency-test"
 SG_NAME="algo-trade-latency-sg"
@@ -79,6 +79,7 @@ INSTANCE_ID=$INSTANCE_ID
 KEY_NAME=$KEY_NAME
 SECURITY_GROUP_ID=$SECURITY_GROUP_ID
 PUBLIC_IP=$PUBLIC_IP
+ALLOCATION_ID=$ALLOCATION_ID
 REGION=$REGION
 EOF
 }
@@ -251,14 +252,26 @@ cmd_deploy() {
         --instance-ids "$INSTANCE_ID" \
         --region "$REGION"
 
-    # Get public IP
-    PUBLIC_IP=$(aws ec2 describe-instances \
-        --instance-ids "$INSTANCE_ID" \
+    # Allocate Elastic IP (static — survives stop/start, needed for whitelisting)
+    info "Allocating Elastic IP..."
+    ALLOCATION_ID=$(aws ec2 allocate-address \
+        --domain vpc \
         --region "$REGION" \
-        --query 'Reservations[0].Instances[0].PublicIpAddress' \
+        --query 'AllocationId' \
         --output text)
 
-    dim "Public IP: $PUBLIC_IP"
+    PUBLIC_IP=$(aws ec2 describe-addresses \
+        --allocation-ids "$ALLOCATION_ID" \
+        --region "$REGION" \
+        --query 'Addresses[0].PublicIp' \
+        --output text)
+
+    aws ec2 associate-address \
+        --instance-id "$INSTANCE_ID" \
+        --allocation-id "$ALLOCATION_ID" \
+        --region "$REGION" >/dev/null
+
+    dim "Elastic IP: $PUBLIC_IP (Allocation: $ALLOCATION_ID)"
 
     # Wait for status checks
     info "Waiting for instance status checks..."
@@ -286,7 +299,7 @@ cmd_deploy() {
     remote_ssh "chmod 600 ~/.env"
 
     # Step 9: Quick connectivity test
-    info "Testing Polymarket API connectivity from us-east-1..."
+    info "Testing Polymarket API connectivity from $REGION..."
     local latency
     latency=$(remote_ssh "curl -s -o /dev/null -w '%{time_total}' https://clob.polymarket.com/time" 2>/dev/null || echo "failed")
     dim "CLOB API round-trip: ${latency}s"
@@ -386,7 +399,7 @@ cmd_live() {
 
     # Allocate a PTY so the dashboard renders correctly
     ssh $SSH_OPTS -t -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
-        "set -a && source ~/.env && set +a && RUST_LOG=debug ~/algo-trade cross-market-auto ${args[*]}"
+        "set -a && source ~/.env && set +a && RUST_LOG=info,algo_trade_polymarket::arbitrage::sdk_client=debug,algo_trade_polymarket::arbitrage::live_executor=debug,algo_trade_polymarket::arbitrage::execution=debug ~/algo-trade cross-market-auto ${args[*]}"
 }
 
 # =============================================================================
@@ -597,6 +610,7 @@ cmd_teardown() {
     echo ""
 
     echo -e "  ${DIM}Instance:${NC}  $INSTANCE_ID"
+    echo -e "  ${DIM}Elastic IP:${NC} ${PUBLIC_IP:-unknown} (${ALLOCATION_ID:-unknown})"
     echo -e "  ${DIM}SG:${NC}        $SECURITY_GROUP_ID"
     echo -e "  ${DIM}Key:${NC}       $KEY_NAME"
     echo ""
@@ -618,6 +632,14 @@ cmd_teardown() {
     aws ec2 wait instance-terminated \
         --instance-ids "$INSTANCE_ID" \
         --region "$REGION" 2>/dev/null || true
+
+    # Release Elastic IP
+    if [[ -n "${ALLOCATION_ID:-}" ]]; then
+        info "Releasing Elastic IP $ALLOCATION_ID..."
+        aws ec2 release-address \
+            --allocation-id "$ALLOCATION_ID" \
+            --region "$REGION" 2>/dev/null || true
+    fi
 
     # Delete security group (retry — takes a moment after termination)
     info "Deleting security group $SECURITY_GROUP_ID..."

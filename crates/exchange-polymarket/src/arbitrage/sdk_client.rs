@@ -30,6 +30,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+use wreq_util::Emulation;
 
 use super::clob_auth::{self, L2Auth};
 use super::eip712::{self, Eip712Config, SIDE_BUY, SIDE_SELL};
@@ -441,8 +442,10 @@ pub struct WalletPosition {
 /// - Balance and order status queries
 /// - Rate limit handling
 pub struct ClobClient {
-    /// HTTP client
+    /// HTTP client (reqwest — GET endpoints)
     http: Client,
+    /// HTTP client with Chrome TLS emulation (wreq — POST endpoints, Cloudflare bypass)
+    wreq_http: wreq::Client,
     /// Client configuration
     config: ClobClientConfig,
     /// Wallet for signing
@@ -467,8 +470,28 @@ impl ClobClient {
             .build()
             .map_err(ClobError::Http)?;
 
+        // Build wreq client with Chrome TLS emulation for POST endpoints.
+        // This bypasses Cloudflare's TLS fingerprinting that blocks standard reqwest.
+        let mut wreq_builder = wreq::Client::builder()
+            .emulation(Emulation::Chrome136)
+            .cookie_store(true)
+            .timeout(config.timeout);
+
+        if let Ok(proxy_url) = std::env::var("POLYMARKET_PROXY") {
+            info!(proxy = %proxy_url, "Configuring SOCKS5 proxy for CLOB POST requests");
+            wreq_builder = wreq_builder.proxy(
+                wreq::Proxy::all(&proxy_url)
+                    .map_err(|e| ClobError::Config(format!("Invalid POLYMARKET_PROXY: {e}")))?,
+            );
+        }
+
+        let wreq_http = wreq_builder
+            .build()
+            .map_err(|e| ClobError::Config(format!("Failed to build wreq client: {e}")))?;
+
         Ok(Self {
             http,
+            wreq_http,
             config,
             wallet,
             api_key: None,
@@ -550,17 +573,20 @@ impl ClobClient {
 
             let create_url = format!("{}/auth/api-key", self.config.base_url);
             let create_response = self
-                .http
+                .wreq_http
                 .post(&create_url)
                 .header("POLY_ADDRESS", &l1_headers.address)
                 .header("POLY_SIGNATURE", &l1_headers.signature)
                 .header("POLY_TIMESTAMP", &l1_headers.timestamp)
                 .header("POLY_NONCE", &l1_headers.nonce)
                 .send()
-                .await?;
+                .await
+                .map_err(|e| ClobError::Auth(format!("wreq POST /auth/api-key failed: {e}")))?;
 
             let status = create_response.status();
-            let body = create_response.text().await?;
+            let body = create_response.text().await.map_err(|e| {
+                ClobError::Auth(format!("wreq response body read failed: {e}"))
+            })?;
 
             if !status.is_success() {
                 return Err(ClobError::Auth(format!(
@@ -871,7 +897,7 @@ impl ClobClient {
             .map_err(|e| ClobError::Auth(format!("L2 header generation failed: {}", e)))?;
 
         let response = self
-            .http
+            .wreq_http
             .post(&url)
             .header("POLY_ADDRESS", &l2_headers.address)
             .header("POLY_SIGNATURE", &l2_headers.signature)
@@ -881,7 +907,11 @@ impl ClobClient {
             .header("Content-Type", "application/json")
             .body(body_json)
             .send()
-            .await?;
+            .await
+            .map_err(|e| ClobError::Api {
+                status: 0,
+                message: format!("wreq POST /order failed: {e}"),
+            })?;
 
         let status = response.status();
 
@@ -898,7 +928,10 @@ impl ClobClient {
             });
         }
 
-        let body = response.text().await?;
+        let body = response.text().await.map_err(|e| ClobError::Api {
+            status: status.as_u16(),
+            message: format!("wreq response body read failed: {e}"),
+        })?;
 
         if !status.is_success() {
             // FOK orders that can't be fully filled return HTTP 400 with a specific message.

@@ -16,8 +16,8 @@ algo-trade-backtest = { path = "../backtest" }
 tokio = { workspace = true, features = ["full"] }
 serde = { workspace = true }
 serde_json = "1.0"
-reqwest = { version = "0.12", features = ["json"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 governor = "0.6"
 ethers = "2.0"
