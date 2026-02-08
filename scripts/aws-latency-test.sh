@@ -5,6 +5,8 @@
 # Usage:
 #   ./scripts/aws-latency-test.sh deploy              # Build, provision EC2, deploy binary
 #   ./scripts/aws-latency-test.sh run [bot-args...]    # Run bot on remote instance
+#   ./scripts/aws-latency-test.sh live [duration]      # Live trade with $1 FOK strategy
+#   ./scripts/aws-latency-test.sh preflight            # Check auth, balance, markets
 #   ./scripts/aws-latency-test.sh ssh                  # SSH into instance
 #   ./scripts/aws-latency-test.sh logs                 # Tail remote logs
 #   ./scripts/aws-latency-test.sh redeploy             # Rebuild and upload binary
@@ -345,6 +347,62 @@ cmd_run() {
 }
 
 # =============================================================================
+# live
+# =============================================================================
+
+cmd_live() {
+    load_state
+
+    local duration="${1:-30m}"
+
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}        ${WHITE}Live Trading — ${REGION} (${PUBLIC_IP})${NC}                      ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${DIM}Pair:${NC}       BTC/ETH"
+    echo -e "  ${DIM}Combo:${NC}      coin1down_coin2up"
+    echo -e "  ${DIM}Bet size:${NC}   \$1 per leg (FOK)"
+    echo -e "  ${DIM}Max/window:${NC} \$10 / 10 trades"
+    echo -e "  ${DIM}Duration:${NC}   ${duration}"
+    echo ""
+
+    local args=(
+        --pair btc,eth
+        --combination coin1down_coin2up
+        --mode live
+        --duration "$duration"
+        --bet-size 1
+        --min-spread 0.15
+        --min-win-prob 0.85
+        --max-loss-prob 0.50
+        --max-position 10
+        --max-trades-per-window 10
+        --kelly-fraction 0.25
+        --stats-interval-secs 1
+    )
+
+    dim "algo-trade cross-market-auto ${args[*]}"
+    echo ""
+
+    # Allocate a PTY so the dashboard renders correctly
+    ssh $SSH_OPTS -t -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
+        "set -a && source ~/.env && set +a && RUST_LOG=debug ~/algo-trade cross-market-auto ${args[*]}"
+}
+
+# =============================================================================
+# preflight
+# =============================================================================
+
+cmd_preflight() {
+    load_state
+
+    info "Running preflight checks on $PUBLIC_IP..."
+    echo ""
+    ssh $SSH_OPTS -t -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
+        "set -a && source ~/.env && set +a && ~/algo-trade preflight --coins btc,eth --verbose"
+}
+
+# =============================================================================
 # ssh
 # =============================================================================
 
@@ -598,6 +656,13 @@ case "${1:-help}" in
         shift
         cmd_run "$@"
         ;;
+    live)
+        shift
+        cmd_live "$@"
+        ;;
+    preflight)
+        cmd_preflight
+        ;;
     ssh)
         cmd_ssh
         ;;
@@ -622,7 +687,7 @@ case "${1:-help}" in
         ;;
     *)
         error "Unknown command: $1"
-        echo "Usage: $0 {deploy|run|ssh|logs|redeploy|latency|status|teardown}"
+        echo "Usage: $0 {deploy|run|live|preflight|ssh|logs|redeploy|latency|status|teardown}"
         exit 1
         ;;
 esac
