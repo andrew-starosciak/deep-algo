@@ -92,8 +92,8 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "0.25")]
     pub kelly_fraction: f64,
 
-    /// Minimum spread required to execute. Default: 0.15 (15%).
-    #[arg(long, default_value = "0.15")]
+    /// Minimum spread required to execute. Default: 0.20 (20%).
+    #[arg(long, default_value = "0.20")]
     pub min_spread: f64,
 
     /// Minimum win probability required. Default: 0.85 (85%).
@@ -111,9 +111,9 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "10")]
     pub entry_start_mins: i64,
 
-    /// Entry window end: minutes before window close to STOP trading. Default: 6.
-    /// Avoids the 4-6 min "dead zone" where win rate drops.
-    #[arg(long, default_value = "6")]
+    /// Entry window end: minutes before window close to STOP trading. Default: 4.
+    /// BTC/ETH maintains 87%+ win rate down to 4 min; drop-off starts at 2 min.
+    #[arg(long, default_value = "4")]
     pub entry_end_mins: i64,
 
     /// Maximum position per window in USDC (paper default: 200, live default: 10).
