@@ -2928,32 +2928,46 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 last_exit_attempt: None,
             };
 
-            // Try Gamma API first (most reliable for past windows), then CLOB
+            // Try Gamma API first (most reliable — official Polymarket resolution).
+            // Only fall back to Chainlink for trades older than 10 minutes
+            // (Gamma should always have data by then; Chainlink is approximate).
+            let trade_age = Utc::now() - *window_end;
             let outcome = match self.try_settle_via_gamma(&settlement).await {
                 Ok(result) => {
                     debug!(trade_id = %settlement.trade_id, "DB trade settled via Gamma API");
                     Some(result)
                 }
                 Err(gamma_err) => {
-                    debug!(
-                        trade_id = %settlement.trade_id,
-                        error = %gamma_err,
-                        "Gamma API failed for orphan, trying Chainlink oracle"
-                    );
-                    match self.try_settle_via_chainlink(&settlement).await {
-                        Ok(result) => {
-                            info!(trade_id = %settlement.trade_id, "Orphan settled via Chainlink oracle");
-                            Some(result)
+                    if trade_age > chrono::Duration::minutes(10) {
+                        debug!(
+                            trade_id = %settlement.trade_id,
+                            error = %gamma_err,
+                            age_minutes = trade_age.num_minutes(),
+                            "Gamma API failed for old orphan, trying Chainlink oracle"
+                        );
+                        match self.try_settle_via_chainlink(&settlement).await {
+                            Ok(result) => {
+                                info!(trade_id = %settlement.trade_id, "Old orphan settled via Chainlink oracle");
+                                Some(result)
+                            }
+                            Err(chainlink_err) => {
+                                warn!(
+                                    trade_id = %settlement.trade_id,
+                                    gamma_error = %gamma_err,
+                                    chainlink_error = %chainlink_err,
+                                    "Could not settle orphan via Gamma or Chainlink"
+                                );
+                                None
+                            }
                         }
-                        Err(chainlink_err) => {
-                            warn!(
-                                trade_id = %settlement.trade_id,
-                                gamma_error = %gamma_err,
-                                chainlink_error = %chainlink_err,
-                                "Could not settle orphan via Gamma or Chainlink"
-                            );
-                            None
-                        }
+                    } else {
+                        debug!(
+                            trade_id = %settlement.trade_id,
+                            error = %gamma_err,
+                            age_secs = trade_age.num_seconds(),
+                            "Gamma not ready yet for recent trade, will retry"
+                        );
+                        None
                     }
                 }
             };
@@ -3484,14 +3498,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     /// Now we only use token-specific CLOB prices which are correct.
     async fn try_fast_settle_via_clob(&self) -> Result<u64, CrossMarketAutoExecutorError> {
         let now = Utc::now();
-        let half = dec!(0.50);
+        let resolved_high = dec!(0.90);
+        let resolved_low = dec!(0.10);
 
-        // Find trades with closed windows
+        // Find trades with closed windows (wait at least 60s for market resolution)
+        let min_clob_delay = chrono::Duration::seconds(60);
         let trades_to_check: Vec<PendingPaperSettlement> = {
             let pending = self.pending_settlements.read().await;
             pending
                 .iter()
-                .filter(|s| now > s.window_end) // Window has closed
+                .filter(|s| now > s.window_end + min_clob_delay)
                 .cloned()
                 .collect()
         };
@@ -3575,9 +3591,24 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 .and_then(|p| Decimal::from_str(&p.price).ok());
 
             if let (Some(p1), Some(p2)) = (leg1_price, leg2_price) {
-                // Token price > 0.50 means that outcome won
-                let leg1_won = p1 > half;
-                let leg2_won = p2 > half;
+                // Only settle if prices show decisive resolution (>= 0.90 or <= 0.10).
+                // Prices between 0.10-0.90 indicate the market hasn't resolved yet —
+                // those are just live trading prices, not settlement prices.
+                let leg1_decisive = p1 >= resolved_high || p1 <= resolved_low;
+                let leg2_decisive = p2 >= resolved_high || p2 <= resolved_low;
+
+                if !leg1_decisive || !leg2_decisive {
+                    debug!(
+                        trade_id = %settlement.trade_id,
+                        leg1_price = %p1,
+                        leg2_price = %p2,
+                        "CLOB prices not yet decisive (need >= 0.90 or <= 0.10), skipping fast settle"
+                    );
+                    continue;
+                }
+
+                let leg1_won = p1 >= resolved_high;
+                let leg2_won = p2 >= resolved_high;
 
                 info!(
                     trade_id = %settlement.trade_id,
@@ -3585,7 +3616,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     leg2_token_price = %p2,
                     leg1_won = leg1_won,
                     leg2_won = leg2_won,
-                    "SETTLING via CLOB token prices"
+                    "SETTLING via CLOB token prices (decisive resolution)"
                 );
 
                 self.finalize_settlement(&settlement, leg1_won, leg2_won)
@@ -4078,7 +4109,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         let now = Utc::now();
-        let settlement_delay = chrono::Duration::seconds(30); // Reduced from 120s since we try fast settle first
+        let settlement_delay = chrono::Duration::seconds(120); // Wait for Gamma API to have official resolution
 
         // Collect trades ready for settlement
         let mut to_settle = Vec::new();
@@ -4150,23 +4181,20 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         Ok(())
     }
 
-    /// Settles a single paper trade by checking Polymarket token prices.
+    /// Settles a single paper trade using Polymarket's official resolution data.
     ///
     /// After market resolution:
     /// - Winning tokens trade at $1.00 (or very close)
     /// - Losing tokens trade at $0.00 (or very close)
     ///
-    /// We query the actual token prices to determine outcomes, which matches
-    /// Polymarket's Chainlink-based resolution exactly.
-    ///
-    /// Settlement flow:
-    /// 1. Try CLOB token prices (works for recently closed markets)
-    /// 2. Fall back to Binance klines if CLOB fails (for resolved markets)
+    /// Uses the Gamma API exclusively (official resolution from Polymarket/UMA).
+    /// If Gamma doesn't have resolution data yet, returns an error so the trade
+    /// stays pending for retry on the next settlement cycle.
     async fn settle_paper_trade(
         &self,
         settlement: &PendingPaperSettlement,
     ) -> Result<(), CrossMarketAutoExecutorError> {
-        // Try to get outcomes - Gamma API first (official), then CLOB prices, then Binance fallback
+        // Use Gamma API only (official outcomes). If not ready yet, trade stays pending.
         let (leg1_won, leg2_won) = match self.try_settle_via_gamma(settlement).await {
             Ok(result) => {
                 info!(trade_id = %settlement.trade_id, "Settled via Gamma API (official outcomes)");
@@ -4176,11 +4204,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 debug!(
                     trade_id = %settlement.trade_id,
                     error = %e,
-                    "Gamma API settlement not available, falling back to Chainlink oracle"
+                    "Gamma API settlement not available yet, will retry"
                 );
-                // CLOB returns 400 for resolved markets, skip straight to Chainlink
-                // (same price source Polymarket uses for settlement)
-                self.try_settle_via_chainlink(settlement).await?
+                return Err(e);
             }
         };
 
