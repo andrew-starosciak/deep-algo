@@ -385,7 +385,7 @@ cmd_live() {
         --mode live
         --duration "$duration"
         --bet-size 1
-        --min-spread 0.15
+        --min-spread 0.20
         --min-win-prob 0.85
         --max-loss-prob 0.50
         --max-position 10

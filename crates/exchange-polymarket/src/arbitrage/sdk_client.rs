@@ -896,6 +896,8 @@ impl ClobClient {
             .headers("POST", "/order", &body_json)
             .map_err(|e| ClobError::Auth(format!("L2 header generation failed: {}", e)))?;
 
+        // Time the actual HTTP round-trip (network latency only)
+        let http_start = std::time::Instant::now();
         let response = self
             .wreq_http
             .post(&url)
@@ -912,6 +914,7 @@ impl ClobClient {
                 status: 0,
                 message: format!("wreq POST /order failed: {e}"),
             })?;
+        let http_latency_ms = http_start.elapsed().as_millis() as u64;
 
         let status = response.status();
 
@@ -938,11 +941,13 @@ impl ClobClient {
             // This is normal liquidity behavior, not an error - return a Rejected OrderResult
             // instead of an error so the circuit breaker is not triggered.
             if status.as_u16() == 400 && body.contains("couldn't be fully filled") {
-                info!(body = %body, "FOK order not filled (insufficient liquidity)");
-                return Ok(OrderResult::rejected(
+                info!(body = %body, latency_ms = http_latency_ms, "FOK order not filled (insufficient liquidity)");
+                let mut result = OrderResult::rejected(
                     "fok-not-filled",
                     format!("FOK not filled: {}", body),
-                ));
+                );
+                result.latency_ms = Some(http_latency_ms);
+                return Ok(result);
             }
 
             warn!(
@@ -956,7 +961,7 @@ impl ClobClient {
             });
         }
 
-        debug!(body = %body, "Order API response");
+        debug!(body = %body, latency_ms = http_latency_ms, "Order API response");
 
         // Parse response
         let order_response: CreateOrderResponse = serde_json::from_str(&body).map_err(|e| {
@@ -966,8 +971,10 @@ impl ClobClient {
             ))
         })?;
 
-        // Convert to OrderResult
-        self.parse_order_response(params, order_response)
+        // Convert to OrderResult and attach HTTP latency
+        let mut result = self.parse_order_response(params, order_response)?;
+        result.latency_ms = Some(http_latency_ms);
+        Ok(result)
     }
 
     /// Submits an order with automatic retries for transient errors.
@@ -1264,6 +1271,7 @@ impl ClobClient {
             filled_size,
             avg_fill_price: avg_price,
             error: None,
+            latency_ms: None,
         })
     }
 
@@ -1294,6 +1302,7 @@ impl ClobClient {
             filled_size,
             avg_fill_price: avg_price,
             error: None,
+            latency_ms: None,
         })
     }
 }

@@ -179,7 +179,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.02),
+            buy_slippage: dec!(0.01),
             min_win_probability: 0.80,
             max_history: 1000,
             early_exit_enabled: false,
@@ -209,7 +209,7 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.02),
+            buy_slippage: dec!(0.01),
             min_win_probability: 0.85,
             max_history: 1000,
             early_exit_enabled: false,
@@ -239,7 +239,7 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(5),
             max_position_per_window: dec!(10),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.02),
+            buy_slippage: dec!(0.01),
             min_win_probability: 0.75,
             max_history: 1000,
             early_exit_enabled: false,
@@ -918,6 +918,9 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
 
     /// Chainlink oracle price tracker for settlement (replaces Binance).
     chainlink_tracker: Arc<RwLock<ChainlinkWindowTracker>>,
+
+    /// Initial balance at session start, used to derive P&L from actual on-chain state.
+    initial_balance: Option<Decimal>,
 }
 
 impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
@@ -951,6 +954,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             last_both_rejected_at: None,
             last_redeem_check: None,
             chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
+            initial_balance: None,
         }
     }
 
@@ -990,6 +994,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             last_both_rejected_at: None,
             last_redeem_check: None,
             chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
+            initial_balance: None,
         }
     }
 
@@ -1041,6 +1046,19 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         // Startup: create session record in database
         self.create_session_record().await;
+
+        // Capture initial balance for P&L derivation from actual on-chain state
+        match self.executor.get_effective_balance().await {
+            Ok(bal) => {
+                self.initial_balance = Some(bal);
+                let mut stats = self.stats.write().await;
+                stats.live_balance = Some(bal);
+                info!(initial_balance = %bal, "Session starting balance captured for P&L tracking");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to capture initial balance — P&L will use first trade query");
+            }
+        }
 
         // Track last settlement check time - check every 5 seconds for faster settlement
         let mut last_settlement_check = std::time::Instant::now();
@@ -1108,7 +1126,17 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 if should_check {
                     match self.executor.redeem_resolved_positions().await {
                         Ok(0) => {}
-                        Ok(n) => info!(redeemed = n, "Auto-redeemed {} resolved positions", n),
+                        Ok(n) => {
+                            info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
+                            // Refresh balance after redemption and derive P&L from actual state
+                            if let Ok(bal) = self.executor.get_effective_balance().await {
+                                let mut stats = self.stats.write().await;
+                                stats.live_balance = Some(bal);
+                                if let Some(initial) = self.initial_balance {
+                                    stats.realized_pnl = bal - initial;
+                                }
+                            }
+                        }
                         Err(e) => debug!(error = %e, "Auto-redeem check failed (non-fatal)"),
                     }
                     self.last_redeem_check = Some(std::time::Instant::now());
@@ -1246,6 +1274,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let balance = self.executor.get_effective_balance().await?;
         // Update live balance in stats for dashboard display
         self.stats.write().await.live_balance = Some(balance);
+        // Record initial balance on first query for P&L derivation
+        if self.initial_balance.is_none() {
+            self.initial_balance = Some(balance);
+        }
         let bet_per_leg = if let Some(fixed) = self.config.fixed_bet_size {
             fixed
         } else {
@@ -2187,8 +2219,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         // Create orders for both legs.
-        // Add slippage tolerance to buy prices — with 500-700ms latency the book
-        // moves between detection and order arrival. Round up to $0.01 tick grid.
+        // Add slippage tolerance to buy prices — with ~24ms latency from AWS eu-west-1
+        // the book rarely moves, but allow 1 cent buffer. Round up to $0.01 tick grid.
         let slippage = self.config.buy_slippage;
         let leg1_buy_price = ((opp.leg1_price + slippage) * dec!(100)).ceil() / dec!(100);
         let leg2_buy_price = ((opp.leg2_price + slippage) * dec!(100)).ceil() / dec!(100);
@@ -2226,8 +2258,6 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             "Executing cross-market trade (parallel)"
         );
 
-        let start = std::time::Instant::now();
-
         // Submit both legs concurrently
         let (leg1_raw, leg2_raw) = tokio::join!(
             self.executor.submit_order(leg1_order),
@@ -2244,8 +2274,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             OrderResult::rejected("leg2-error", e.to_string())
         });
 
-        let latency_ms = start.elapsed().as_millis() as u64;
-        self.update_latency_stats(latency_ms).await;
+        // Use HTTP round-trip latency from the order results (max of both legs)
+        let latency_ms = leg1_result
+            .latency_ms
+            .unwrap_or(0)
+            .max(leg2_result.latency_ms.unwrap_or(0));
+        if latency_ms > 0 {
+            self.update_latency_stats(latency_ms).await;
+        }
 
         let leg1_filled = leg1_result.status == OrderStatus::Filled;
         let leg2_filled = leg2_result.status == OrderStatus::Filled;
@@ -4205,6 +4241,24 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // In live mode, this is a no-op (balance comes from chain)
         if let Err(e) = self.executor.credit_balance(net_payout).await {
             warn!(error = %e, "Failed to credit executor balance");
+        }
+
+        // In live mode, refresh balance from chain and derive P&L from actual state
+        // This overrides the estimated P&L accumulation above with ground truth
+        if let Ok(bal) = self.executor.get_effective_balance().await {
+            let mut stats = self.stats.write().await;
+            stats.live_balance = Some(bal);
+            if let Some(initial) = self.initial_balance {
+                let balance_pnl = bal - initial;
+                info!(
+                    balance_pnl = %balance_pnl,
+                    estimated_pnl = %stats.realized_pnl,
+                    live_balance = %bal,
+                    initial_balance = %initial,
+                    "P&L reconciliation: using balance-derived P&L"
+                );
+                stats.realized_pnl = balance_pnl;
+            }
         }
 
         // Update database status if persistence is enabled

@@ -387,6 +387,7 @@ impl PaperExecutor {
                 filled_size: Decimal::ZERO,
                 avg_fill_price: None,
                 error: Some("No fill - simulated market conditions".to_string()),
+                latency_ms: None,
             };
             state.orders.insert(order_id.clone(), result.clone());
             state.order_params.insert(order_id, order.clone());
@@ -462,6 +463,7 @@ impl PaperExecutor {
             filled_size: fill_size,
             avg_fill_price: Some(order.price),
             error: None,
+            latency_ms: None,
         };
 
         state.orders.insert(order_id.clone(), result.clone());

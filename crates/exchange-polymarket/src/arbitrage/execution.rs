@@ -264,6 +264,9 @@ pub struct OrderResult {
 
     /// Error message if order was rejected or failed.
     pub error: Option<String>,
+
+    /// HTTP round-trip latency in milliseconds (network only, excludes signing/rate limiting).
+    pub latency_ms: Option<u64>,
 }
 
 impl OrderResult {
@@ -276,6 +279,7 @@ impl OrderResult {
             filled_size: size,
             avg_fill_price: Some(price),
             error: None,
+            latency_ms: None,
         }
     }
 
@@ -288,6 +292,7 @@ impl OrderResult {
             filled_size: Decimal::ZERO,
             avg_fill_price: None,
             error: Some(reason.into()),
+            latency_ms: None,
         }
     }
 
@@ -300,6 +305,7 @@ impl OrderResult {
             filled_size: Decimal::ZERO,
             avg_fill_price: None,
             error: None,
+            latency_ms: None,
         }
     }
 

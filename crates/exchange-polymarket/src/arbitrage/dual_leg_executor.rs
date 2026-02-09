@@ -725,6 +725,7 @@ mod tests {
                 filled_size: dec!(50),
                 avg_fill_price: Some(dec!(0.45)),
                 error: None,
+                latency_ms: None,
             },
             filled_size: dec!(50),
             complete: false,
