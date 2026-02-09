@@ -179,7 +179,7 @@ impl Default for CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.01),
+            buy_slippage: dec!(0.02),
             min_win_probability: 0.80,
             max_history: 1000,
             early_exit_enabled: false,
@@ -209,7 +209,7 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.01),
+            buy_slippage: dec!(0.02),
             min_win_probability: 0.85,
             max_history: 1000,
             early_exit_enabled: false,
@@ -239,7 +239,7 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(5),
             max_position_per_window: dec!(10),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.01),
+            buy_slippage: dec!(0.02),
             min_win_probability: 0.75,
             max_history: 1000,
             early_exit_enabled: false,
@@ -1047,8 +1047,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // Startup: create session record in database
         self.create_session_record().await;
 
-        // Capture initial balance for P&L derivation from actual on-chain state
-        match self.executor.get_effective_balance().await {
+        // Capture initial USDC balance for P&L derivation from actual on-chain state.
+        // Uses get_balance() (USDC only) — not get_effective_balance() — so open
+        // positions don't inflate P&L before they're actually redeemed.
+        match self.executor.get_balance().await {
             Ok(bal) => {
                 self.initial_balance = Some(bal);
                 let mut stats = self.stats.write().await;
@@ -1128,8 +1130,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
-                            // Refresh balance after redemption and derive P&L from actual state
-                            if let Ok(bal) = self.executor.get_effective_balance().await {
+                            // Refresh USDC balance after redemption and derive P&L
+                            if let Ok(bal) = self.executor.get_balance().await {
                                 let mut stats = self.stats.write().await;
                                 stats.live_balance = Some(bal);
                                 if let Some(initial) = self.initial_balance {
@@ -1272,8 +1274,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
         // Calculate bet size using effective balance (USDC + redeemable positions)
         let balance = self.executor.get_effective_balance().await?;
-        // Update live balance in stats for dashboard display
-        self.stats.write().await.live_balance = Some(balance);
+        // Update live balance with USDC only (matches MetaMask / on-chain truth)
+        if let Ok(usdc) = self.executor.get_balance().await {
+            self.stats.write().await.live_balance = Some(usdc);
+        }
         // Record initial balance on first query for P&L derivation
         if self.initial_balance.is_none() {
             self.initial_balance = Some(balance);
@@ -2219,8 +2223,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         // Create orders for both legs.
-        // Add slippage tolerance to buy prices — with ~24ms latency from AWS eu-west-1
-        // the book rarely moves, but allow 1 cent buffer. Round up to $0.01 tick grid.
+        // Add slippage tolerance to buy prices — matching engine takes 500-2000ms
+        // so the book can move between detection and fill. Round up to $0.01 tick grid.
         let slippage = self.config.buy_slippage;
         let leg1_buy_price = ((opp.leg1_price + slippage) * dec!(100)).ceil() / dec!(100);
         let leg2_buy_price = ((opp.leg2_price + slippage) * dec!(100)).ceil() / dec!(100);
@@ -2498,42 +2502,84 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             "Selling back partial fill to avoid directional exposure"
         );
 
-        match self.executor.submit_order(sell_order).await {
-            Ok(result) => {
-                let recovered = result.filled_size * sell_price;
-                let cost = filled_size * fill_price;
-                let loss = cost - recovered;
-                if result.filled_size > Decimal::ZERO {
-                    info!(
-                        leg = leg_label,
-                        sold = %result.filled_size,
-                        recovered = %recovered,
-                        loss = %loss,
-                        "Sell-back filled — small spread loss accepted"
-                    );
-                    self.push_event(
-                        EventKind::Trim,
-                        format!(
-                            "SELL-BACK {} {:.1}sh @ ${:.2} (loss ${:.2})",
-                            leg_label, result.filled_size, sell_price, loss,
-                        ),
-                    )
-                    .await;
-                } else {
+        // Retry sell-back with delays — the buy may still be settling on-chain.
+        // Polymarket returns "matched" before the Polygon tx confirms, so shares
+        // aren't immediately available to sell.
+        let delays = [
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(3),
+            std::time::Duration::from_secs(5),
+        ];
+        for (attempt, delay) in std::iter::once(std::time::Duration::ZERO)
+            .chain(delays.iter().copied())
+            .enumerate()
+        {
+            if delay > std::time::Duration::ZERO {
+                info!(
+                    leg = leg_label,
+                    attempt = attempt + 1,
+                    delay_secs = delay.as_secs(),
+                    "Retrying sell-back after delay (waiting for on-chain settlement)"
+                );
+                tokio::time::sleep(delay).await;
+            }
+
+            match self.executor.submit_order(sell_order.clone()).await {
+                Ok(result) => {
+                    let recovered = result.filled_size * sell_price;
+                    let cost = filled_size * fill_price;
+                    let loss = cost - recovered;
+                    if result.filled_size > Decimal::ZERO {
+                        info!(
+                            leg = leg_label,
+                            sold = %result.filled_size,
+                            recovered = %recovered,
+                            loss = %loss,
+                            attempt = attempt + 1,
+                            "Sell-back filled — small spread loss accepted"
+                        );
+                        self.push_event(
+                            EventKind::Trim,
+                            format!(
+                                "SELL-BACK {} {:.1}sh @ ${:.2} (loss ${:.2})",
+                                leg_label, result.filled_size, sell_price, loss,
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
                     warn!(
                         leg = leg_label,
-                        "Sell-back not filled — directional exposure remains"
+                        attempt = attempt + 1,
+                        "Sell-back not filled — will retry"
                     );
                 }
-            }
-            Err(e) => {
-                warn!(
-                    leg = leg_label,
-                    error = %e,
-                    "Sell-back failed — directional exposure remains"
-                );
+                Err(e) => {
+                    let is_balance_error = e.to_string().contains("not enough balance");
+                    if is_balance_error && attempt < delays.len() {
+                        debug!(
+                            leg = leg_label,
+                            attempt = attempt + 1,
+                            error = %e,
+                            "Sell-back failed (shares not yet settled) — will retry"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        leg = leg_label,
+                        attempt = attempt + 1,
+                        error = %e,
+                        "Sell-back failed — directional exposure remains"
+                    );
+                    return;
+                }
             }
         }
+
+        warn!(
+            leg = leg_label,
+            "Sell-back exhausted all retries — directional exposure remains"
+        );
     }
 
     /// Updates latency statistics.
@@ -4243,9 +4289,9 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             warn!(error = %e, "Failed to credit executor balance");
         }
 
-        // In live mode, refresh balance from chain and derive P&L from actual state
-        // This overrides the estimated P&L accumulation above with ground truth
-        if let Ok(bal) = self.executor.get_effective_balance().await {
+        // In live mode, refresh USDC balance and derive P&L from actual state.
+        // Uses get_balance() (USDC only) so open positions don't inflate P&L.
+        if let Ok(bal) = self.executor.get_balance().await {
             let mut stats = self.stats.write().await;
             stats.live_balance = Some(bal);
             if let Some(initial) = self.initial_balance {

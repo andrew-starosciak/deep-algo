@@ -499,7 +499,11 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
     // Main monitoring loop
     let start_time = std::time::Instant::now();
     let deadline = tokio::time::Instant::now() + duration;
-    let stats_interval = Duration::from_secs(stats_interval_secs);
+    let stats_interval = if verbose {
+        Duration::from_secs(stats_interval_secs)
+    } else {
+        Duration::from_millis(33) // ~30fps dashboard refresh
+    };
     let mut last_stats = tokio::time::Instant::now();
 
     // Print initial launch banner (once)
@@ -543,7 +547,7 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
             last_stats = tokio::time::Instant::now();
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(16)).await;
     }
 
     // Stop both components

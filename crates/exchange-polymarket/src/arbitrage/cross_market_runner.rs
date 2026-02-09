@@ -198,6 +198,9 @@ pub struct CrossMarketRunner {
     ws_handle: Option<PolymarketWebSocket>,
     /// Current subscribed token IDs.
     subscribed_tokens: Arc<RwLock<Vec<String>>>,
+    /// Cached coin → (up_token_id, down_token_id) mapping from last scan.
+    /// Used for fast WebSocket price refreshes between Gamma API scans.
+    token_map: std::collections::HashMap<String, (String, String)>,
 }
 
 impl CrossMarketRunner {
@@ -221,6 +224,7 @@ impl CrossMarketRunner {
             stats: Arc::new(RwLock::new(CrossMarketRunnerStats::default())),
             ws_handle: None,
             subscribed_tokens: Arc::new(RwLock::new(Vec::new())),
+            token_map: std::collections::HashMap::new(),
         };
 
         (runner, opp_rx)
@@ -251,6 +255,7 @@ impl CrossMarketRunner {
             stats: Arc::new(RwLock::new(CrossMarketRunnerStats::default())),
             ws_handle: None,
             subscribed_tokens: Arc::new(RwLock::new(Vec::new())),
+            token_map: std::collections::HashMap::new(),
         };
 
         (runner, opp_rx)
@@ -292,6 +297,7 @@ impl CrossMarketRunner {
         }
 
         let scan_interval = Duration::from_millis(self.config.scan_interval_ms);
+        let mut last_scan = tokio::time::Instant::now() - scan_interval; // scan immediately on start
 
         loop {
             if self.should_stop.load(Ordering::SeqCst) {
@@ -303,31 +309,38 @@ impl CrossMarketRunner {
                 return Ok(());
             }
 
-            // Perform one scan cycle
-            match self.scan_once().await {
-                Ok(opportunities) => {
-                    let mut stats = self.stats.write().await;
-                    stats.scans_performed += 1;
-                    stats.last_scan_at = Some(Utc::now());
+            // Refresh prices from WebSocket every iteration (fast, in-memory read)
+            self.refresh_prices_from_ws().await;
 
-                    for opp in opportunities {
-                        stats.record_opportunity(&opp);
+            // Full scan (Gamma API + opportunity detection) at scan_interval
+            if last_scan.elapsed() >= scan_interval {
+                match self.scan_once().await {
+                    Ok(opportunities) => {
+                        let mut stats = self.stats.write().await;
+                        stats.scans_performed += 1;
+                        stats.last_scan_at = Some(Utc::now());
 
-                        // Send to channel
-                        if self.opp_tx.send(opp).await.is_err() {
-                            warn!("Opportunity channel closed");
-                            return Err(CrossMarketRunnerError::Stopped);
+                        for opp in opportunities {
+                            stats.record_opportunity(&opp);
+
+                            // Send to channel
+                            if self.opp_tx.send(opp).await.is_err() {
+                                warn!("Opportunity channel closed");
+                                return Err(CrossMarketRunnerError::Stopped);
+                            }
                         }
                     }
+                    Err(e) => {
+                        error!("Scan error: {}", e);
+                        let mut stats = self.stats.write().await;
+                        stats.errors += 1;
+                    }
                 }
-                Err(e) => {
-                    error!("Scan error: {}", e);
-                    let mut stats = self.stats.write().await;
-                    stats.errors += 1;
-                }
+                last_scan = tokio::time::Instant::now();
             }
 
-            tokio::time::sleep(scan_interval).await;
+            // Fast tick for real-time price updates
+            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -355,6 +368,14 @@ impl CrossMarketRunner {
             .iter()
             .filter_map(|m| self.market_to_snapshot_with_depth(m, now_ms))
             .collect();
+
+        // Cache token mapping for fast WebSocket price refreshes between scans
+        for snapshot in &snapshots {
+            self.token_map.insert(
+                snapshot.coin.slug_prefix().to_uppercase(),
+                (snapshot.up_token_id.clone(), snapshot.down_token_id.clone()),
+            );
+        }
 
         // Update current prices and snapshots in stats
         {
@@ -385,14 +406,22 @@ impl CrossMarketRunner {
 
     /// Ensures WebSocket is connected to all market tokens.
     async fn ensure_websocket_connected(&mut self, markets: &[Market]) {
-        // Collect all token IDs we need
+        // Collect all token IDs and build coin→token mapping for real-time price updates
         let mut token_ids: Vec<String> = Vec::new();
+        let mut coin_tokens: Vec<(String, String, String)> = Vec::new();
         for market in markets {
-            if let Some(up) = market.up_token() {
+            let coin = match self.detect_coin_from_market(market) {
+                Some(c) => c,
+                None => continue,
+            };
+            if let (Some(up), Some(down)) = (market.up_token(), market.down_token()) {
                 token_ids.push(up.token_id.clone());
-            }
-            if let Some(down) = market.down_token() {
                 token_ids.push(down.token_id.clone());
+                coin_tokens.push((
+                    coin.slug_prefix().to_uppercase(),
+                    up.token_id.clone(),
+                    down.token_id.clone(),
+                ));
             }
         }
 
@@ -408,25 +437,46 @@ impl CrossMarketRunner {
                 ws.shutdown().await;
             }
 
-            // Connect to new tokens
+            // Connect to new tokens (unlimited reconnects to stay alive all session)
             let config = WebSocketConfig {
-                max_reconnect_attempts: 3,
+                max_reconnect_attempts: 0,
                 ..Default::default()
             };
 
             match PolymarketWebSocket::connect(token_ids.clone(), config).await {
                 Ok((ws, mut rx)) => {
                     info!("WebSocket connected for {} tokens", token_ids.len());
+                    let ws_clone = ws.clone();
                     self.ws_handle = Some(ws);
 
                     // Update subscribed tokens
                     let mut current = self.subscribed_tokens.write().await;
                     *current = token_ids;
 
-                    // Spawn a task to drain events (we just need the book state)
+                    // Spawn event handler that pushes WebSocket prices to stats in real-time.
+                    // This runs independently of the runner's scan loop, so prices update
+                    // even while Gamma API calls are in progress.
+                    let stats = Arc::clone(&self.stats);
                     tokio::spawn(async move {
+                        let mut last_update = tokio::time::Instant::now();
                         while rx.recv().await.is_some() {
-                            // Events are processed, book state is maintained in ws_handle
+                            // Throttle to ~20 updates/sec to avoid lock contention
+                            if last_update.elapsed() < Duration::from_millis(50) {
+                                continue;
+                            }
+                            let mut s = stats.write().await;
+                            for (coin, up_id, down_id) in &coin_tokens {
+                                let up_price = ws_clone
+                                    .get_book(up_id)
+                                    .and_then(|b| b.best_ask().or_else(|| b.mid_price()));
+                                let down_price = ws_clone
+                                    .get_book(down_id)
+                                    .and_then(|b| b.best_ask().or_else(|| b.mid_price()));
+                                if let (Some(up), Some(down)) = (up_price, down_price) {
+                                    s.current_prices.insert(coin.clone(), (up, down));
+                                }
+                            }
+                            last_update = tokio::time::Instant::now();
                         }
                     });
 
@@ -539,6 +589,33 @@ impl CrossMarketRunner {
             up_depth,
             down_depth,
         })
+    }
+
+    /// Refreshes dashboard prices from WebSocket book state without hitting the Gamma API.
+    /// Uses the cached token_map from the last scan to look up book prices directly.
+    async fn refresh_prices_from_ws(&self) {
+        let ws = match &self.ws_handle {
+            Some(ws) => ws,
+            None => return,
+        };
+
+        let mut stats = self.stats.write().await;
+        for (coin, (up_token_id, down_token_id)) in &self.token_map {
+            let up_book = ws.get_book(up_token_id);
+            let down_book = ws.get_book(down_token_id);
+
+            // Use best ask (what we'd pay to buy) — same logic as scan_once
+            let up_price = up_book
+                .as_ref()
+                .and_then(|b| b.best_ask().or_else(|| b.mid_price()));
+            let down_price = down_book
+                .as_ref()
+                .and_then(|b| b.best_ask().or_else(|| b.mid_price()));
+
+            if let (Some(up), Some(down)) = (up_price, down_price) {
+                stats.current_prices.insert(coin.clone(), (up, down));
+            }
+        }
     }
 
     /// Detects which coin a market belongs to based on its question text.

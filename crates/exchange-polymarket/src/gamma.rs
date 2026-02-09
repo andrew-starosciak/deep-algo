@@ -185,24 +185,29 @@ impl GammaClient {
 
     /// Gets 15-minute markets for specific coins only.
     pub async fn get_15min_markets_for_coins(&self, coins: &[Coin]) -> Vec<Market> {
-        let mut markets = Vec::new();
-
-        for coin in coins {
-            match self.get_current_15min_market(*coin).await {
-                Ok(market) => {
-                    markets.push(market);
+        // Fetch all coins concurrently to avoid sequential HTTP latency
+        let futures: Vec<_> = coins
+            .iter()
+            .map(|coin| async move {
+                match self.get_current_15min_market(*coin).await {
+                    Ok(market) => Some(market),
+                    Err(e) => {
+                        tracing::warn!(
+                            coin = coin.slug_prefix(),
+                            error = %e,
+                            "Failed to fetch 15-min market"
+                        );
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        coin = coin.slug_prefix(),
-                        error = %e,
-                        "Failed to fetch 15-min market"
-                    );
-                }
-            }
-        }
+            })
+            .collect();
 
-        markets
+        futures_util::future::join_all(futures)
+            .await
+            .into_iter()
+            .flatten()
+            .collect()
     }
 
     /// Gets the outcome of a resolved 15-minute market.
