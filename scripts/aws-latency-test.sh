@@ -12,6 +12,9 @@
 #   ./scripts/aws-latency-test.sh redeploy             # Rebuild and upload binary
 #   ./scripts/aws-latency-test.sh latency              # Measure latency to Polymarket endpoints
 #   ./scripts/aws-latency-test.sh status               # Show instance status
+#   ./scripts/aws-latency-test.sh db-dump              # Download a pg_dump to local machine
+#   ./scripts/aws-latency-test.sh db-sync              # Import remote dump into local Postgres
+#   ./scripts/aws-latency-test.sh db-shell             # Open psql on the remote database
 #   ./scripts/aws-latency-test.sh teardown             # Terminate and clean up everything
 #
 # Prerequisites:
@@ -42,6 +45,12 @@ INSTANCE_TAG="algo-trade-latency"
 
 STATE_FILE="$SCRIPT_DIR/.aws-latency-test.state"
 KEY_FILE="$SCRIPT_DIR/.aws-latency-key.pem"
+DUMPS_DIR="$PROJECT_ROOT/data/aws-dumps"
+
+REMOTE_DB_NAME="algo_trade"
+REMOTE_DB_USER="algo"
+REMOTE_DB_PASS="algo_trade_local"
+REMOTE_DATABASE_URL="postgres://${REMOTE_DB_USER}:${REMOTE_DB_PASS}@localhost/${REMOTE_DB_NAME}"
 
 SSH_USER="ubuntu"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
@@ -105,6 +114,47 @@ wait_for_ssh() {
     done
     error "SSH not available after ${max_attempts} attempts"
     return 1
+}
+
+sync_and_migrate() {
+    info "Syncing migrations..."
+    remote_ssh "mkdir -p ~/migrations"
+    remote_scp "$PROJECT_ROOT/scripts/migrations/"*.sql "$SSH_USER@$PUBLIC_IP:~/migrations/"
+
+    info "Running new migrations..."
+    remote_ssh "bash -s" <<'RUN_MIGRATIONS'
+set -euo pipefail
+export PGPASSWORD="algo_trade_local"
+DB_ARGS="-h localhost -U algo -d algo_trade"
+
+# Create tracking table if it doesn't exist
+psql $DB_ARGS -c "
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    filename TEXT PRIMARY KEY,
+    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);" 2>/dev/null
+
+applied=0
+skipped=0
+for f in $(ls ~/migrations/*.sql | sort); do
+    fname=$(basename "$f")
+    # Check if already applied
+    already=$(psql $DB_ARGS -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$fname'" 2>/dev/null)
+    if [[ "$already" == "1" ]]; then
+        skipped=$((skipped + 1))
+        continue
+    fi
+    echo "  Applying $fname..."
+    if psql $DB_ARGS -f "$f" 2>&1 | tail -3; then
+        psql $DB_ARGS -c "INSERT INTO schema_migrations (filename) VALUES ('$fname');" 2>/dev/null
+        applied=$((applied + 1))
+    else
+        echo "  ERROR applying $fname — stopping"
+        exit 1
+    fi
+done
+echo "Migrations: $applied applied, $skipped already up-to-date"
+RUN_MIGRATIONS
 }
 
 # =============================================================================
@@ -231,15 +281,16 @@ cmd_deploy() {
 
     dim "Security group: $SECURITY_GROUP_ID (SSH from $my_ip)"
 
-    # Step 5: Launch instance
-    info "Launching $INSTANCE_TYPE in $REGION..."
+    # Step 5: Launch spot instance
+    info "Launching $INSTANCE_TYPE spot instance in $REGION..."
     INSTANCE_ID=$(aws ec2 run-instances \
         --image-id "$ami_id" \
         --instance-type "$INSTANCE_TYPE" \
         --key-name "$KEY_NAME" \
         --security-group-ids "$SECURITY_GROUP_ID" \
         --region "$REGION" \
-        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":20,"VolumeType":"gp3"}}]' \
+        --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}' \
+        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":8,"VolumeType":"gp3"}}]' \
         --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_TAG}]" \
         --query 'Instances[0].InstanceId' \
         --output text)
@@ -289,20 +340,118 @@ cmd_deploy() {
     info "Installing runtime dependencies..."
     remote_ssh "sudo apt-get update -qq && sudo apt-get install -y -qq libssl3t64 ca-certificates >/dev/null 2>&1"
 
-    # Step 8: Deploy binary and config
+    # Step 8: Install PostgreSQL + TimescaleDB
+    info "Installing PostgreSQL + TimescaleDB..."
+    remote_ssh 'bash -s' <<'SETUP_PG'
+set -euo pipefail
+
+# Install Postgres 16
+sudo apt-get install -y -qq postgresql postgresql-client >/dev/null 2>&1
+
+# Install TimescaleDB from official apt repo
+CODENAME=$(lsb_release -cs)
+echo "deb https://packagecloud.io/timescale/timescaledb/ubuntu/ ${CODENAME} main" | sudo tee /etc/apt/sources.list.d/timescaledb.list >/dev/null
+curl -sL https://packagecloud.io/timescale/timescaledb/gpgkey | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/timescaledb.gpg
+sudo apt-get update -qq >/dev/null 2>&1
+sudo apt-get install -y -qq timescaledb-2-postgresql-16 >/dev/null 2>&1 || echo "TimescaleDB package install returned non-zero (may still be OK)"
+
+# Ensure shared_preload_libraries includes timescaledb
+# timescaledb-tune handles this + memory settings, but verify it works
+if sudo timescaledb-tune --quiet --yes 2>/dev/null; then
+    echo "timescaledb-tune applied"
+else
+    echo "timescaledb-tune failed, setting shared_preload_libraries manually"
+    sudo sed -i "s/^#*shared_preload_libraries.*/shared_preload_libraries = 'timescaledb'/" /etc/postgresql/16/main/postgresql.conf
+    # Check if the line exists at all
+    if ! grep -q "^shared_preload_libraries.*timescaledb" /etc/postgresql/16/main/postgresql.conf; then
+        echo "shared_preload_libraries = 'timescaledb'" | sudo tee -a /etc/postgresql/16/main/postgresql.conf >/dev/null
+    fi
+fi
+
+# Tune Postgres for low-memory (t3.micro = 1GB RAM)
+sudo tee /etc/postgresql/16/main/conf.d/low-memory.conf >/dev/null <<PGCONF
+shared_buffers = 128MB
+effective_cache_size = 384MB
+work_mem = 4MB
+maintenance_work_mem = 64MB
+max_connections = 20
+wal_buffers = 4MB
+checkpoint_completion_target = 0.9
+random_page_cost = 1.1
+max_wal_size = 256MB
+PGCONF
+
+sudo systemctl restart postgresql
+sudo systemctl enable postgresql
+
+# Create database and user
+sudo -u postgres psql -c "DO \$\$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'algo') THEN
+        CREATE ROLE algo WITH LOGIN PASSWORD 'algo_trade_local';
+    END IF;
+END
+\$\$;"
+sudo -u postgres createdb -O algo algo_trade 2>/dev/null || true
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE algo_trade TO algo;"
+sudo -u postgres psql -d algo_trade -c "GRANT ALL ON SCHEMA public TO algo;"
+
+# Create TimescaleDB extension as superuser (algo can't do this)
+sudo -u postgres psql -d algo_trade -c "CREATE EXTENSION IF NOT EXISTS timescaledb;"
+
+# Allow local password auth
+sudo sed -i 's/local\s\+all\s\+all\s\+peer/local   all             all                                     md5/' /etc/postgresql/16/main/pg_hba.conf
+if ! grep -q "host.*all.*all.*127.0.0.1/32.*md5" /etc/postgresql/16/main/pg_hba.conf; then
+    echo "host    all    all    127.0.0.1/32    md5" | sudo tee -a /etc/postgresql/16/main/pg_hba.conf >/dev/null
+fi
+sudo systemctl reload postgresql
+
+echo "PostgreSQL + TimescaleDB installed and configured"
+SETUP_PG
+
+    # Step 9: Deploy migrations
+    info "Deploying database migrations..."
+    sync_and_migrate
+
+    # Step 10: Set up daily backup cron
+    info "Setting up daily database backup..."
+    remote_ssh 'bash -s' <<'SETUP_BACKUP'
+mkdir -p ~/backups
+cat > ~/backup-db.sh <<'BKSCRIPT'
+#!/bin/bash
+export PGPASSWORD="algo_trade_local"
+DUMP_FILE=~/backups/algo_trade_$(date +%Y%m%d_%H%M%S).sql.gz
+pg_dump -h localhost -U algo algo_trade | gzip > "$DUMP_FILE"
+# Keep only last 7 days of backups
+find ~/backups -name "algo_trade_*.sql.gz" -mtime +7 -delete
+BKSCRIPT
+chmod +x ~/backup-db.sh
+
+# Run daily at 04:00 UTC
+(crontab -l 2>/dev/null | grep -v backup-db; echo "0 4 * * * ~/backup-db.sh") | crontab -
+SETUP_BACKUP
+
+    # Step 11: Inject DATABASE_URL into .env
     info "Deploying binary ($binary_size)..."
     remote_scp "$binary" "$SSH_USER@$PUBLIC_IP:~/algo-trade"
     remote_ssh "chmod +x ~/algo-trade"
 
-    info "Deploying .env..."
+    info "Deploying .env (with DATABASE_URL)..."
     remote_scp "$PROJECT_ROOT/.env" "$SSH_USER@$PUBLIC_IP:~/.env"
     remote_ssh "chmod 600 ~/.env"
+    # Append DATABASE_URL if not already present
+    remote_ssh "grep -q '^DATABASE_URL=' ~/.env || echo 'DATABASE_URL=${REMOTE_DATABASE_URL}' >> ~/.env"
 
-    # Step 9: Quick connectivity test
+    # Step 12: Quick connectivity test
     info "Testing Polymarket API connectivity from $REGION..."
     local latency
     latency=$(remote_ssh "curl -s -o /dev/null -w '%{time_total}' https://clob.polymarket.com/time" 2>/dev/null || echo "failed")
     dim "CLOB API round-trip: ${latency}s"
+
+    # Verify DB
+    local table_count
+    table_count=$(remote_ssh "PGPASSWORD=algo_trade_local psql -h localhost -U algo -d algo_trade -tAc \"SELECT count(*) FROM information_schema.tables WHERE table_schema='public'\"" 2>/dev/null || echo "?")
+    dim "Database: algo_trade ($table_count tables)"
 
     # Done
     echo ""
@@ -312,15 +461,21 @@ cmd_deploy() {
     echo -e "  ${DIM}Instance:${NC}  $INSTANCE_ID"
     echo -e "  ${DIM}Region:${NC}    $REGION"
     echo -e "  ${DIM}IP:${NC}        $PUBLIC_IP"
-    echo -e "  ${DIM}Type:${NC}      $INSTANCE_TYPE"
+    echo -e "  ${DIM}Type:${NC}      $INSTANCE_TYPE (spot)"
+    echo -e "  ${DIM}Database:${NC}  algo_trade (local Postgres + TimescaleDB)"
     echo ""
     echo -e "${WHITE}Quick start:${NC}"
-    echo -e "  ${CYAN}./scripts/aws-latency-test.sh run --mode observe --duration 1h --no-persist --verbose${NC}"
+    echo -e "  ${CYAN}./scripts/aws-latency-test.sh live${NC}           # Live trade with persistence"
+    echo ""
+    echo -e "${WHITE}Data commands:${NC}"
+    echo -e "  ${DIM}./scripts/aws-latency-test.sh db-shell${NC}       # Remote psql"
+    echo -e "  ${DIM}./scripts/aws-latency-test.sh db-dump${NC}        # Download pg_dump"
+    echo -e "  ${DIM}./scripts/aws-latency-test.sh db-sync${NC}        # Import into local Postgres"
     echo ""
     echo -e "${WHITE}Other commands:${NC}"
-    echo -e "  ${DIM}./scripts/aws-latency-test.sh ssh${NC}        # SSH into instance"
-    echo -e "  ${DIM}./scripts/aws-latency-test.sh status${NC}     # Check instance status"
-    echo -e "  ${DIM}./scripts/aws-latency-test.sh teardown${NC}   # Destroy everything"
+    echo -e "  ${DIM}./scripts/aws-latency-test.sh ssh${NC}            # SSH into instance"
+    echo -e "  ${DIM}./scripts/aws-latency-test.sh redeploy${NC}       # Rebuild + sync migrations"
+    echo -e "  ${DIM}./scripts/aws-latency-test.sh teardown${NC}       # Destroy everything"
     echo ""
 }
 
@@ -392,6 +547,7 @@ cmd_live() {
         --max-trades-per-window 10
         --kelly-fraction 0.25
         --stats-interval-secs 1
+        --persist
     )
 
     dim "algo-trade cross-market-auto ${args[*]}"
@@ -463,9 +619,13 @@ cmd_redeploy() {
     remote_scp "$binary" "$SSH_USER@$PUBLIC_IP:~/algo-trade"
     remote_ssh "chmod +x ~/algo-trade"
 
-    # Also sync .env in case it changed
+    # Sync .env (preserve remote DATABASE_URL)
     remote_scp "$PROJECT_ROOT/.env" "$SSH_USER@$PUBLIC_IP:~/.env"
     remote_ssh "chmod 600 ~/.env"
+    remote_ssh "grep -q '^DATABASE_URL=' ~/.env || echo 'DATABASE_URL=${REMOTE_DATABASE_URL}' >> ~/.env"
+
+    # Sync and apply any new migrations
+    sync_and_migrate
 
     info "Redeployed to $PUBLIC_IP"
 }
@@ -598,6 +758,96 @@ cmd_status() {
 }
 
 # =============================================================================
+# db-dump
+# =============================================================================
+
+cmd_db_dump() {
+    load_state
+
+    mkdir -p "$DUMPS_DIR"
+
+    local timestamp
+    timestamp=$(date +%Y%m%d_%H%M%S)
+    local dump_file="$DUMPS_DIR/algo_trade_${timestamp}.sql.gz"
+
+    info "Creating database dump on $PUBLIC_IP..."
+    remote_ssh "PGPASSWORD=algo_trade_local pg_dump -h localhost -U algo algo_trade | gzip > /tmp/algo_trade_dump.sql.gz"
+
+    info "Downloading dump..."
+    remote_scp "$SSH_USER@$PUBLIC_IP:/tmp/algo_trade_dump.sql.gz" "$dump_file"
+    remote_ssh "rm -f /tmp/algo_trade_dump.sql.gz"
+
+    local dump_size
+    dump_size=$(du -h "$dump_file" | cut -f1)
+    info "Dump saved: $dump_file ($dump_size)"
+
+    # Show row counts for key tables
+    info "Remote table row counts:"
+    remote_ssh "PGPASSWORD=algo_trade_local psql -h localhost -U algo -d algo_trade -c \"
+        SELECT relname AS table, n_live_tup AS rows
+        FROM pg_stat_user_tables
+        WHERE n_live_tup > 0
+        ORDER BY n_live_tup DESC;
+    \"" 2>/dev/null || true
+}
+
+# =============================================================================
+# db-sync
+# =============================================================================
+
+cmd_db_sync() {
+    load_state
+
+    # Find the latest dump
+    local latest_dump
+    latest_dump=$(ls -t "$DUMPS_DIR"/algo_trade_*.sql.gz 2>/dev/null | head -1)
+
+    if [[ -z "$latest_dump" ]]; then
+        warn "No dumps found in $DUMPS_DIR. Run 'db-dump' first."
+        exit 1
+    fi
+
+    info "Latest dump: $latest_dump"
+    local dump_size
+    dump_size=$(du -h "$latest_dump" | cut -f1)
+    dim "Size: $dump_size"
+
+    # Check if local Postgres is accessible
+    local local_db_url="${DATABASE_URL:-${LOCAL_DATABASE_URL:-}}"
+    if [[ -z "$local_db_url" ]]; then
+        # Try to read from .env
+        if [[ -f "$PROJECT_ROOT/.env" ]]; then
+            local_db_url=$(grep '^DATABASE_URL=' "$PROJECT_ROOT/.env" | cut -d= -f2- || true)
+        fi
+    fi
+
+    if [[ -z "$local_db_url" ]]; then
+        error "No DATABASE_URL found. Set it in .env or environment."
+        exit 1
+    fi
+
+    info "Importing into local database..."
+    dim "URL: $local_db_url"
+
+    # Import: drop existing data and restore
+    gunzip -c "$latest_dump" | psql "$local_db_url" 2>&1 | tail -5
+
+    info "Import complete. Local database synced from $(basename "$latest_dump")"
+}
+
+# =============================================================================
+# db-shell
+# =============================================================================
+
+cmd_db_shell() {
+    load_state
+
+    info "Opening psql on $PUBLIC_IP..."
+    ssh $SSH_OPTS -t -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
+        "PGPASSWORD=algo_trade_local psql -h localhost -U algo -d algo_trade"
+}
+
+# =============================================================================
 # teardown
 # =============================================================================
 
@@ -621,6 +871,21 @@ cmd_teardown() {
         exit 1
     fi
     echo ""
+
+    # Cancel spot instance request (persistent spot will relaunch otherwise)
+    info "Cancelling spot instance request..."
+    local spot_req
+    spot_req=$(aws ec2 describe-spot-instance-requests \
+        --region "$REGION" \
+        --filters "Name=instance-id,Values=$INSTANCE_ID" \
+        --query 'SpotInstanceRequests[0].SpotInstanceRequestId' \
+        --output text 2>/dev/null || echo "None")
+    if [[ -n "$spot_req" && "$spot_req" != "None" ]]; then
+        aws ec2 cancel-spot-instance-requests \
+            --spot-instance-request-ids "$spot_req" \
+            --region "$REGION" >/dev/null 2>&1 || true
+        dim "Cancelled spot request: $spot_req"
+    fi
 
     # Terminate instance
     info "Terminating instance $INSTANCE_ID..."
@@ -701,6 +966,15 @@ case "${1:-help}" in
     status)
         cmd_status
         ;;
+    db-dump)
+        cmd_db_dump
+        ;;
+    db-sync)
+        cmd_db_sync
+        ;;
+    db-shell)
+        cmd_db_shell
+        ;;
     teardown)
         cmd_teardown
         ;;
@@ -709,7 +983,7 @@ case "${1:-help}" in
         ;;
     *)
         error "Unknown command: $1"
-        echo "Usage: $0 {deploy|run|live|preflight|ssh|logs|redeploy|latency|status|teardown}"
+        echo "Usage: $0 {deploy|run|live|preflight|ssh|logs|redeploy|latency|status|db-dump|db-sync|db-shell|teardown}"
         exit 1
         ;;
 esac
