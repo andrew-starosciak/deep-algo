@@ -5,13 +5,15 @@
 # Usage:
 #   ./scripts/aws-latency-test.sh deploy              # Build, provision EC2, deploy binary
 #   ./scripts/aws-latency-test.sh run [bot-args...]    # Run bot on remote instance
-#   ./scripts/aws-latency-test.sh live [duration]      # Live trade with $1 FOK strategy
+#   ./scripts/aws-latency-test.sh live [duration]      # Live trade + observer (all pairs)
+#   ./scripts/aws-latency-test.sh stop                 # Kill all running bot processes
 #   ./scripts/aws-latency-test.sh preflight            # Check auth, balance, markets
 #   ./scripts/aws-latency-test.sh ssh                  # SSH into instance
-#   ./scripts/aws-latency-test.sh logs                 # Tail remote logs
+#   ./scripts/aws-latency-test.sh logs [all|live|observer]  # Tail remote logs
 #   ./scripts/aws-latency-test.sh redeploy             # Rebuild and upload binary
 #   ./scripts/aws-latency-test.sh latency              # Measure latency to Polymarket endpoints
 #   ./scripts/aws-latency-test.sh status               # Show instance status
+#   ./scripts/aws-latency-test.sh db-check [interval]   # Show recent DB activity (default: 1h)
 #   ./scripts/aws-latency-test.sh db-dump              # Download a pg_dump to local machine
 #   ./scripts/aws-latency-test.sh db-sync              # Import remote dump into local Postgres
 #   ./scripts/aws-latency-test.sh db-shell             # Open psql on the remote database
@@ -264,20 +266,34 @@ cmd_deploy() {
         --query 'Vpcs[0].VpcId' \
         --output text)
 
-    SECURITY_GROUP_ID=$(aws ec2 create-security-group \
-        --group-name "$SG_NAME" \
-        --description "SSH access for algo-trade latency test" \
-        --vpc-id "$vpc_id" \
+    # Reuse existing SG or create a new one
+    SECURITY_GROUP_ID=$(aws ec2 describe-security-groups \
         --region "$REGION" \
-        --query 'GroupId' \
-        --output text)
+        --filters "Name=group-name,Values=$SG_NAME" \
+        --query 'SecurityGroups[0].GroupId' \
+        --output text 2>/dev/null)
 
+    if [[ -z "$SECURITY_GROUP_ID" || "$SECURITY_GROUP_ID" == "None" ]]; then
+        SECURITY_GROUP_ID=$(aws ec2 create-security-group \
+            --group-name "$SG_NAME" \
+            --description "SSH access for algo-trade latency test" \
+            --vpc-id "$vpc_id" \
+            --region "$REGION" \
+            --query 'GroupId' \
+            --output text)
+    fi
+
+    # Update ingress rule for current IP (remove old rules first)
+    aws ec2 revoke-security-group-ingress \
+        --group-id "$SECURITY_GROUP_ID" \
+        --protocol tcp --port 22 --cidr "0.0.0.0/0" \
+        --region "$REGION" 2>/dev/null || true
     aws ec2 authorize-security-group-ingress \
         --group-id "$SECURITY_GROUP_ID" \
         --protocol tcp \
         --port 22 \
         --cidr "${my_ip}/32" \
-        --region "$REGION" >/dev/null
+        --region "$REGION" >/dev/null 2>&1 || true
 
     dim "Security group: $SECURITY_GROUP_ID (SSH from $my_ip)"
 
@@ -440,7 +456,7 @@ SETUP_BACKUP
     remote_scp "$PROJECT_ROOT/.env" "$SSH_USER@$PUBLIC_IP:~/.env"
     remote_ssh "chmod 600 ~/.env"
     # Append DATABASE_URL if not already present
-    remote_ssh "grep -q '^DATABASE_URL=' ~/.env || echo 'DATABASE_URL=${REMOTE_DATABASE_URL}' >> ~/.env"
+    remote_ssh "sed -i '/^DATABASE_URL=/d' ~/.env && echo 'DATABASE_URL=${REMOTE_DATABASE_URL}' >> ~/.env"
 
     # Step 12: Quick connectivity test
     info "Testing Polymarket API connectivity from $REGION..."
@@ -524,17 +540,23 @@ cmd_live() {
     local duration="${1:-30m}"
 
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}        ${WHITE}Live Trading — ${REGION} (${PUBLIC_IP})${NC}                      ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}        ${WHITE}Live Trading + Observer — ${REGION} (${PUBLIC_IP})${NC}              ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
+    echo -e "  ${WHITE}Live bot:${NC}"
     echo -e "  ${DIM}Pair:${NC}       BTC/ETH"
     echo -e "  ${DIM}Combo:${NC}      coin1down_coin2up"
     echo -e "  ${DIM}Bet size:${NC}   \$1 per leg (FOK)"
     echo -e "  ${DIM}Max/window:${NC} \$10 / 10 trades"
     echo -e "  ${DIM}Duration:${NC}   ${duration}"
     echo ""
+    echo -e "  ${WHITE}Observer:${NC}"
+    echo -e "  ${DIM}Mode:${NC}       observe (all pairs, all combos)"
+    echo -e "  ${DIM}Persists:${NC}   ALL opportunities to DB"
+    echo -e "  ${DIM}Duration:${NC}   ${duration}"
+    echo ""
 
-    local args=(
+    local live_args=(
         --pair btc,eth
         --combination coin1down_coin2up
         --mode live
@@ -550,12 +572,75 @@ cmd_live() {
         --persist
     )
 
-    dim "algo-trade cross-market-auto ${args[*]}"
+    local observe_args=(
+        --mode observe
+        --duration "$duration"
+        --persist
+        --stats-interval-secs 30
+    )
+
+    dim "Observer: algo-trade cross-market-auto ${observe_args[*]}"
+    dim "Live:     algo-trade cross-market-auto ${live_args[*]}"
     echo ""
 
-    # Allocate a PTY so the dashboard renders correctly
+    # Start observer in background first (no PTY needed, logs to file)
+    # Use nohup + disown via bash -c so the process survives SSH disconnect
+    info "Starting observer (background)..."
+    remote_ssh "bash -c '
+        set -a && source ~/.env && set +a
+        nohup env RUST_LOG=info ~/algo-trade cross-market-auto ${observe_args[*]} \
+            > /tmp/observer.log 2>&1 &
+        echo \$! > /tmp/observer.pid
+        disown
+        sleep 2
+        if kill -0 \$(cat /tmp/observer.pid) 2>/dev/null; then
+            echo \"Observer started (PID \$(cat /tmp/observer.pid))\"
+        else
+            echo \"ERROR: Observer failed to start\"
+            tail -5 /tmp/observer.log 2>/dev/null
+        fi
+    '"
+
+    # Start live bot in foreground with PTY for dashboard
+    info "Starting live bot (foreground)..."
+    echo ""
     ssh $SSH_OPTS -t -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" \
-        "set -a && source ~/.env && set +a && RUST_LOG=info,algo_trade_polymarket::arbitrage::sdk_client=debug,algo_trade_polymarket::arbitrage::live_executor=debug,algo_trade_polymarket::arbitrage::execution=debug ~/algo-trade cross-market-auto ${args[*]}"
+        "set -a && source ~/.env && set +a && RUST_LOG=info,algo_trade_polymarket::arbitrage::sdk_client=debug,algo_trade_polymarket::arbitrage::live_executor=debug,algo_trade_polymarket::arbitrage::execution=debug ~/algo-trade cross-market-auto ${live_args[*]}"
+
+    # When live bot exits (Ctrl+C or duration), also stop the observer
+    echo ""
+    info "Live bot exited. Stopping observer..."
+    remote_ssh "if [[ -f /tmp/observer.pid ]]; then kill \$(cat /tmp/observer.pid) 2>/dev/null && echo 'Observer stopped' || echo 'Observer already exited'; rm -f /tmp/observer.pid; fi"
+}
+
+# =============================================================================
+# stop — kill any running bot/observer processes
+# =============================================================================
+
+cmd_stop() {
+    load_state
+
+    info "Stopping all bot processes on $PUBLIC_IP..."
+
+    remote_ssh "
+        stopped=0
+        # Stop observer
+        if [[ -f /tmp/observer.pid ]]; then
+            pid=\$(cat /tmp/observer.pid)
+            if kill \$pid 2>/dev/null; then
+                echo 'Stopped observer (PID '\$pid')'
+                stopped=\$((stopped + 1))
+            fi
+            rm -f /tmp/observer.pid
+        fi
+        # Stop any remaining algo-trade processes
+        for pid in \$(pgrep -f 'algo-trade cross-market-auto' 2>/dev/null); do
+            kill \$pid 2>/dev/null && echo \"Stopped algo-trade PID \$pid\" && stopped=\$((stopped + 1))
+        done
+        if [[ \$stopped -eq 0 ]]; then
+            echo 'No running processes found'
+        fi
+    "
 }
 
 # =============================================================================
@@ -587,8 +672,23 @@ cmd_ssh() {
 
 cmd_logs() {
     load_state
-    info "Tailing logs on $PUBLIC_IP..."
-    remote_ssh "tail -f /tmp/cross_market_auto.log 2>/dev/null || echo 'No log file found. Bot may not have run yet.'"
+
+    local target="${1:-all}"
+
+    case "$target" in
+        observer)
+            info "Tailing observer logs on $PUBLIC_IP..."
+            remote_ssh "tail -f /tmp/observer.log 2>/dev/null || echo 'No observer log found.'"
+            ;;
+        live)
+            info "Tailing live bot logs on $PUBLIC_IP..."
+            remote_ssh "tail -f /tmp/cross_market_auto.log 2>/dev/null || echo 'No live bot log found.'"
+            ;;
+        all|*)
+            info "Tailing all logs on $PUBLIC_IP (Ctrl+C to stop)..."
+            remote_ssh "tail -f /tmp/cross_market_auto.log /tmp/observer.log 2>/dev/null || echo 'No log files found.'"
+            ;;
+    esac
 }
 
 # =============================================================================
@@ -622,7 +722,7 @@ cmd_redeploy() {
     # Sync .env (preserve remote DATABASE_URL)
     remote_scp "$PROJECT_ROOT/.env" "$SSH_USER@$PUBLIC_IP:~/.env"
     remote_ssh "chmod 600 ~/.env"
-    remote_ssh "grep -q '^DATABASE_URL=' ~/.env || echo 'DATABASE_URL=${REMOTE_DATABASE_URL}' >> ~/.env"
+    remote_ssh "sed -i '/^DATABASE_URL=/d' ~/.env && echo 'DATABASE_URL=${REMOTE_DATABASE_URL}' >> ~/.env"
 
     # Sync and apply any new migrations
     sync_and_migrate
@@ -758,6 +858,124 @@ cmd_status() {
 }
 
 # =============================================================================
+# db-check
+# =============================================================================
+
+cmd_db_check() {
+    load_state
+
+    local interval="${1:-1 hour}"
+
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}        ${WHITE}Database Activity — last ${interval}${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    remote_ssh "PGPASSWORD=algo_trade_local psql -h localhost -U algo -d algo_trade" <<EOSQL
+-- Row counts per table (recent activity)
+\echo '=== Row Counts ==='
+SELECT
+    relname AS table,
+    n_live_tup AS total_rows
+FROM pg_stat_user_tables
+WHERE n_live_tup > 0
+ORDER BY n_live_tup DESC;
+
+-- Recent inserts per table in the time window
+\echo ''
+\echo '=== Rows Inserted (last ${interval}) ==='
+SELECT 'window_settlements' AS table,
+       count(*) AS rows,
+       count(DISTINCT coin) AS coins,
+       min(window_start) AS earliest,
+       max(window_start) AS latest
+FROM window_settlements
+WHERE settled_at > NOW() - INTERVAL '${interval}'
+UNION ALL
+SELECT 'clob_price_snapshots',
+       count(*), count(DISTINCT coin),
+       min(timestamp), max(timestamp)
+FROM clob_price_snapshots
+WHERE timestamp > NOW() - INTERVAL '${interval}'
+UNION ALL
+SELECT 'chainlink_window_prices',
+       count(*), count(DISTINCT coin),
+       min(window_start), max(window_start)
+FROM chainlink_window_prices
+WHERE last_polled_at > NOW() - INTERVAL '${interval}'
+UNION ALL
+SELECT 'cross_market_opportunities',
+       count(*), count(DISTINCT coin1),
+       min(timestamp), max(timestamp)
+FROM cross_market_opportunities
+WHERE timestamp > NOW() - INTERVAL '${interval}'
+ORDER BY rows DESC;
+
+-- Window settlements detail
+\echo ''
+\echo '=== Window Settlements (last ${interval}) ==='
+SELECT
+    window_start,
+    coin,
+    outcome,
+    settlement_source,
+    chainlink_start_price,
+    chainlink_end_price
+FROM window_settlements
+WHERE settled_at > NOW() - INTERVAL '${interval}'
+ORDER BY window_start DESC, coin;
+
+-- Executed trades detail
+\echo ''
+\echo '=== Executed Trades (last ${interval}) ==='
+SELECT
+    timestamp AS detected_at,
+    coin1 || '/' || coin2 AS pair,
+    combination,
+    leg1_direction || ' @' || ROUND(leg1_price, 3) AS leg1,
+    leg2_direction || ' @' || ROUND(leg2_price, 3) AS leg2,
+    ROUND(total_cost, 3) AS cost,
+    ROUND(spread, 3) AS spread,
+    CASE WHEN leg1_fill_price IS NOT NULL THEN ROUND(leg1_fill_price, 3)::TEXT ELSE 'REJECTED' END AS leg1_fill,
+    CASE WHEN leg2_fill_price IS NOT NULL THEN ROUND(leg2_fill_price, 3)::TEXT ELSE 'REJECTED' END AS leg2_fill,
+    ROUND(slippage, 4) AS slip,
+    status,
+    trade_result,
+    ROUND(actual_pnl, 4) AS pnl
+FROM cross_market_opportunities
+WHERE executed = true
+  AND timestamp > NOW() - INTERVAL '${interval}'
+ORDER BY timestamp DESC;
+
+-- Settled trades summary
+\echo ''
+\echo '=== Trade Summary ==='
+SELECT
+    COUNT(*) FILTER (WHERE executed = true) AS total_trades,
+    COUNT(*) FILTER (WHERE executed = true AND leg1_fill_price IS NOT NULL AND leg2_fill_price IS NOT NULL) AS both_filled,
+    COUNT(*) FILTER (WHERE executed = true AND (leg1_fill_price IS NULL OR leg2_fill_price IS NULL)) AS partial_fills,
+    COUNT(*) FILTER (WHERE status = 'settled') AS settled,
+    COUNT(*) FILTER (WHERE trade_result = 'WIN') AS wins,
+    COUNT(*) FILTER (WHERE trade_result = 'LOSE') AS losses,
+    ROUND(SUM(actual_pnl) FILTER (WHERE status = 'settled'), 4) AS total_pnl
+FROM cross_market_opportunities
+WHERE timestamp > NOW() - INTERVAL '${interval}';
+
+-- Sessions
+\echo ''
+\echo '=== Active Sessions ==='
+SELECT
+    session_id,
+    started_at,
+    status,
+    total_opportunities
+FROM cross_market_sessions
+ORDER BY started_at DESC
+LIMIT 5;
+EOSQL
+}
+
+# =============================================================================
 # db-dump
 # =============================================================================
 
@@ -829,8 +1047,37 @@ cmd_db_sync() {
     info "Importing into local database..."
     dim "URL: $local_db_url"
 
-    # Import: drop existing data and restore
-    gunzip -c "$latest_dump" | psql "$local_db_url" 2>&1 | tail -5
+    # Extract host/port/db/user from the URL for psql commands
+    # Format: postgres://user:pass@host:port/dbname
+    local db_user db_pass db_host db_port db_name
+    db_user=$(echo "$local_db_url" | sed -n 's|.*://\([^:]*\):.*|\1|p')
+    db_pass=$(echo "$local_db_url" | sed -n 's|.*://[^:]*:\([^@]*\)@.*|\1|p')
+    db_host=$(echo "$local_db_url" | sed -n 's|.*@\([^:]*\):.*|\1|p')
+    db_port=$(echo "$local_db_url" | sed -n 's|.*:\([0-9]*\)/.*|\1|p')
+    db_name=$(echo "$local_db_url" | sed -n 's|.*/\([^?]*\).*|\1|p')
+
+    info "Dropping and recreating local database '$db_name'..."
+    PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres \
+        -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name' AND pid <> pg_backend_pid();" \
+        -c "DROP DATABASE IF EXISTS $db_name;" \
+        -c "CREATE DATABASE $db_name;" \
+        2>&1 | tail -3
+
+    # Restore: TimescaleDB requires pre_restore / post_restore for proper hypertable import
+    info "Restoring from dump..."
+    PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c "CREATE EXTENSION IF NOT EXISTS timescaledb;" 2>/dev/null
+    PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c "SELECT timescaledb_pre_restore();" 2>/dev/null
+    gunzip -c "$latest_dump" | PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" 2>&1 | grep -cE 'ERROR' | xargs -I{} echo "  {} errors during restore"
+    PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c "SELECT timescaledb_post_restore();" 2>/dev/null
+
+    # Verify
+    info "Verifying local data..."
+    PGPASSWORD="$db_pass" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$db_name" -c "
+        SELECT relname AS table, n_live_tup AS rows
+        FROM pg_stat_user_tables
+        WHERE n_live_tup > 0
+        ORDER BY n_live_tup DESC;
+    " 2>/dev/null || true
 
     info "Import complete. Local database synced from $(basename "$latest_dump")"
 }
@@ -947,6 +1194,9 @@ case "${1:-help}" in
         shift
         cmd_live "$@"
         ;;
+    stop)
+        cmd_stop
+        ;;
     preflight)
         cmd_preflight
         ;;
@@ -954,7 +1204,8 @@ case "${1:-help}" in
         cmd_ssh
         ;;
     logs)
-        cmd_logs
+        shift
+        cmd_logs "$@"
         ;;
     redeploy)
         cmd_redeploy
@@ -965,6 +1216,10 @@ case "${1:-help}" in
         ;;
     status)
         cmd_status
+        ;;
+    db-check)
+        shift
+        cmd_db_check "$@"
         ;;
     db-dump)
         cmd_db_dump
@@ -979,11 +1234,11 @@ case "${1:-help}" in
         cmd_teardown
         ;;
     help|--help|-h)
-        head -22 "$0" | tail -21
+        head -23 "$0" | tail -22
         ;;
     *)
         error "Unknown command: $1"
-        echo "Usage: $0 {deploy|run|live|preflight|ssh|logs|redeploy|latency|status|db-dump|db-sync|db-shell|teardown}"
+        echo "Usage: $0 {deploy|run|live|stop|preflight|ssh|logs|redeploy|latency|status|db-check|db-dump|db-sync|db-shell|teardown}"
         exit 1
         ;;
 esac

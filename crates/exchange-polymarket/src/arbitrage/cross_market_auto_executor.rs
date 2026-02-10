@@ -1087,61 +1087,66 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 last_chainlink_poll = std::time::Instant::now();
             }
 
-            // Persist CLOB snapshots and Chainlink window prices periodically
+            // Persist CLOB snapshots, Chainlink window prices, and window settlements periodically
             if last_price_persist.elapsed() >= price_persist_interval {
                 self.persist_clob_snapshots().await;
                 self.persist_chainlink_windows().await;
+                self.record_window_settlements().await;
                 last_price_persist = std::time::Instant::now();
             }
 
-            // Always check settlement if interval has passed (before waiting for opportunities)
-            if last_settlement_check.elapsed() >= settlement_check_interval {
-                debug!("Running periodic settlement check...");
+            // Settlement, early exit, and auto-redeem: skip entirely in observe mode.
+            // Observe mode only collects data — no API calls for settlement/execution.
+            if !self.config.observe_mode {
+                // Check settlement if interval has passed (before waiting for opportunities)
+                if last_settlement_check.elapsed() >= settlement_check_interval {
+                    debug!("Running periodic settlement check...");
 
-                // Settle DB trades (handles partial fills + orphans from any session)
-                self.settle_db_trades().await;
+                    // Settle DB trades (handles partial fills + orphans from any session)
+                    self.settle_db_trades().await;
 
-                // Settle in-memory pending trades (paired trades from current session)
-                if let Err(e) = self.check_pending_settlements().await {
-                    warn!(error = %e, "Settlement check error");
-                }
-
-                // Try early exit on profitable positions (before window closes)
-                if self.config.early_exit_enabled {
-                    if let Err(e) = self.try_early_exit().await {
-                        debug!(error = %e, "Early exit check error (non-fatal)");
+                    // Settle in-memory pending trades (paired trades from current session)
+                    if let Err(e) = self.check_pending_settlements().await {
+                        warn!(error = %e, "Settlement check error");
                     }
+
+                    // Try early exit on profitable positions (before window closes)
+                    if self.config.early_exit_enabled {
+                        if let Err(e) = self.try_early_exit().await {
+                            debug!(error = %e, "Early exit check error (non-fatal)");
+                        }
+                    }
+
+                    // Sync pending display with actual settlement state (shares, early exits)
+                    self.sync_pending_display().await;
+
+                    last_settlement_check = std::time::Instant::now();
                 }
 
-                // Sync pending display with actual settlement state (shares, early exits)
-                self.sync_pending_display().await;
-
-                last_settlement_check = std::time::Instant::now();
-            }
-
-            // Auto-redeem: check for redeemable positions every 60 seconds
-            {
-                let should_check = match self.last_redeem_check {
-                    None => true,
-                    Some(last) => last.elapsed() >= std::time::Duration::from_secs(60),
-                };
-                if should_check {
-                    match self.executor.redeem_resolved_positions().await {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
-                            // Refresh USDC balance after redemption and derive P&L
-                            if let Ok(bal) = self.executor.get_balance().await {
-                                let mut stats = self.stats.write().await;
-                                stats.live_balance = Some(bal);
-                                if let Some(initial) = self.initial_balance {
-                                    stats.realized_pnl = bal - initial;
+                // Auto-redeem: check for redeemable positions every 60 seconds
+                {
+                    let should_check = match self.last_redeem_check {
+                        None => true,
+                        Some(last) => last.elapsed() >= std::time::Duration::from_secs(60),
+                    };
+                    if should_check {
+                        match self.executor.redeem_resolved_positions().await {
+                            Ok(0) => {}
+                            Ok(n) => {
+                                info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
+                                // Refresh USDC balance after redemption and derive P&L
+                                if let Ok(bal) = self.executor.get_balance().await {
+                                    let mut stats = self.stats.write().await;
+                                    stats.live_balance = Some(bal);
+                                    if let Some(initial) = self.initial_balance {
+                                        stats.realized_pnl = bal - initial;
+                                    }
                                 }
                             }
+                            Err(e) => debug!(error = %e, "Auto-redeem check failed (non-fatal)"),
                         }
-                        Err(e) => debug!(error = %e, "Auto-redeem check failed (non-fatal)"),
+                        self.last_redeem_check = Some(std::time::Instant::now());
                     }
-                    self.last_redeem_check = Some(std::time::Instant::now());
                 }
             }
 
@@ -1166,15 +1171,18 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
-        // Final settlement check before stopping
-        info!("Running final settlement check...");
-        if let Err(e) = self.check_pending_settlements().await {
-            warn!(error = %e, "Final settlement check error");
+        // Final settlement check before stopping (skip in observe mode — no trades to settle)
+        if !self.config.observe_mode {
+            info!("Running final settlement check...");
+            if let Err(e) = self.check_pending_settlements().await {
+                warn!(error = %e, "Final settlement check error");
+            }
         }
 
         // Final persistence flush
         self.persist_clob_snapshots().await;
         self.persist_chainlink_windows().await;
+        self.record_window_settlements().await;
 
         // Update session record with final stats
         self.update_session_record().await;
@@ -1205,9 +1213,11 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             stats.opportunities_received += 1;
         }
 
-        // Observe mode: persist ALL detected opportunities before filtering
+        // Observe mode: persist the opportunity and return immediately.
+        // No filtering, no execution, no settlement — just data collection.
         if self.config.observe_mode {
             self.persist_detected_opportunity(&opp).await;
+            return Ok(());
         }
 
         // Cooldown after both legs rejected (e.g., FOK not filled due to low liquidity).
@@ -1390,13 +1400,18 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
                     // Immediately sell back the filled leg to avoid naked directional exposure.
                     // Accept a small spread loss (~2-5%) rather than holding a 50/50 bet.
-                    self.sell_back_partial_fill(
+                    let sell_back = self.sell_back_partial_fill(
                         &opp.leg1_token_id,
                         filled_size,
                         fill_price,
                         "leg1",
                     )
                     .await;
+
+                    // If sell-back succeeded, settle the DB trade immediately with actual loss
+                    if let Some((_recovered, loss)) = sell_back {
+                        self.settle_partial_fill_in_db(&opp, loss).await;
+                    }
                 }
                 CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
                     stats.partial_fills += 1;
@@ -1410,13 +1425,18 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     drop(stats); // Release lock before sell-back
 
                     // Immediately sell back the filled leg to avoid naked directional exposure.
-                    self.sell_back_partial_fill(
+                    let sell_back = self.sell_back_partial_fill(
                         &opp.leg2_token_id,
                         filled_size,
                         fill_price,
                         "leg2",
                     )
                     .await;
+
+                    // If sell-back succeeded, settle the DB trade immediately with actual loss
+                    if let Some((_recovered, loss)) = sell_back {
+                        self.settle_partial_fill_in_db(&opp, loss).await;
+                    }
                 }
                 CrossMarketExecutionResult::BothRejected { .. } => {
                     stats.both_rejected += 1;
@@ -2461,13 +2481,15 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     /// bet (50/50 with no edge). Instead of trying to recover the missing leg (which usually
     /// fails as the book has moved), we sell the filled leg back immediately. This accepts
     /// a small known spread loss (~2-5%) rather than risking a 50% chance of total loss.
+    ///
+    /// Returns `Some((recovered, loss))` if sell-back filled, `None` if all retries failed.
     async fn sell_back_partial_fill(
         &self,
         token_id: &str,
         filled_size: Decimal,
         fill_price: Decimal,
         leg_label: &str,
-    ) {
+    ) -> Option<(Decimal, Decimal)> {
         // Sell at 3% below fill price to ensure it fills quickly via FAK
         let sell_price = ((fill_price * dec!(0.97)) * dec!(100)).floor() / dec!(100);
         let sell_price = sell_price.max(dec!(0.01));
@@ -2480,7 +2502,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 sell_value = %sell_value,
                 "Sell-back value below $1 minimum — accepting small directional exposure"
             );
-            return;
+            return None;
         }
 
         let sell_order = OrderParams {
@@ -2546,7 +2568,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                             ),
                         )
                         .await;
-                        return;
+                        return Some((recovered, loss));
                     }
                     warn!(
                         leg = leg_label,
@@ -2571,7 +2593,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         error = %e,
                         "Sell-back failed — directional exposure remains"
                     );
-                    return;
+                    return None;
                 }
             }
         }
@@ -2580,6 +2602,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             leg = leg_label,
             "Sell-back exhausted all retries — directional exposure remains"
         );
+        None
     }
 
     /// Updates latency statistics.
@@ -2815,6 +2838,59 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
     }
 
+    /// Immediately settles a partial fill in the DB after a successful sell-back.
+    /// This prevents `settle_db_trades` from re-settling with incorrect PnL.
+    async fn settle_partial_fill_in_db(
+        &self,
+        opp: &CrossMarketOpportunity,
+        loss: Decimal,
+    ) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        // The actual PnL is the negative of the sell-back loss (we lost money on the spread)
+        let pnl = -loss;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE cross_market_opportunities
+            SET status = 'settled',
+                trade_result = 'LOSE',
+                actual_pnl = $1,
+                settled_at = NOW()
+            WHERE session_id = $2
+              AND timestamp = $3
+              AND status = 'pending'
+            "#,
+        )
+        .bind(pnl)
+        .bind(&self.session_id)
+        .bind(opp.detected_at)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(r) if r.rows_affected() > 0 => {
+                info!(
+                    pair = %format!("{}/{}", opp.coin1, opp.coin2),
+                    pnl = %pnl,
+                    "Partial fill settled in DB (sell-back completed)"
+                );
+                let mut stats = self.stats.write().await;
+                stats.realized_pnl += pnl;
+                stats.settled_losses += 1;
+            }
+            Ok(_) => {
+                debug!("Partial fill DB update matched no rows (may not have been persisted yet)");
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to settle partial fill in DB");
+            }
+        }
+    }
+
     // =========================================================================
     // Database Lifecycle Methods (startup, periodic, shutdown)
     // =========================================================================
@@ -2991,23 +3067,21 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
                 // Calculate PnL differently for partial fills vs full paired trades
                 let (trade_result, pnl) = if is_partial {
-                    // Partial fill: only the filled leg matters.
-                    // The sell-back may have failed, so the position was held to settlement.
+                    // Partial fill: only the filled leg was purchased.
+                    // The sell-back may have already recovered funds, but we don't
+                    // track that in the DB yet. Calculate worst-case: held to settlement.
                     let (filled_leg_won, fill_price) = if leg1_fill_price.is_some() {
                         (leg1_won, leg1_fill_price.unwrap_or(*leg1_price))
                     } else {
                         (leg2_won, leg2_fill_price.unwrap_or(*leg2_price))
                     };
 
-                    // Shares = total_cost / fill_price (single leg cost)
-                    let shares = if fill_price > Decimal::ZERO {
-                        *total_cost / fill_price
-                    } else {
-                        Decimal::ONE
-                    };
-                    let payout = if filled_leg_won { shares } else { Decimal::ZERO };
+                    // Cost basis is only the filled leg's price (per share), not total_cost
+                    // which includes both legs. We use 1 normalized share since the DB
+                    // doesn't store actual filled share count.
+                    let payout = if filled_leg_won { Decimal::ONE } else { Decimal::ZERO };
                     let fees = payout * self.fee_rate;
-                    let pnl = payout - fees - *total_cost;
+                    let pnl = payout - fees - fill_price;
 
                     // Partial fills are either win or lose based on the single filled leg
                     let result = if filled_leg_won { "WIN" } else { "LOSE" };
@@ -3357,6 +3431,122 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 debug!(error = %e, coin = %coin, "Failed to persist Chainlink window");
             }
         }
+    }
+
+    /// Records settlement outcomes for all closed windows (traded or not).
+    ///
+    /// Runs periodically alongside CLOB/Chainlink persistence. For each closed
+    /// window from the Chainlink tracker, tries Gamma API first (authoritative),
+    /// falls back to Chainlink price comparison. Inserts with ON CONFLICT DO NOTHING
+    /// so already-recorded windows are skipped.
+    async fn record_window_settlements(&self) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        // Collect closed windows from Chainlink tracker
+        let closed_windows: Vec<_> = {
+            let tracker = self.chainlink_tracker.read().await;
+            tracker
+                .get_all_windows()
+                .into_iter()
+                .filter(|(_, _, record)| record.closed)
+                .collect()
+        };
+
+        if closed_windows.is_empty() {
+            return;
+        }
+
+        for (coin_str, window_start_ts, record) in &closed_windows {
+            let window_start = match DateTime::from_timestamp(*window_start_ts, 0) {
+                Some(dt) => dt,
+                None => continue,
+            };
+            let window_end = window_start + chrono::Duration::seconds(900);
+
+            // Only use Gamma API (official Polymarket resolution).
+            // If Gamma doesn't have the result yet, skip — we'll retry in 30s.
+            let (outcome, slug, cond_id) =
+                match self.try_gamma_settlement_info(coin_str, window_end).await {
+                    Some(info) => info,
+                    None => continue,
+                };
+
+            let result = sqlx::query(
+                r#"
+                INSERT INTO window_settlements
+                    (window_start, coin, window_end, outcome, settlement_source,
+                     gamma_slug, condition_id,
+                     chainlink_start_price, chainlink_end_price,
+                     settled_at, session_id)
+                VALUES ($1, $2, $3, $4, 'gamma', $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (window_start, coin) DO NOTHING
+                "#,
+            )
+            .bind(window_start)
+            .bind(coin_str)
+            .bind(window_end)
+            .bind(&outcome)
+            .bind(&slug)
+            .bind(&cond_id)
+            .bind(record.start_price)
+            .bind(record.latest_price)
+            .bind(Utc::now())
+            .bind(&self.session_id)
+            .execute(pool)
+            .await;
+
+            match result {
+                Ok(r) if r.rows_affected() > 0 => {
+                    info!(
+                        coin = %coin_str,
+                        window_start = %window_start,
+                        outcome = %outcome,
+                        "Recorded window settlement (Gamma)"
+                    );
+                }
+                Err(e) => {
+                    debug!(error = %e, coin = %coin_str, "Failed to record window settlement");
+                }
+                _ => {} // Already recorded (ON CONFLICT DO NOTHING)
+            }
+        }
+    }
+
+    /// Tries to get settlement info from the Gamma API for a single coin/window.
+    ///
+    /// Returns `Some((outcome, slug, condition_id))` on success, `None` on any failure.
+    async fn try_gamma_settlement_info(
+        &self,
+        coin_str: &str,
+        window_end: DateTime<Utc>,
+    ) -> Option<(String, String, String)> {
+        let coin = Coin::from_slug(coin_str)?;
+
+        let outcome = self
+            .gamma_client
+            .get_market_outcome(coin, window_end)
+            .await
+            .ok()??;
+
+        // Generate slug and fetch condition_id
+        let window_timestamp =
+            GammaClient::calculate_window_timestamp(window_end - chrono::Duration::minutes(15));
+        let slug = GammaClient::generate_event_slug(coin, window_timestamp);
+
+        // Try to get condition_id from the event
+        let condition_id = self
+            .gamma_client
+            .get_15min_event(coin, window_end)
+            .await
+            .ok()
+            .and_then(|event| event.markets.into_iter().next())
+            .map(|m| m.condition_id)
+            .unwrap_or_default();
+
+        Some((outcome, slug, condition_id))
     }
 
     /// Persists a detected opportunity without execution (observe mode).
