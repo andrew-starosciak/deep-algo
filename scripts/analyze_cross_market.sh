@@ -25,35 +25,70 @@ BOLD='\033[1m'
 NC='\033[0m' # No Color
 
 # ============================================================================
-# PRE-ANALYSIS: PROCESS PENDING SETTLEMENTS
+# PRE-ANALYSIS: ENRICH PENDING OPPORTUNITIES FROM WINDOW SETTLEMENTS
 # ============================================================================
 echo ""
-echo -e "${BOLD}Processing pending settlements...${NC}"
+echo -e "${BOLD}Enriching pending opportunities from window settlements...${NC}"
 
-# Count pending before
+# Count pending and settled before enrichment
 PENDING_BEFORE=$(psql "$DATABASE_URL" -t -c "
     SELECT COUNT(*) FROM cross_market_opportunities
     WHERE status = 'pending'
     AND window_end < NOW() - INTERVAL '2 minutes';
 ")
 
+SETTLED_BEFORE=$(psql "$DATABASE_URL" -t -c "
+    SELECT COUNT(*) FROM cross_market_opportunities WHERE status = 'settled';
+")
+
 if [ "$PENDING_BEFORE" -gt 0 ]; then
-    echo "  Found ${PENDING_BEFORE} opportunities ready for settlement"
-    echo "  Running settlement processor..."
+    echo "  Found ${PENDING_BEFORE} pending opportunities ready for enrichment"
+    echo "  Deriving outcomes from window_settlements (Gamma/Chainlink)..."
 
-    # Run settlement for 60 seconds max (enough to process batch), suppress logs
-    timeout 60 cargo run --release -p algo-trade-cli -- cross-market-settle --duration-mins 1 >/dev/null 2>&1 || true
+    # Enrich pending opportunities by joining with window_settlements.
+    # For each opportunity, look up the actual outcome of each coin in its 15-min window.
+    # PnL: winning leg = (1 - price) * 0.98 (2% fee on profit), losing leg = -price
+    psql "$DATABASE_URL" -q -c "
+        UPDATE cross_market_opportunities AS opp
+        SET
+            coin1_outcome = ws1.outcome,
+            coin2_outcome = ws2.outcome,
+            trade_result = CASE
+                WHEN opp.leg1_direction = ws1.outcome AND opp.leg2_direction = ws2.outcome THEN 'DOUBLE_WIN'
+                WHEN opp.leg1_direction = ws1.outcome OR opp.leg2_direction = ws2.outcome THEN 'WIN'
+                ELSE 'LOSE'
+            END,
+            actual_pnl = (CASE WHEN opp.leg1_direction = ws1.outcome
+                THEN (1.0 - opp.leg1_price) * 0.98
+                ELSE -opp.leg1_price END)
+            + (CASE WHEN opp.leg2_direction = ws2.outcome
+                THEN (1.0 - opp.leg2_price) * 0.98
+                ELSE -opp.leg2_price END),
+            correlation_correct = (ws1.outcome = ws2.outcome),
+            status = 'settled',
+            settled_at = NOW()
+        FROM window_settlements ws1, window_settlements ws2
+        WHERE opp.status = 'pending'
+            AND opp.window_end IS NOT NULL
+            AND opp.window_end < NOW() - INTERVAL '2 minutes'
+            AND ws1.window_end = opp.window_end AND ws1.coin = opp.coin1
+            AND ws2.window_end = opp.window_end AND ws2.coin = opp.coin2;
+    " 2>/dev/null || true
 
-    # Count how many were settled
-    PENDING_AFTER=$(psql "$DATABASE_URL" -t -c "
-        SELECT COUNT(*) FROM cross_market_opportunities
-        WHERE status = 'pending'
-        AND window_end < NOW() - INTERVAL '2 minutes';
+    SETTLED_AFTER=$(psql "$DATABASE_URL" -t -c "
+        SELECT COUNT(*) FROM cross_market_opportunities WHERE status = 'settled';
     ")
-    SETTLED_COUNT=$((PENDING_BEFORE - PENDING_AFTER))
-    echo -e "  ${GREEN}✓ Settled ${SETTLED_COUNT} opportunities${NC}"
+    ENRICHED_COUNT=$((SETTLED_AFTER - SETTLED_BEFORE))
+    STILL_PENDING=$(psql "$DATABASE_URL" -t -c "
+        SELECT COUNT(*) FROM cross_market_opportunities
+        WHERE status = 'pending' AND window_end < NOW() - INTERVAL '2 minutes';
+    ")
+    echo -e "  ${GREEN}Enriched ${ENRICHED_COUNT} opportunities from window settlements${NC}"
+    if [ "$STILL_PENDING" -gt 0 ]; then
+        echo -e "  ${YELLOW}${STILL_PENDING} still pending (no matching window settlement data)${NC}"
+    fi
 else
-    echo -e "  ${GREEN}✓ No pending settlements to process${NC}"
+    echo -e "  ${GREEN}No pending opportunities to enrich${NC}"
 fi
 
 echo ""

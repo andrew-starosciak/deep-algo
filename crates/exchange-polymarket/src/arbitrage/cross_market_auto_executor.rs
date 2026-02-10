@@ -166,6 +166,15 @@ pub struct CrossMarketAutoExecutorConfig {
     /// Observe mode: persist ALL detected opportunities (even filtered ones) and
     /// record CLOB snapshots every scan interval. Default: false.
     pub observe_mode: bool,
+
+    /// Pairs to exclude from trading (e.g., ETH/SOL).
+    /// Checked after pair filter — allows "all pairs except these".
+    pub exclude_pairs: Vec<(Coin, Coin)>,
+
+    /// Fixed number of shares per leg (overrides Kelly/bet-size share calculation).
+    /// When set, each leg uses exactly this many shares regardless of price.
+    /// Must be >= 5 (Polymarket minimum for sell-back on partial fills).
+    pub fixed_shares_per_leg: Option<Decimal>,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -192,6 +201,8 @@ impl Default for CrossMarketAutoExecutorConfig {
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 5,
             observe_mode: false,
+            exclude_pairs: vec![],
+            fixed_shares_per_leg: None,
         }
     }
 }
@@ -222,6 +233,8 @@ impl CrossMarketAutoExecutorConfig {
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 5,
             observe_mode: false,
+            exclude_pairs: vec![],
+            fixed_shares_per_leg: None,
         }
     }
 
@@ -252,6 +265,8 @@ impl CrossMarketAutoExecutorConfig {
             divergence_exit_threshold: Decimal::ZERO,
             max_trades_per_window: 10,
             observe_mode: false,
+            exclude_pairs: vec![],
+            fixed_shares_per_leg: None,
         }
     }
 
@@ -827,6 +842,10 @@ pub struct CrossMarketWindowTracker {
 
     /// Number of positions this window.
     pub position_count: u32,
+
+    /// Pairs already traded this window (normalized as sorted coin pair strings).
+    /// Prevents duplicate entries for the same pair within a single window.
+    pub traded_pairs: std::collections::HashSet<(String, String)>,
 }
 
 impl CrossMarketWindowTracker {
@@ -837,6 +856,7 @@ impl CrossMarketWindowTracker {
             window_start_ms,
             total_cost: Decimal::ZERO,
             position_count: 0,
+            traded_pairs: std::collections::HashSet::new(),
         }
     }
 
@@ -850,6 +870,7 @@ impl CrossMarketWindowTracker {
     pub fn clear(&mut self) {
         self.total_cost = Decimal::ZERO;
         self.position_count = 0;
+        self.traded_pairs.clear();
     }
 
     /// Returns remaining capacity for this window.
@@ -1280,6 +1301,22 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 self.stats.write().await.opportunities_skipped += 1;
                 return Ok(());
             }
+
+            // Per-pair-per-window dedup: only one trade per coin pair per window.
+            // Normalize pair key so BTC/ETH and ETH/BTC map to the same entry.
+            let pair_key = {
+                let (a, b) = (opp.coin1.to_uppercase(), opp.coin2.to_uppercase());
+                if a <= b { (a, b) } else { (b, a) }
+            };
+            if pos.traded_pairs.contains(&pair_key) {
+                trace!(
+                    pair = format!("{}/{}", opp.coin1, opp.coin2),
+                    "Skipping — pair already traded this window"
+                );
+                drop(pos);
+                self.stats.write().await.opportunities_skipped += 1;
+                return Ok(());
+            }
         }
 
         // Calculate bet size using effective balance (USDC + redeemable positions)
@@ -1308,13 +1345,15 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         };
 
-        // Calculate shares (same for both legs)
-        // shares = bet_per_leg / leg_price
-        // For simplicity, use the average leg price
-        // Floor at 5 shares — Polymarket's minimum order size. Without this,
-        // partial-fill sell-backs get rejected and we're stuck holding naked exposure.
-        let avg_leg_price = opp.total_cost / dec!(2);
-        let shares = (bet_per_leg / avg_leg_price).max(dec!(5));
+        // Calculate shares (same for both legs).
+        // Fixed shares mode: use exact count (must be >= 5 for sell-back).
+        // Otherwise: derive from bet_per_leg / avg_leg_price, floored at 5.
+        let shares = if let Some(fixed_shares) = self.config.fixed_shares_per_leg {
+            fixed_shares
+        } else {
+            let avg_leg_price = opp.total_cost / dec!(2);
+            (bet_per_leg / avg_leg_price).max(dec!(5))
+        };
 
         // Estimate actual USDC cost for both legs
         let estimated_cost = shares * opp.leg1_price + shares * opp.leg2_price;
@@ -1361,6 +1400,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         // otherwise the bot retries endlessly within the same window.
         {
             let mut pos = self.position.write().await;
+
+            // Mark this pair as traded for per-pair-per-window dedup.
+            let pair_key = {
+                let (a, b) = (opp.coin1.to_uppercase(), opp.coin2.to_uppercase());
+                if a <= b { (a, b) } else { (b, a) }
+            };
+            pos.traded_pairs.insert(pair_key);
+
             match &result {
                 CrossMarketExecutionResult::Success { total_cost, .. } => {
                     pos.record_position(*total_cost);
@@ -2124,6 +2171,23 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 }
             } else {
                 return false;
+            }
+        }
+
+        // Check exclude pairs
+        if !self.config.exclude_pairs.is_empty() {
+            let opp_coin1 = Self::parse_coin(&opp.coin1);
+            let opp_coin2 = Self::parse_coin(&opp.coin2);
+            if let (Some(oc1), Some(oc2)) = (opp_coin1, opp_coin2) {
+                for (ec1, ec2) in &self.config.exclude_pairs {
+                    if (oc1 == *ec1 && oc2 == *ec2) || (oc1 == *ec2 && oc2 == *ec1) {
+                        trace!(
+                            pair = format!("{}/{}", opp.coin1, opp.coin2),
+                            "Filter: pair excluded"
+                        );
+                        return false;
+                    }
+                }
             }
         }
 

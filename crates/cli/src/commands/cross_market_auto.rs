@@ -153,6 +153,15 @@ pub struct CrossMarketAutoArgs {
     /// Session ID for grouping trades.
     #[arg(long)]
     pub session_id: Option<String>,
+
+    /// Exclude a specific coin pair (e.g., "eth,sol"). Can be repeated.
+    #[arg(long)]
+    pub exclude_pair: Vec<String>,
+
+    /// Fixed shares per leg (overrides Kelly/bet-size share calculation).
+    /// Must be >= 5 (Polymarket minimum for sell-back on partial fills).
+    #[arg(long)]
+    pub shares_per_leg: Option<f64>,
 }
 
 impl CrossMarketAutoArgs {
@@ -165,6 +174,9 @@ impl CrossMarketAutoArgs {
     }
 
     pub fn parse_pair(&self) -> Option<(Coin, Coin)> {
+        if self.pair.to_lowercase() == "all" {
+            return None;
+        }
         let parts: Vec<&str> = self.pair.split(',').collect();
         if parts.len() != 2 {
             return None;
@@ -190,6 +202,20 @@ impl CrossMarketAutoArgs {
 
     pub fn paper_balance_decimal(&self) -> Decimal {
         Decimal::from_str(&format!("{:.2}", self.paper_balance)).unwrap_or_default()
+    }
+
+    pub fn parse_exclude_pairs(&self) -> Vec<(Coin, Coin)> {
+        self.exclude_pair
+            .iter()
+            .filter_map(|s| {
+                let parts: Vec<&str> = s.split(',').collect();
+                if parts.len() == 2 {
+                    Some((parse_coin(parts[0])?, parse_coin(parts[1])?))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -290,6 +316,11 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
     if let Some(max_trades) = args.max_trades_per_window {
         auto_config.max_trades_per_window = max_trades;
     }
+    auto_config.exclude_pairs = args.parse_exclude_pairs();
+    if let Some(shares) = args.shares_per_leg {
+        auto_config.fixed_shares_per_leg =
+            Some(Decimal::from_str(&format!("{:.1}", shares))?);
+    }
 
     // Create runner
     let (runner, opp_rx) = CrossMarketRunner::new(runner_config);
@@ -309,10 +340,13 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
         None => "ALL".to_string(),
     };
 
-    let bet_str = args
-        .fixed_bet_size()
-        .map(|v| format!("${}", v))
-        .unwrap_or_else(|| format!("Kelly {}%", (args.kelly_fraction * 100.0) as i32));
+    let bet_str = if let Some(shares) = args.shares_per_leg {
+        format!("{} shares/leg", shares as u32)
+    } else {
+        args.fixed_bet_size()
+            .map(|v| format!("${}", v))
+            .unwrap_or_else(|| format!("Kelly {}%", (args.kelly_fraction * 100.0) as i32))
+    };
 
     // Run based on mode
     match mode {

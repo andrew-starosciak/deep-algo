@@ -3,7 +3,8 @@
 # AWS Deploy - Deploy algo-trade bot to eu-west-2 (London) for Polymarket trading
 #
 # Usage:
-#   ./scripts/aws-latency-test.sh deploy              # Build, provision EC2, deploy binary
+#   ./scripts/aws-latency-test.sh deploy              # Build, provision on-demand EC2, deploy binary
+#   ./scripts/aws-latency-test.sh deploy --spot       # Same but with spot instance (cheaper, can be reclaimed)
 #   ./scripts/aws-latency-test.sh run [bot-args...]    # Run bot on remote instance
 #   ./scripts/aws-latency-test.sh live [duration]      # Live trade + observer (all pairs)
 #   ./scripts/aws-latency-test.sh stop                 # Kill all running bot processes
@@ -92,6 +93,7 @@ SECURITY_GROUP_ID=$SECURITY_GROUP_ID
 PUBLIC_IP=$PUBLIC_IP
 ALLOCATION_ID=$ALLOCATION_ID
 REGION=$REGION
+INSTANCE_MARKET=${INSTANCE_MARKET:-on-demand}
 EOF
 }
 
@@ -164,8 +166,16 @@ RUN_MIGRATIONS
 # =============================================================================
 
 cmd_deploy() {
+    # Parse deploy options: --spot for spot instance, default is on-demand
+    INSTANCE_MARKET="on-demand"
+    for arg in "$@"; do
+        case "$arg" in
+            --spot) INSTANCE_MARKET="spot" ;;
+        esac
+    done
+
     echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║${NC}        ${WHITE}AWS Latency Test - Deploy${NC}                                ${CYAN}║${NC}"
+    echo -e "${CYAN}║${NC}        ${WHITE}AWS Deploy — ${INSTANCE_MARKET}${NC}                                      ${CYAN}║${NC}"
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -297,19 +307,32 @@ cmd_deploy() {
 
     dim "Security group: $SECURITY_GROUP_ID (SSH from $my_ip)"
 
-    # Step 5: Launch spot instance
-    info "Launching $INSTANCE_TYPE spot instance in $REGION..."
-    INSTANCE_ID=$(aws ec2 run-instances \
-        --image-id "$ami_id" \
-        --instance-type "$INSTANCE_TYPE" \
-        --key-name "$KEY_NAME" \
-        --security-group-ids "$SECURITY_GROUP_ID" \
-        --region "$REGION" \
-        --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}' \
-        --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":8,"VolumeType":"gp3"}}]' \
-        --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_TAG}]" \
-        --query 'Instances[0].InstanceId' \
-        --output text)
+    # Step 5: Launch instance
+    info "Launching $INSTANCE_TYPE $INSTANCE_MARKET instance in $REGION..."
+    if [[ "$INSTANCE_MARKET" == "spot" ]]; then
+        INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$ami_id" \
+            --instance-type "$INSTANCE_TYPE" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SECURITY_GROUP_ID" \
+            --region "$REGION" \
+            --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"persistent","InstanceInterruptionBehavior":"stop"}}' \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":8,"VolumeType":"gp3"}}]' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_TAG}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+    else
+        INSTANCE_ID=$(aws ec2 run-instances \
+            --image-id "$ami_id" \
+            --instance-type "$INSTANCE_TYPE" \
+            --key-name "$KEY_NAME" \
+            --security-group-ids "$SECURITY_GROUP_ID" \
+            --region "$REGION" \
+            --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":8,"VolumeType":"gp3"}}]' \
+            --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$INSTANCE_TAG}]" \
+            --query 'Instances[0].InstanceId' \
+            --output text)
+    fi
 
     dim "Instance: $INSTANCE_ID"
 
@@ -477,7 +500,7 @@ SETUP_BACKUP
     echo -e "  ${DIM}Instance:${NC}  $INSTANCE_ID"
     echo -e "  ${DIM}Region:${NC}    $REGION"
     echo -e "  ${DIM}IP:${NC}        $PUBLIC_IP"
-    echo -e "  ${DIM}Type:${NC}      $INSTANCE_TYPE (spot)"
+    echo -e "  ${DIM}Type:${NC}      $INSTANCE_TYPE (${INSTANCE_MARKET:-on-demand})"
     echo -e "  ${DIM}Database:${NC}  algo_trade (local Postgres + TimescaleDB)"
     echo ""
     echo -e "${WHITE}Quick start:${NC}"
@@ -544,10 +567,10 @@ cmd_live() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${WHITE}Live bot:${NC}"
-    echo -e "  ${DIM}Pair:${NC}       BTC/ETH"
-    echo -e "  ${DIM}Combo:${NC}      coin1down_coin2up"
-    echo -e "  ${DIM}Bet size:${NC}   \$1 per leg (FOK)"
-    echo -e "  ${DIM}Max/window:${NC} \$10 / 10 trades"
+    echo -e "  ${DIM}Pairs:${NC}      BTC/ETH + BTC/XRP (excl ETH/SOL)"
+    echo -e "  ${DIM}Combo:${NC}      coin1up_coin2down"
+    echo -e "  ${DIM}Shares:${NC}     5 per leg (~\$2-4 per pair)"
+    echo -e "  ${DIM}Max/window:${NC} \$20 / 2 trades"
     echo -e "  ${DIM}Duration:${NC}   ${duration}"
     echo ""
     echo -e "  ${WHITE}Observer:${NC}"
@@ -557,17 +580,20 @@ cmd_live() {
     echo ""
 
     local live_args=(
-        --pair btc,eth
-        --combination coin1down_coin2up
+        --pair all
+        --exclude-pair eth,sol
+        --combination coin1up_coin2down
         --mode live
         --duration "$duration"
-        --bet-size 1
-        --min-spread 0.20
-        --min-win-prob 0.85
+        --shares-per-leg 5
+        --min-spread 0.10
+        --min-win-prob 0.70
         --max-loss-prob 0.50
-        --max-position 10
-        --max-trades-per-window 10
+        --max-position 20
+        --max-trades-per-window 2
         --kelly-fraction 0.25
+        --entry-start-mins 12
+        --entry-end-mins 3
         --stats-interval-secs 1
         --persist
     )
@@ -715,6 +741,12 @@ cmd_redeploy() {
     local binary_size
     binary_size=$(du -h "$binary" | cut -f1)
     info "Binary built ($binary_size), uploading to $PUBLIC_IP..."
+
+    # Stop any running processes first — Linux holds file handles on running
+    # binaries, so scp will fail with "dest open: Failure" if the old binary
+    # is still executing.
+    info "Stopping any running bot processes before upload..."
+    remote_ssh "pkill -f algo-trade 2>/dev/null; sleep 1; rm -f /tmp/observer.pid" || true
 
     remote_scp "$binary" "$SSH_USER@$PUBLIC_IP:~/algo-trade"
     remote_ssh "chmod +x ~/algo-trade"
@@ -1119,19 +1151,36 @@ cmd_teardown() {
     fi
     echo ""
 
-    # Cancel spot instance request (persistent spot will relaunch otherwise)
-    info "Cancelling spot instance request..."
-    local spot_req
-    spot_req=$(aws ec2 describe-spot-instance-requests \
-        --region "$REGION" \
-        --filters "Name=instance-id,Values=$INSTANCE_ID" \
-        --query 'SpotInstanceRequests[0].SpotInstanceRequestId' \
-        --output text 2>/dev/null || echo "None")
-    if [[ -n "$spot_req" && "$spot_req" != "None" ]]; then
-        aws ec2 cancel-spot-instance-requests \
-            --spot-instance-request-ids "$spot_req" \
-            --region "$REGION" >/dev/null 2>&1 || true
-        dim "Cancelled spot request: $spot_req"
+    # Cancel spot instance request if applicable (persistent spot will relaunch otherwise)
+    if [[ "${INSTANCE_MARKET:-on-demand}" == "spot" ]]; then
+        info "Cancelling spot instance request..."
+        local spot_req
+        spot_req=$(aws ec2 describe-spot-instance-requests \
+            --region "$REGION" \
+            --filters "Name=instance-id,Values=$INSTANCE_ID" \
+            --query 'SpotInstanceRequests[0].SpotInstanceRequestId' \
+            --output text 2>/dev/null || echo "None")
+        if [[ -n "$spot_req" && "$spot_req" != "None" ]]; then
+            aws ec2 cancel-spot-instance-requests \
+                --spot-instance-request-ids "$spot_req" \
+                --region "$REGION" >/dev/null 2>&1 || true
+            dim "Cancelled spot request: $spot_req"
+        fi
+    else
+        # Safety: check for spot request even on on-demand (in case state file is stale)
+        local spot_req
+        spot_req=$(aws ec2 describe-spot-instance-requests \
+            --region "$REGION" \
+            --filters "Name=instance-id,Values=$INSTANCE_ID" \
+            --query 'SpotInstanceRequests[0].SpotInstanceRequestId' \
+            --output text 2>/dev/null || echo "None")
+        if [[ -n "$spot_req" && "$spot_req" != "None" ]]; then
+            info "Found lingering spot request, cancelling..."
+            aws ec2 cancel-spot-instance-requests \
+                --spot-instance-request-ids "$spot_req" \
+                --region "$REGION" >/dev/null 2>&1 || true
+            dim "Cancelled spot request: $spot_req"
+        fi
     fi
 
     # Terminate instance
