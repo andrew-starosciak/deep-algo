@@ -772,24 +772,26 @@ async fn print_dashboard(
     }
     println!("{clear_line}");
 
-    // ── Holdings (positions we're currently holding) ──
-    if !auto.pending_trades.is_empty() {
+    // ── Partition positions into active (window open) and settling (window closed) ──
+    let now = chrono::Utc::now();
+    let (active, settling): (Vec<&PendingTradeDisplay>, Vec<&PendingTradeDisplay>) =
+        auto.pending_trades.iter().partition(|p| p.window_end > now);
+
+    // ── Holdings (active positions with live P&L) ──
+    if !active.is_empty() {
         let mut total_cost = Decimal::ZERO;
         let mut total_value = Decimal::ZERO;
-        let mut total_proceeds = Decimal::ZERO;
 
         println!("{clear_line}  {bold}Holdings{reset}");
         println!("{clear_line}    {dim}Pair        Leg1    Now     Shares   Leg2    Now     Shares   Cost    Value   P&L     Timer{reset}");
-        for p in auto.pending_trades.iter().take(5) {
-            let remaining_secs = (p.window_end - chrono::Utc::now()).num_seconds().max(0);
+        for p in active.iter().take(5) {
+            let remaining_secs = (p.window_end - now).num_seconds().max(0);
             let status = if p.partially_exited {
                 format!("{magenta}exiting{reset}")
-            } else if remaining_secs > 0 {
+            } else {
                 let mins = remaining_secs / 60;
                 let secs = remaining_secs % 60;
                 format!("{yellow}{mins}:{secs:02}{reset}")
-            } else {
-                format!("{green}settle{reset}")
             };
 
             let l1_dir_char = p.leg1_dir.chars().next().unwrap_or('-');
@@ -799,7 +801,6 @@ async fn print_dashboard(
             let c1_prices = runner.current_prices.get(p.coin1.as_str());
             let c2_prices = runner.current_prices.get(p.coin2.as_str());
 
-            // Get current price for each leg based on direction
             let leg1_now = c1_prices.map(|(up, down)| {
                 if p.leg1_dir == "UP" { *up } else { *down }
             });
@@ -807,18 +808,15 @@ async fn print_dashboard(
                 if p.leg2_dir == "UP" { *up } else { *down }
             });
 
-            // Calculate current value = shares * current_price for each leg
             let leg1_val = leg1_now.map(|px| p.shares_leg1 * px).unwrap_or(Decimal::ZERO);
             let leg2_val = leg2_now.map(|px| p.shares_leg2 * px).unwrap_or(Decimal::ZERO);
             let current_value = leg1_val + leg2_val + p.early_exit_proceeds;
 
-            // Cost = entry * shares for each leg
             let cost = p.entry_price_leg1 * p.shares_leg1 + p.entry_price_leg2 * p.shares_leg2;
             let pnl = current_value - cost;
 
             total_cost += cost;
             total_value += current_value;
-            total_proceeds += p.early_exit_proceeds;
 
             let pnl_c = if pnl > Decimal::ZERO { green } else if pnl < Decimal::ZERO { red } else { reset };
             let l1_now_str = leg1_now.map(|p| format!("{:.2}", p)).unwrap_or_else(|| "  - ".to_string());
@@ -831,16 +829,71 @@ async fn print_dashboard(
                 cost, current_value, pnl,
             );
         }
-        if auto.pending_trades.len() > 5 {
-            println!("{clear_line}    {dim}... and {} more{reset}", auto.pending_trades.len() - 5);
+        if active.len() > 5 {
+            println!("{clear_line}    {dim}... and {} more{reset}", active.len() - 5);
         }
 
-        // Totals row
         let total_pnl = total_value - total_cost;
         let total_pnl_c = if total_pnl > Decimal::ZERO { green } else if total_pnl < Decimal::ZERO { red } else { reset };
         println!("{clear_line}    {dim}─────────────────────────────────────────────────────────────────────────────────{reset}");
         println!("{clear_line}    {bold}Total{reset}                                                     ${:<5.2}  ${:<5.2}  {total_pnl_c}{bold}{:+.2}{reset}",
             total_cost, total_value, total_pnl);
+        println!("{clear_line}");
+    }
+
+    // ── Pending Settlement (window closed, awaiting Gamma resolution) ──
+    if !settling.is_empty() {
+        println!("{clear_line}  {bold}Pending Settlement{reset}");
+        println!("{clear_line}    {dim}Pair        Leg1    Leg2    Cost    Predicted   Status{reset}");
+        for p in settling.iter().take(5) {
+            let l1_dir_char = p.leg1_dir.chars().next().unwrap_or('-');
+            let l2_dir_char = p.leg2_dir.chars().next().unwrap_or('-');
+            let cost = p.entry_price_leg1 * p.shares_leg1 + p.entry_price_leg2 * p.shares_leg2;
+
+            let has_both = p.predicted_leg1_outcome.is_some() && p.predicted_leg2_outcome.is_some();
+
+            let (predicted_str, status_str) = if has_both {
+                let l1_outcome = p.predicted_leg1_outcome.as_deref().unwrap_or("");
+                let l2_outcome = p.predicted_leg2_outcome.as_deref().unwrap_or("");
+
+                // Win if our direction matches the outcome (case-insensitive)
+                let l1_won = p.leg1_dir.eq_ignore_ascii_case(l1_outcome);
+                let l2_won = p.leg2_dir.eq_ignore_ascii_case(l2_outcome);
+
+                // Predicted value: winning leg = $1/share, losing leg = $0
+                let l1_val = if l1_won { p.shares_leg1 } else { Decimal::ZERO };
+                let l2_val = if l2_won { p.shares_leg2 } else { Decimal::ZERO };
+                let predicted_value = l1_val + l2_val + p.early_exit_proceeds;
+                let predicted_pnl = predicted_value - cost;
+
+                let pnl_c = if predicted_pnl > Decimal::ZERO { green } else if predicted_pnl < Decimal::ZERO { red } else { reset };
+                // Pad the raw value before wrapping in ANSI codes to avoid width miscalculation
+                let pred = format!("{pnl_c}{:<11}{reset}", format!("{:+.2}", predicted_pnl));
+
+                // Status: color-coded per leg
+                let l1_c = if l1_won { green } else { red };
+                let l2_c = if l2_won { green } else { red };
+                let status = format!("{l1_c}L1:{l1_outcome}{reset} {l2_c}L2:{l2_outcome}{reset}");
+
+                (pred, status)
+            } else {
+                // Still waiting for Gamma outcomes
+                let elapsed_secs = (now - p.window_end).num_seconds().max(0);
+                let elapsed_mins = elapsed_secs / 60;
+                let elapsed_s = elapsed_secs % 60;
+                let waiting = format!("{yellow}{:<11}{reset}", "waiting");
+                let elapsed = format!("{dim}+{elapsed_mins}:{elapsed_s:02}{reset}");
+                (waiting, elapsed)
+            };
+
+            println!(
+                "{clear_line}    {:<10}  {l1_dir_char}@{:.2}  {l2_dir_char}@{:.2}  ${:<5.2}  {} {}",
+                p.pair, p.entry_price_leg1, p.entry_price_leg2, cost, predicted_str, status_str,
+            );
+        }
+        if settling.len() > 5 {
+            println!("{clear_line}    {dim}... and {} more{reset}", settling.len() - 5);
+        }
         println!("{clear_line}");
     }
 

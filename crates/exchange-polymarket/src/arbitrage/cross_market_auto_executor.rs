@@ -549,6 +549,10 @@ pub struct PendingTradeDisplay {
     pub early_exit_proceeds: Decimal,
     /// Whether any early exit sells have occurred.
     pub partially_exited: bool,
+    /// Predicted Gamma outcome for coin 1 (e.g., "UP" or "DOWN").
+    pub predicted_leg1_outcome: Option<String>,
+    /// Predicted Gamma outcome for coin 2 (e.g., "UP" or "DOWN").
+    pub predicted_leg2_outcome: Option<String>,
 }
 
 /// Key event entry for the dashboard event log.
@@ -616,6 +620,12 @@ pub struct PendingPaperSettlement {
     /// Last early exit attempt time (for cooldown after failures).
     #[serde(default)]
     pub last_exit_attempt: Option<DateTime<Utc>>,
+    /// Cached Gamma outcome for coin 1 (display-only, e.g., "UP" or "DOWN").
+    #[serde(default)]
+    pub predicted_leg1_outcome: Option<String>,
+    /// Cached Gamma outcome for coin 2 (display-only, e.g., "UP" or "DOWN").
+    #[serde(default)]
+    pub predicted_leg2_outcome: Option<String>,
 }
 
 // =============================================================================
@@ -1095,6 +1105,10 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let mut last_price_persist = std::time::Instant::now();
         let price_persist_interval = std::time::Duration::from_secs(30);
 
+        // Track last Gamma display poll (every 15 seconds)
+        let mut last_gamma_display_poll = std::time::Instant::now();
+        let gamma_display_poll_interval = std::time::Duration::from_secs(15);
+
         loop {
             if self.should_stop.load(Ordering::SeqCst) {
                 info!("CrossMarketAutoExecutor stopping");
@@ -1114,6 +1128,13 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 self.persist_chainlink_windows().await;
                 self.record_window_settlements().await;
                 last_price_persist = std::time::Instant::now();
+            }
+
+            // Poll Gamma for display-only predicted outcomes (all modes including observe)
+            if last_gamma_display_poll.elapsed() >= gamma_display_poll_interval {
+                self.poll_gamma_for_display().await;
+                self.sync_pending_display().await;
+                last_gamma_display_poll = std::time::Instant::now();
             }
 
             // Settlement, early exit, and auto-redeem: skip entirely in observe mode.
@@ -2018,6 +2039,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 early_exit_proceeds: Decimal::ZERO,
                 partially_exited: false,
                 last_exit_attempt: None,
+                predicted_leg1_outcome: None,
+                predicted_leg2_outcome: None,
             };
 
             {
@@ -2714,8 +2737,95 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 entry_price_leg2: s.leg2_entry_price,
                 early_exit_proceeds: s.early_exit_proceeds,
                 partially_exited: s.partially_exited,
+                predicted_leg1_outcome: s.predicted_leg1_outcome.clone(),
+                predicted_leg2_outcome: s.predicted_leg2_outcome.clone(),
             })
             .collect();
+    }
+
+    /// Polls Gamma API for display-only predicted outcomes on settled positions.
+    ///
+    /// For each pending settlement past `window_end` that doesn't have cached outcomes,
+    /// fetches the market outcome from Gamma. Results are cached so we only poll once
+    /// per coin per settlement. Errors are silently ignored (display-only feature).
+    ///
+    /// Uses a read-then-fetch-then-write pattern to avoid holding the write lock
+    /// during HTTP calls (which would block settlement checks).
+    async fn poll_gamma_for_display(&self) {
+        let now = Utc::now();
+
+        // Phase 1: Read lock — collect positions that need polling
+        let to_poll: Vec<(String, String, String, DateTime<Utc>)> = {
+            let pending = self.pending_settlements.read().await;
+            pending
+                .iter()
+                .filter(|s| s.window_end <= now)
+                .filter(|s| {
+                    s.predicted_leg1_outcome.is_none() || s.predicted_leg2_outcome.is_none()
+                })
+                .map(|s| {
+                    (
+                        s.trade_id.clone(),
+                        s.coin1.clone(),
+                        s.coin2.clone(),
+                        s.window_end,
+                    )
+                })
+                .collect()
+        }; // read lock dropped
+
+        if to_poll.is_empty() {
+            return;
+        }
+
+        // Phase 2: No lock — fetch outcomes from Gamma API
+        let mut results: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+        for (trade_id, coin1, coin2, window_end) in &to_poll {
+            let leg1 = if let Some(coin) = Coin::from_slug(coin1) {
+                self.gamma_client
+                    .get_market_outcome(coin, *window_end)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            let leg2 = if let Some(coin) = Coin::from_slug(coin2) {
+                self.gamma_client
+                    .get_market_outcome(coin, *window_end)
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
+
+            if leg1.is_some() || leg2.is_some() {
+                results.push((trade_id.clone(), leg1, leg2));
+            }
+        }
+
+        if results.is_empty() {
+            return;
+        }
+
+        // Phase 3: Write lock — apply results
+        let mut pending = self.pending_settlements.write().await;
+        for (trade_id, leg1, leg2) in results {
+            if let Some(settlement) = pending.iter_mut().find(|s| s.trade_id == trade_id) {
+                if let Some(outcome) = leg1 {
+                    if settlement.predicted_leg1_outcome.is_none() {
+                        settlement.predicted_leg1_outcome = Some(outcome);
+                    }
+                }
+                if let Some(outcome) = leg2 {
+                    if settlement.predicted_leg2_outcome.is_none() {
+                        settlement.predicted_leg2_outcome = Some(outcome);
+                    }
+                }
+            }
+        }
     }
 
     /// Records a trade in history.
@@ -3066,6 +3176,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 early_exit_proceeds: Decimal::ZERO,
                 partially_exited: false,
                 last_exit_attempt: None,
+                predicted_leg1_outcome: None,
+                predicted_leg2_outcome: None,
             };
 
             // Try Gamma API first (most reliable — official Polymarket resolution).
@@ -3715,6 +3827,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             early_exit_proceeds: Decimal::ZERO,
             partially_exited: false,
             last_exit_attempt: None,
+            predicted_leg1_outcome: None,
+            predicted_leg2_outcome: None,
         };
 
         let mut pending = self.pending_settlements.write().await;
@@ -3739,6 +3853,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             entry_price_leg2: opp.leg2_price,
             early_exit_proceeds: Decimal::ZERO,
             partially_exited: false,
+            predicted_leg1_outcome: None,
+            predicted_leg2_outcome: None,
         });
     }
 
