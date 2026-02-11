@@ -10,9 +10,9 @@ use commands::{
     BackfillSignalsArgs, BinaryBacktestArgs, CalculateReturnsArgs, CheckDepthArgs,
     CollectPolymarketArgs, CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs,
     CrossMarketBacktestArgs, CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
-    EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs, LatencyMonitorArgs,
-    Phase1ArbitrageArgs, PolymarketPaperTradeArgs, PreflightArgs, RedeemPositionsArgs,
-    ValidateSignalsArgs,
+    DirectionalAutoArgs, EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs,
+    LatencyMonitorArgs, Phase1ArbitrageArgs, PolymarketPaperTradeArgs, PreflightArgs,
+    RedeemPositionsArgs, ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -162,6 +162,8 @@ enum Commands {
     ApproveAllowances(ApproveAllowancesArgs),
     /// Redeem winning positions from resolved Polymarket markets
     RedeemPositions(RedeemPositionsArgs),
+    /// Run automated single-leg directional trading (spot confirmation)
+    DirectionalAuto(DirectionalAutoArgs),
 }
 
 #[tokio::main]
@@ -198,6 +200,23 @@ async fn main() -> anyhow::Result<()> {
             // Dashboard mode - redirect logs to file to prevent screen corruption
             let log_path = std::env::var("CROSS_MARKET_LOG")
                 .unwrap_or_else(|_| "/tmp/cross_market_auto.log".to_string());
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        Commands::DirectionalAuto(args) if !args.verbose => {
+            // Dashboard mode - redirect logs to file to prevent screen corruption
+            let log_path = std::env::var("DIRECTIONAL_LOG")
+                .unwrap_or_else(|_| "/tmp/directional_auto.log".to_string());
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -337,6 +356,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::RedeemPositions(args) => {
             commands::run_redeem_positions(args).await?;
+        }
+        Commands::DirectionalAuto(args) => {
+            commands::run_directional_auto(args).await?;
         }
     }
 

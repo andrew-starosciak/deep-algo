@@ -67,6 +67,11 @@
 pub mod approvals;
 pub mod auto_executor;
 pub mod book_feed;
+
+// Single-leg directional trading
+pub mod directional_detector;
+pub mod directional_executor;
+pub mod directional_runner;
 pub mod circuit_breaker;
 pub mod clob_auth;
 pub mod correlation_tracker;
@@ -236,4 +241,14 @@ pub use cross_market_auto_executor::{
     CrossMarketAutoExecutorStats, CrossMarketExecutionResult, CrossMarketKellySizer,
     CrossMarketTradeRecord, CrossMarketWindowTracker, EventKind, EventLogEntry, FilledLeg,
     IncompleteTrade, PendingTradeDisplay, RecentTradeDisplay,
+};
+
+// Single-leg directional trading
+pub use directional_detector::{Direction, DirectionalConfig, DirectionalDetector, DirectionalSignal};
+pub use directional_executor::{
+    DirectionalExecutor, DirectionalExecutorConfig, DirectionalExecutorError,
+    DirectionalExecutorStats, DirectionalTradeRecord,
+};
+pub use directional_runner::{
+    DirectionalRunner, DirectionalRunnerConfig, DirectionalRunnerError, DirectionalRunnerStats,
 };
