@@ -635,7 +635,7 @@ impl SignalGenerator for CompositeSignal {
         self.apply_multicollinearity_adjustment(&mut signals, &generator_names);
 
         // Combine based on method
-        let combined = match self.method {
+        let mut combined = match self.method {
             CombinationMethod::WeightedAverage => self.combine_weighted_average(&signals),
             CombinationMethod::Voting => self.combine_voting(&signals),
             CombinationMethod::Strongest => self.combine_strongest(&signals),
@@ -644,6 +644,25 @@ impl SignalGenerator for CompositeSignal {
                 self.combine_require_n(&signals, min_agree)
             }
         };
+
+        // Enrich with per-generator metadata for factor analysis
+        for (i, (weight, signal)) in signals.iter().enumerate() {
+            let name = &generator_names[i];
+            let dir_value = match signal.direction {
+                Direction::Up => 1.0,
+                Direction::Down => -1.0,
+                Direction::Neutral => 0.0,
+            };
+            combined
+                .metadata
+                .insert(format!("{name}_direction"), dir_value);
+            combined
+                .metadata
+                .insert(format!("{name}_strength"), signal.strength);
+            combined
+                .metadata
+                .insert(format!("{name}_weight"), *weight);
+        }
 
         Ok(combined)
     }
