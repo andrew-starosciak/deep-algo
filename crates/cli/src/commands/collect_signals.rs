@@ -65,6 +65,17 @@ pub struct CollectSignalsArgs {
     #[arg(long, default_value = "btcusdt")]
     pub symbol: String,
 
+    /// Coins for multi-coin data collection (comma-separated, e.g., "btc,eth,sol,xrp").
+    /// When set, overrides --symbol for raw data collectors.
+    #[arg(long, default_value = "btc,eth,sol,xrp")]
+    pub coins: String,
+
+    /// Enable composite signal computation and persistence.
+    /// Spawns a SignalAggregator (7-signal composite) per coin and writes
+    /// signal snapshots to the database every 15 seconds.
+    #[arg(long)]
+    pub signals: bool,
+
     /// Database connection URL (uses DATABASE_URL env var if not provided)
     #[arg(long, env = "DATABASE_URL")]
     pub db_url: Option<String>,
@@ -296,11 +307,17 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
     // Parse arguments
     let duration = parse_duration(&args.duration)?;
     let sources = parse_sources(&args.sources)?;
+    let coins: Vec<algo_trade_polymarket::models::Coin> = args
+        .coins
+        .split(',')
+        .filter_map(|s| algo_trade_polymarket::models::Coin::from_slug(s.trim()))
+        .collect();
 
     tracing::info!(
-        "Starting signal collection for {:?} duration with sources: {:?}",
+        "Starting signal collection for {:?} duration with sources: {:?}, coins: {:?}",
         duration,
-        sources.iter().map(|s| s.as_str()).collect::<Vec<_>>()
+        sources.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+        coins.iter().map(|c| c.slug_prefix()).collect::<Vec<_>>(),
     );
 
     // Get database URL
@@ -532,11 +549,57 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
         }
     }
 
+    // Spawn signal aggregator + snapshot writer (if --signals)
+    if args.signals {
+        use algo_trade_polymarket::arbitrage::signal_aggregator::{
+            SharedSignalMap, SignalAggregator, SignalAggregatorConfig,
+        };
+        use algo_trade_polymarket::arbitrage::data_service::SignalSnapshotWriter;
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
+
+        if coins.is_empty() {
+            tracing::warn!("--signals enabled but no valid coins parsed from --coins");
+        } else {
+            let signal_map: SharedSignalMap = Arc::new(RwLock::new(HashMap::new()));
+            let signal_stop = shutdown.clone();
+
+            // Spawn signal aggregator
+            let aggregator_config = SignalAggregatorConfig::default();
+            let aggregator = SignalAggregator::with_config(
+                coins.clone(),
+                Arc::clone(&signal_map),
+                Arc::clone(&signal_stop),
+                aggregator_config,
+            );
+            handles.push(tokio::spawn(async move {
+                aggregator.run().await;
+            }));
+            tracing::info!(
+                coins = ?coins.iter().map(|c| c.slug_prefix()).collect::<Vec<_>>(),
+                "Spawned signal aggregator (7-signal composite)"
+            );
+
+            // Spawn signal snapshot writer (persists every 15s)
+            let writer = SignalSnapshotWriter::new(
+                pool.clone(),
+                Arc::clone(&signal_map),
+                coins.clone(),
+                Duration::from_secs(15),
+                shutdown.clone(),
+            );
+            handles.push(tokio::spawn(async move {
+                writer.run().await;
+            }));
+            tracing::info!("Spawned signal snapshot writer (15s interval)");
+        }
+    }
+
     // Spawn health logger
     let health_clone = health_stats.clone();
     let shutdown_health = shutdown.clone();
     handles.push(tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(300)); // Every 5 minutes
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
             if shutdown_health.load(Ordering::Relaxed) {
@@ -686,11 +749,13 @@ async fn run_database_writer<T, R>(
                 batch.push(record);
 
                 if batch.len() >= BATCH_SIZE {
+                    let count = batch.len();
                     if let Err(e) = repo.insert_batch(&batch).await {
                         tracing::error!("Failed to insert {} batch: {}", source.as_str(), e);
                         let mut stats = health_stats.lock().await;
                         stats.record_error(source);
                     } else {
+                        tracing::info!("Wrote {} {} records", count, source.as_str());
                         let mut stats = health_stats.lock().await;
                         for _ in &batch {
                             stats.record_success(source);
@@ -715,11 +780,13 @@ async fn run_database_writer<T, R>(
 
                 // Periodic flush
                 if !batch.is_empty() {
+                    let count = batch.len();
                     if let Err(e) = repo.insert_batch(&batch).await {
                         tracing::error!("Failed to flush {} batch: {}", source.as_str(), e);
                         let mut stats = health_stats.lock().await;
                         stats.record_error(source);
                     } else {
+                        tracing::info!("Flushed {} {} records", count, source.as_str());
                         let mut stats = health_stats.lock().await;
                         for _ in &batch {
                             stats.record_success(source);
@@ -1003,6 +1070,8 @@ mod tests {
             duration: "24h".to_string(),
             sources: "orderbook,funding,liquidations,polymarket,news".to_string(),
             symbol: "btcusdt".to_string(),
+            coins: "btc,eth,sol,xrp".to_string(),
+            signals: false,
             db_url: None,
             news_api_key: None,
         };

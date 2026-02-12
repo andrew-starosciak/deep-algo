@@ -68,10 +68,15 @@ pub mod approvals;
 pub mod auto_executor;
 pub mod book_feed;
 
+// Unified data collection service
+pub mod data_service;
+pub mod raw_data_writer;
+
 // Single-leg directional trading
 pub mod directional_detector;
 pub mod directional_executor;
 pub mod directional_runner;
+pub mod signal_aggregator;
 pub mod circuit_breaker;
 pub mod clob_auth;
 pub mod correlation_tracker;
@@ -241,6 +246,11 @@ pub use cross_market_auto_executor::{
     CrossMarketAutoExecutorStats, CrossMarketExecutionResult, CrossMarketKellySizer,
     CrossMarketTradeRecord, CrossMarketWindowTracker, EventKind, EventLogEntry, FilledLeg,
     IncompleteTrade, PendingTradeDisplay, RecentTradeDisplay,
+};
+
+// Unified data collection service
+pub use data_service::{
+    signal_to_snapshot, DataService, DataServiceConfig, DataServiceHandle, SignalSnapshotWriter,
 };
 
 // Single-leg directional trading

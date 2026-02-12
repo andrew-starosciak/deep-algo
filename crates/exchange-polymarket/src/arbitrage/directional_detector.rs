@@ -15,6 +15,7 @@
 //!
 //! At $0.45/share with 55% win rate → +$0.089 EV/share.
 
+use algo_trade_core::{Direction as CoreDirection, SignalValue};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -164,6 +165,7 @@ impl DirectionalDetector {
     /// * `no_token_id` - NO token ID
     /// * `time_remaining_secs` - Seconds until window closes
     /// * `timestamp_ms` - Current timestamp in milliseconds
+    /// * `external_signal` - Optional composite signal from SignalAggregator
     #[allow(clippy::too_many_arguments)]
     pub fn check(
         &mut self,
@@ -176,6 +178,7 @@ impl DirectionalDetector {
         no_token_id: &str,
         time_remaining_secs: i64,
         timestamp_ms: i64,
+        external_signal: Option<&SignalValue>,
     ) -> Option<DirectionalSignal> {
         // Check cooldown
         if let Some(last) = self.last_signal_ms {
@@ -215,8 +218,21 @@ impl DirectionalDetector {
             return None;
         }
 
-        // Calculate confidence: scales linearly with delta up to max_delta_pct
-        let confidence = (delta_pct.abs() / self.config.max_delta_pct).min(1.0);
+        // Calculate confidence: blend delta with external signal
+        let delta_confidence = (delta_pct.abs() / self.config.max_delta_pct).min(1.0);
+        let confidence = if let Some(signal) = external_signal {
+            let agrees = directions_match(&direction, &signal.direction);
+            if agrees {
+                // Delta (60%) + signal strength (40%)
+                0.60 * delta_confidence + 0.40 * signal.strength
+            } else {
+                // Signal disagrees: halve confidence
+                delta_confidence * 0.50
+            }
+        } else {
+            // Fallback: delta only (backward compatible)
+            delta_confidence
+        };
 
         // Win probability: 50% + (confidence * 30%) → range [50%, 80%]
         let win_probability = 0.50 + (confidence * 0.30);
@@ -250,6 +266,14 @@ impl DirectionalDetector {
             timestamp,
         })
     }
+}
+
+/// Checks if a directional `Direction` matches a core `CoreDirection`.
+fn directions_match(dir: &Direction, core_dir: &CoreDirection) -> bool {
+    matches!(
+        (dir, core_dir),
+        (Direction::Up, CoreDirection::Up) | (Direction::Down, CoreDirection::Down)
+    )
 }
 
 #[cfg(test)]
@@ -305,6 +329,7 @@ mod tests {
             "no-token",
             300, // 5 min remaining (within entry window)
             make_time(10, 0),
+            None,
         );
 
         assert!(signal.is_some());
@@ -338,6 +363,7 @@ mod tests {
             "no-token",
             300,
             make_time(10, 0),
+            None,
         );
 
         assert!(signal.is_some());
@@ -367,6 +393,7 @@ mod tests {
             "no-token",
             300,
             make_time(10, 0),
+            None,
         );
 
         assert!(signal.is_none());
@@ -390,6 +417,7 @@ mod tests {
             "no-token",
             300,
             make_time(10, 0),
+            None,
         );
 
         assert!(signal.is_none());
@@ -413,6 +441,7 @@ mod tests {
             "no-token",
             300,
             make_time(10, 0),
+            None,
         );
 
         assert!(signal.is_none());
@@ -433,6 +462,7 @@ mod tests {
             "no-token",
             800, // Too early
             make_time(3, 20),
+            None,
         );
 
         assert!(signal.is_none());
@@ -453,6 +483,7 @@ mod tests {
             "no-token",
             60, // Too late
             make_time(14, 0),
+            None,
         );
 
         assert!(signal.is_none());
@@ -474,7 +505,7 @@ mod tests {
             "btc", 79_000.0, 78_500.0,
             dec!(0.45), dec!(0.55),
             "yes-token", "no-token",
-            300, make_time(10, 0),
+            300, make_time(10, 0), None,
         );
         assert!(signal1.is_some());
 
@@ -483,7 +514,7 @@ mod tests {
             "btc", 79_000.0, 78_500.0,
             dec!(0.45), dec!(0.55),
             "yes-token", "no-token",
-            295, make_time(10, 5),
+            295, make_time(10, 5), None,
         );
         assert!(signal2.is_none());
     }
@@ -500,7 +531,7 @@ mod tests {
             "btc", 79_000.0, 78_500.0,
             dec!(0.45), dec!(0.55),
             "yes-token", "no-token",
-            300, make_time(10, 0),
+            300, make_time(10, 0), None,
         );
         assert!(signal1.is_some());
 
@@ -509,7 +540,7 @@ mod tests {
             "btc", 79_000.0, 78_500.0,
             dec!(0.45), dec!(0.55),
             "yes-token", "no-token",
-            290, make_time(10, 10),
+            290, make_time(10, 10), None,
         );
         assert!(signal2.is_some());
     }
@@ -526,7 +557,7 @@ mod tests {
             "btc", 79_000.0, 78_500.0,
             dec!(0.45), dec!(0.55),
             "yes-token", "no-token",
-            300, make_time(10, 0),
+            300, make_time(10, 0), None,
         );
         assert!(signal1.is_some());
 
@@ -537,7 +568,7 @@ mod tests {
             "btc", 79_000.0, 78_500.0,
             dec!(0.45), dec!(0.55),
             "yes-token", "no-token",
-            299, make_time(10, 1),
+            299, make_time(10, 1), None,
         );
         assert!(signal2.is_some());
     }
@@ -555,7 +586,7 @@ mod tests {
             "btc", 78_578.5, 78_500.0, // +0.1%
             dec!(0.40), dec!(0.60),
             "yes-token", "no-token",
-            300, make_time(10, 0),
+            300, make_time(10, 0), None,
         );
         assert!(signal.is_some());
         let s = signal.unwrap();
@@ -577,7 +608,7 @@ mod tests {
             "btc", 82_425.0, 78_500.0, // +5%
             dec!(0.30), dec!(0.70),
             "yes-token", "no-token",
-            300, make_time(10, 0),
+            300, make_time(10, 0), None,
         );
         assert!(signal.is_some());
         let s = signal.unwrap();
@@ -602,19 +633,109 @@ mod tests {
             "btc", 79_000.0, 78_500.0,
             dec!(0.45), dec!(0.55),
             "btc-yes", "btc-no",
-            300, make_time(10, 0),
+            300, make_time(10, 0), None,
         );
 
         let eth_signal = eth_detector.check(
             "eth", 2_050.0, 2_000.0,
             dec!(0.42), dec!(0.58),
             "eth-yes", "eth-no",
-            300, make_time(10, 0),
+            300, make_time(10, 0), None,
         );
 
         assert!(btc_signal.is_some());
         assert!(eth_signal.is_some());
         assert_eq!(btc_signal.unwrap().coin, "btc");
         assert_eq!(eth_signal.unwrap().coin, "eth");
+    }
+
+    // =========================================================================
+    // External Signal Blending Tests
+    // =========================================================================
+
+    #[test]
+    fn test_external_signal_agreeing_boosts_confidence() {
+        let config = DirectionalConfig {
+            signal_cooldown_ms: 0,
+            ..DirectionalConfig::default()
+        };
+        let mut detector = DirectionalDetector::new(config);
+
+        // Without external signal
+        let signal_without = detector.check(
+            "btc", 79_000.0, 78_500.0,
+            dec!(0.45), dec!(0.55),
+            "yes-token", "no-token",
+            300, make_time(10, 0), None,
+        );
+        detector.reset_cooldown();
+
+        // With agreeing external signal (Up direction, high strength)
+        let ext_signal = SignalValue {
+            direction: CoreDirection::Up,
+            strength: 0.8,
+            confidence: 0.7,
+            metadata: std::collections::HashMap::new(),
+        };
+        let signal_with = detector.check(
+            "btc", 79_000.0, 78_500.0,
+            dec!(0.45), dec!(0.55),
+            "yes-token", "no-token",
+            300, make_time(10, 1), Some(&ext_signal),
+        );
+
+        let s_without = signal_without.unwrap();
+        let s_with = signal_with.unwrap();
+
+        // Blended confidence should be higher than delta-only
+        // delta_confidence * 0.60 + signal.strength * 0.40
+        assert!(s_with.confidence > s_without.confidence);
+    }
+
+    #[test]
+    fn test_external_signal_disagreeing_halves_confidence() {
+        let config = DirectionalConfig {
+            signal_cooldown_ms: 0,
+            ..DirectionalConfig::default()
+        };
+        let mut detector = DirectionalDetector::new(config);
+
+        // Without external signal
+        let signal_without = detector.check(
+            "btc", 79_000.0, 78_500.0,
+            dec!(0.45), dec!(0.55),
+            "yes-token", "no-token",
+            300, make_time(10, 0), None,
+        );
+        detector.reset_cooldown();
+
+        // With disagreeing external signal (Down direction when delta is Up)
+        let ext_signal = SignalValue {
+            direction: CoreDirection::Down,
+            strength: 0.8,
+            confidence: 0.7,
+            metadata: std::collections::HashMap::new(),
+        };
+        let signal_with = detector.check(
+            "btc", 79_000.0, 78_500.0,
+            dec!(0.40), dec!(0.60), // Lower entry to still pass edge check
+            "yes-token", "no-token",
+            300, make_time(10, 1), Some(&ext_signal),
+        );
+
+        let s_without = signal_without.unwrap();
+        let s_with = signal_with.unwrap();
+
+        // Halved confidence should be lower
+        assert!(s_with.confidence < s_without.confidence);
+    }
+
+    #[test]
+    fn test_directions_match_helper() {
+        assert!(directions_match(&Direction::Up, &CoreDirection::Up));
+        assert!(directions_match(&Direction::Down, &CoreDirection::Down));
+        assert!(!directions_match(&Direction::Up, &CoreDirection::Down));
+        assert!(!directions_match(&Direction::Down, &CoreDirection::Up));
+        assert!(!directions_match(&Direction::Up, &CoreDirection::Neutral));
     }
 }

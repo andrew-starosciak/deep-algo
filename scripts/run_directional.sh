@@ -8,7 +8,7 @@
 #   ./scripts/run_directional.sh [options]
 #
 # Options:
-#   --mode paper|live|observe  Trading mode (default: paper)
+#   --mode paper|live           Trading mode (default: paper)
 #   --duration <time>          How long to run (default: 1h)
 #   --coins <list>             Coins to trade (default: btc,eth,sol,xrp)
 #   --bet-size <amount>        Fixed bet size in USDC (default: Kelly sizing)
@@ -17,13 +17,14 @@
 #   --max-trades <n>           Max trades per 15-min window (default: 1)
 #   --kelly <fraction>         Kelly fraction 0.0-1.0 (default: 0.25)
 #   --paper-balance <amt>      Paper mode starting balance (default: 1000)
+#   --signals                  Enable Binance signal aggregation
+#   --raw-persist              Persist raw Binance data (OB/funding/liq) to DB
 #   --verbose                  Show verbose log output instead of dashboard
 #   --help                     Show this help
 #
 # Examples:
 #   ./scripts/run_directional.sh                                    # Paper, 1h, all coins
 #   ./scripts/run_directional.sh --mode live --bet-size 10          # Live, $10 bets
-#   ./scripts/run_directional.sh --mode observe --duration 4h       # Observe, 4h
 #   ./scripts/run_directional.sh --coins btc,eth --min-edge 0.05   # BTC+ETH only
 #
 
@@ -68,6 +69,10 @@ MAX_TRADES_PER_WINDOW="1"
 PAPER_BALANCE="1000"
 STATS_INTERVAL="5"
 VERBOSE=""
+PERSIST=""
+RAW_PERSIST=""
+SESSION_ID=""
+SIGNALS=""
 
 # =============================================================================
 # Parse arguments
@@ -131,6 +136,22 @@ while [[ $# -gt 0 ]]; do
             STATS_INTERVAL="$2"
             shift 2
             ;;
+        --persist)
+            PERSIST="1"
+            shift
+            ;;
+        --raw-persist)
+            RAW_PERSIST="1"
+            shift
+            ;;
+        --signals)
+            SIGNALS="1"
+            shift
+            ;;
+        --session-id)
+            SESSION_ID="$2"
+            shift 2
+            ;;
         --verbose|-v)
             VERBOSE="1"
             shift
@@ -155,12 +176,27 @@ if [[ "$MODE" == "live" && -z "${POLYMARKET_PRIVATE_KEY:-}" ]]; then
     exit 1
 fi
 
+if [[ -n "$PERSIST" && -z "${DATABASE_URL:-}" ]]; then
+    echo -e "${RED}ERROR: DATABASE_URL required for --persist${NC}"
+    exit 1
+fi
+
+# =============================================================================
+# Migrations
+# =============================================================================
+
+if [[ -n "$PERSIST" && -n "${DATABASE_URL:-}" ]]; then
+    echo -e "${DIM}Running database migrations...${NC}"
+    "$SCRIPT_DIR/migrate.sh" 2>&1 | grep -E '\[APPLY\]|\[SKIP\]|Error' || true
+    echo ""
+fi
+
 # =============================================================================
 # Build
 # =============================================================================
 
 CARGO_PROFILE=""
-if [[ "$MODE" == "live" || "$MODE" == "observe" ]]; then
+if [[ "$MODE" == "live" ]]; then
     CARGO_PROFILE="--release"
     echo -e "${DIM}Building release binary...${NC}"
     if ! cargo build -p algo-trade-cli --release 2>&1 | tail -3; then
@@ -193,6 +229,10 @@ CMD+=(--stats-interval-secs "$STATS_INTERVAL")
 [[ -n "$BET_SIZE" ]] && CMD+=(--bet-size "$BET_SIZE")
 [[ "$MODE" == "paper" ]] && CMD+=(--paper-balance "$PAPER_BALANCE")
 [[ -n "$VERBOSE" ]] && CMD+=(--verbose)
+[[ -n "$PERSIST" ]] && CMD+=(--persist)
+[[ -n "$RAW_PERSIST" ]] && CMD+=(--raw-persist)
+[[ -n "$SIGNALS" ]] && CMD+=(--signals)
+[[ -n "$SESSION_ID" ]] && CMD+=(--session-id "$SESSION_ID")
 
 # =============================================================================
 # Display configuration
@@ -209,8 +249,6 @@ echo -e "${WHITE}Configuration:${NC}"
 echo -e "  ${DIM}Mode:${NC}          ${MODE^^}"
 if [[ "$MODE" == "live" ]]; then
     echo -e "                 ${RED}*** REAL FUNDS WILL BE USED ***${NC}"
-elif [[ "$MODE" == "observe" ]]; then
-    echo -e "                 ${CYAN}*** OBSERVE MODE - NO TRADING ***${NC}"
 fi
 echo -e "  ${DIM}Duration:${NC}      $DURATION"
 echo -e "  ${DIM}Coins:${NC}         ${COINS^^}"
@@ -224,6 +262,12 @@ echo -e "  ${DIM}Max Entry:${NC}     \$$MAX_ENTRY_PRICE"
 echo -e "  ${DIM}Max/Window:${NC}    \$$MAX_POSITION (${MAX_TRADES_PER_WINDOW} trades)"
 if [[ "$MODE" == "paper" ]]; then
     echo -e "  ${DIM}Paper Balance:${NC} \$$PAPER_BALANCE"
+fi
+if [[ -n "$SIGNALS" ]]; then
+    echo -e "  ${DIM}Signals:${NC}       ${GREEN}ENABLED${NC} (Binance OB/funding/liq)"
+fi
+if [[ -n "$RAW_PERSIST" ]]; then
+    echo -e "  ${DIM}Raw Persist:${NC}   ${GREEN}ENABLED${NC} (OB/funding/liq to DB)"
 fi
 echo ""
 

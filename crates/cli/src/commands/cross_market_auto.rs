@@ -14,6 +14,7 @@ use anyhow::Result;
 use clap::Args;
 use chrono::Local;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use sqlx::PgPool;
 use std::io::{stdout, Write};
 use std::str::FromStr;
@@ -96,9 +97,20 @@ pub struct CrossMarketAutoArgs {
     #[arg(long, default_value = "0.20")]
     pub min_spread: f64,
 
-    /// Slippage tolerance on buy price in dollars. Default: 0.02 ($0.02/share).
+    /// Maximum spread to accept. Wider spreads often indicate low-probability
+    /// legs that are traps. Data shows 0.08–0.12 is the profitable sweet spot.
+    /// If not set, no upper cap is applied.
+    #[arg(long)]
+    pub max_spread: Option<f64>,
+
+    /// Maximum effective total fill cost (detected prices + 2x slippage).
+    /// Caps worst-case loss when both legs lose. Default: 0.96.
+    #[arg(long, default_value = "0.96")]
+    pub max_total_fill_cost: f64,
+
+    /// Slippage tolerance on buy price in dollars. Default: 0.03 ($0.03/share).
     /// Compensates for price movement during order latency (~700ms).
-    #[arg(long, default_value = "0.02")]
+    #[arg(long, default_value = "0.03")]
     pub buy_slippage: f64,
 
     /// Minimum win probability required. Default: 0.85 (85%).
@@ -162,6 +174,25 @@ pub struct CrossMarketAutoArgs {
     /// Must be >= 5 (Polymarket minimum for sell-back on partial fills).
     #[arg(long)]
     pub shares_per_leg: Option<f64>,
+
+    /// Minimum leg price. Safety net for near-zero tokens. Default: 0.15.
+    #[arg(long, default_value = "0.15")]
+    pub min_leg_price: f64,
+
+    /// Maximum leg price ratio (0.0-1.0). Rejects symmetric ~50/50 legs which are
+    /// coin flips with big losses. E.g., 0.75 rejects pairs where both legs are
+    /// close in price. Data: ratio >= 0.80 is -$7.46, asymmetric < 0.40 is +$2.17.
+    #[arg(long)]
+    pub max_leg_ratio: Option<f64>,
+
+    /// Earliest UTC hour to trade (0-23). Wraps midnight when start > end.
+    /// E.g., --trading-start-hour-utc 12 --trading-end-hour-utc 5 = 12:00-04:59 UTC.
+    #[arg(long)]
+    pub trading_start_hour_utc: Option<u32>,
+
+    /// Latest UTC hour (exclusive) to trade (0-23).
+    #[arg(long)]
+    pub trading_end_hour_utc: Option<u32>,
 }
 
 impl CrossMarketAutoArgs {
@@ -233,6 +264,21 @@ impl CrossMarketAutoArgs {
         }
         let _ = self.parsed_duration()?;
         let _ = self.execution_mode()?;
+        if let Some(h) = self.trading_start_hour_utc {
+            if h > 23 {
+                anyhow::bail!("--trading-start-hour-utc must be 0-23, got {}", h);
+            }
+        }
+        if let Some(h) = self.trading_end_hour_utc {
+            if h > 23 {
+                anyhow::bail!("--trading-end-hour-utc must be 0-23, got {}", h);
+            }
+        }
+        if self.trading_start_hour_utc.is_some() != self.trading_end_hour_utc.is_some() {
+            anyhow::bail!(
+                "--trading-start-hour-utc and --trading-end-hour-utc must both be set or both omitted"
+            );
+        }
         Ok(())
     }
 }
@@ -302,6 +348,19 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
     auto_config.filter_combination = combination;
     auto_config.kelly_fraction = args.kelly_fraction;
     auto_config.min_spread = Decimal::from_str(&format!("{:.4}", args.min_spread))?;
+    if let Some(max_spread) = args.max_spread {
+        let max = Decimal::from_str(&format!("{:.4}", max_spread))?;
+        if max < auto_config.min_spread {
+            anyhow::bail!(
+                "max-spread ({}) must be >= min-spread ({})",
+                max,
+                auto_config.min_spread
+            );
+        }
+        auto_config.max_spread = Some(max);
+    }
+    auto_config.max_total_fill_cost =
+        Decimal::from_str(&format!("{:.4}", args.max_total_fill_cost))?;
     auto_config.min_win_probability = args.min_win_prob;
     auto_config.max_loss_prob = args.max_loss_prob;
     auto_config.buy_slippage = Decimal::from_str(&format!("{:.2}", args.buy_slippage))?;
@@ -321,6 +380,11 @@ pub async fn run(args: CrossMarketAutoArgs) -> Result<()> {
         auto_config.fixed_shares_per_leg =
             Some(Decimal::from_str(&format!("{:.1}", shares))?);
     }
+    auto_config.min_leg_price =
+        Decimal::from_str(&format!("{:.2}", args.min_leg_price)).unwrap_or(dec!(0.15));
+    auto_config.max_leg_price_ratio = args.max_leg_ratio;
+    auto_config.trading_start_hour_utc = args.trading_start_hour_utc;
+    auto_config.trading_end_hour_utc = args.trading_end_hour_utc;
 
     // Create runner
     let (runner, opp_rx) = CrossMarketRunner::new(runner_config);

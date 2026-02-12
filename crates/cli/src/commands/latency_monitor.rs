@@ -3,6 +3,7 @@
 //! This command connects to both Binance (BTC spot) and Polymarket (order books)
 //! to detect latency arbitrage opportunities in real-time.
 
+use algo_trade_polymarket::arbitrage::data_service::{DataService, DataServiceConfig};
 use algo_trade_polymarket::arbitrage::{
     LatencyConfig, LatencyDirection, LatencyRunner, LatencyRunnerConfig, LatencySignal,
 };
@@ -10,7 +11,8 @@ use algo_trade_polymarket::{Coin, GammaClient};
 use anyhow::Result;
 use clap::Args;
 use rust_decimal::Decimal;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -60,6 +62,10 @@ pub struct LatencyMonitorArgs {
     /// Show verbose output (every check, not just signals).
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Enable Binance signal aggregation (order book, funding, liquidations).
+    #[arg(long)]
+    pub signals: bool,
 }
 
 /// Runs the latency arbitrage monitor.
@@ -125,8 +131,33 @@ pub async fn run(args: LatencyMonitorArgs) -> Result<()> {
         ..Default::default()
     };
 
+    // Create DataService when --signals is enabled
+    let data_stop = Arc::new(AtomicBool::new(false));
+    let data_handle = if args.signals {
+        let data_config = DataServiceConfig {
+            coins: vec![Coin::Btc],
+            enable_signals: true,
+            signal_compute_interval: Duration::from_secs(5),
+            enable_signal_persistence: false,
+            signal_flush_interval: Duration::from_secs(15),
+            enable_raw_persistence: false,
+        };
+        let data_service = DataService::new(data_config, None, Arc::clone(&data_stop));
+        let handle = data_service.handle();
+        tokio::spawn(async move {
+            data_service.run().await;
+        });
+        info!("DataService started for shared BTC data");
+        Some(handle)
+    } else {
+        None
+    };
+
     // Create runner
-    let (runner, mut signal_rx) = LatencyRunner::new(runner_config);
+    let (runner, mut signal_rx) = match data_handle {
+        Some(handle) => LatencyRunner::with_data_service(runner_config, handle),
+        None => LatencyRunner::new(runner_config),
+    };
     let stop_handle = runner.stop_handle();
     let stats = runner.stats();
     let spot_tracker = runner.spot_tracker();
@@ -140,10 +171,12 @@ pub async fn run(args: LatencyMonitorArgs) -> Result<()> {
 
     // Set up Ctrl+C handler
     let stop_on_ctrl_c = stop_handle.clone();
+    let data_stop_ctrlc = Arc::clone(&data_stop);
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("Received Ctrl+C, stopping...");
             stop_on_ctrl_c.store(true, Ordering::SeqCst);
+            data_stop_ctrlc.store(true, Ordering::SeqCst);
         }
     });
 
@@ -210,8 +243,9 @@ pub async fn run(args: LatencyMonitorArgs) -> Result<()> {
         }
     }
 
-    // Stop runner
+    // Stop runner and data service
     stop_handle.store(true, Ordering::SeqCst);
+    data_stop.store(true, Ordering::SeqCst);
     let _ = tokio::time::timeout(Duration::from_secs(5), runner_handle).await;
 
     // Print summary

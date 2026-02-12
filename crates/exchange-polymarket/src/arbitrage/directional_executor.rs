@@ -25,13 +25,14 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 // =============================================================================
 // Errors
@@ -334,16 +335,24 @@ pub struct DirectionalExecutor<E: PolymarketExecutor> {
     should_stop: Arc<AtomicBool>,
     /// Trade counter for ID generation.
     trade_counter: u64,
+    /// Database pool for persistence (None = in-memory only).
+    db_pool: Option<PgPool>,
+    /// Session identifier for grouping trades.
+    session_id: String,
+    /// Trading mode string (paper/live/observe).
+    mode: String,
 }
 
 impl<E: PolymarketExecutor> DirectionalExecutor<E> {
-    /// Creates a new directional executor.
+    /// Creates a new directional executor (in-memory only, no persistence).
     pub fn new(executor: E, config: DirectionalExecutorConfig) -> Self {
         let sizer = KellySizer::new(
             config.kelly_fraction,
             config.min_bet_size,
             config.max_bet_size,
         );
+
+        let session_id = format!("dir-{}", Utc::now().format("%Y%m%d-%H%M%S"));
 
         Self {
             executor,
@@ -357,6 +366,44 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             runner_stats: None,
             should_stop: Arc::new(AtomicBool::new(false)),
             trade_counter: 0,
+            db_pool: None,
+            session_id,
+            mode: "paper".to_string(),
+        }
+    }
+
+    /// Creates a new directional executor with database persistence.
+    pub fn with_persistence(
+        executor: E,
+        config: DirectionalExecutorConfig,
+        db_pool: PgPool,
+        session_id: Option<String>,
+        mode: String,
+    ) -> Self {
+        let sizer = KellySizer::new(
+            config.kelly_fraction,
+            config.min_bet_size,
+            config.max_bet_size,
+        );
+
+        let session_id =
+            session_id.unwrap_or_else(|| format!("dir-{}", Utc::now().format("%Y%m%d-%H%M%S")));
+
+        Self {
+            executor,
+            config,
+            sizer,
+            window_tracker: WindowTracker::default(),
+            stats: Arc::new(RwLock::new(DirectionalExecutorStats::default())),
+            trades: VecDeque::with_capacity(100),
+            pending_settlements: Vec::new(),
+            gamma_client: GammaClient::new(),
+            runner_stats: None,
+            should_stop: Arc::new(AtomicBool::new(false)),
+            trade_counter: 0,
+            db_pool: Some(db_pool),
+            session_id,
+            mode,
         }
     }
 
@@ -401,6 +448,10 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             stats.current_balance = balance;
         }
 
+        // Database lifecycle: create session + load unsettled trades
+        self.create_session_record().await;
+        self.load_unsettled_trades().await;
+
         let mut settlement_tick =
             tokio::time::interval(Duration::from_secs(self.config.settlement_interval_secs));
         let mut dashboard_tick =
@@ -437,6 +488,9 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                 break;
             }
         }
+
+        // Database lifecycle: update session with final stats
+        self.update_session_record().await;
 
         // Final summary
         self.print_summary().await;
@@ -611,6 +665,10 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             self.window_tracker.record_trade(actual_cost);
             self.pending_settlements.push(trade.clone());
 
+            // Persist to database
+            self.persist_trade(&trade, window_start_ms + 15 * 60 * 1000)
+                .await;
+
             // Keep last 100 trades in history
             self.trades.push_back(trade);
             while self.trades.len() > 100 {
@@ -641,6 +699,8 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
 
         let now_ms = Utc::now().timestamp_millis();
         let mut settled_indices: Vec<usize> = Vec::new();
+        // Collect settlements to persist after the mutable borrow ends
+        let mut to_persist: Vec<(String, bool, Decimal)> = Vec::new();
 
         for (i, trade) in self.pending_settlements.iter_mut().enumerate() {
             // Only check trades whose window has closed (15 min = 900_000 ms)
@@ -654,96 +714,88 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                 continue;
             }
 
-            // Try to resolve via Gamma API
+            // Resolve via Gamma API using the trade's exact window
             let coin = crate::models::Coin::from_slug(&trade.coin);
             let coin = match coin {
                 Some(c) => c,
                 None => continue,
             };
 
-            match self.gamma_client.get_current_15min_market(coin).await {
-                Ok(market) => {
-                    // Check if the market for the trade's window has resolved
-                    let won = match trade.direction {
-                        Direction::Up => {
-                            market.up_token().and_then(|t| t.winner).unwrap_or(false)
-                        }
-                        Direction::Down => {
-                            market.down_token().and_then(|t| t.winner).unwrap_or(false)
-                        }
-                    };
+            let window_end_dt = match DateTime::from_timestamp_millis(window_end) {
+                Some(dt) => dt,
+                None => continue,
+            };
 
-                    // Check if resolution is available (either token has winner set)
-                    let resolved = market
-                        .up_token()
-                        .and_then(|t| t.winner)
-                        .is_some()
-                        || market
-                            .down_token()
-                            .and_then(|t| t.winner)
-                            .is_some();
-
-                    if !resolved {
-                        continue; // Not yet resolved
-                    }
-
-                    // Calculate P&L
-                    let pnl = if won {
-                        // Win: receive 1.00 per share, minus entry cost and fee
-                        let gross = (Decimal::ONE - trade.entry_price) * trade.shares;
-                        gross * (Decimal::ONE - self.config.fee_rate)
-                    } else {
-                        // Loss: lose entire cost
-                        -trade.cost
-                    };
-
-                    trade.settlement = Some(SettlementResult {
-                        won,
-                        pnl,
-                        settled_at: Utc::now(),
-                    });
-
-                    info!(
-                        trade_id = trade.trade_id,
-                        coin = trade.coin,
-                        direction = %trade.direction,
-                        won = won,
-                        pnl = %pnl,
-                        "SETTLED directional trade"
-                    );
-
-                    // Credit balance for wins
-                    if won {
-                        let winnings = trade.cost + pnl;
-                        let _ = self.executor.credit_balance(winnings).await;
-                    }
-
-                    // Update stats
-                    {
-                        let mut stats = self.stats.write().await;
-                        if won {
-                            stats.wins += 1;
-                        } else {
-                            stats.losses += 1;
-                        }
-                        stats.realized_pnl += pnl;
-                        stats.current_balance = self
-                            .executor
-                            .get_balance()
-                            .await
-                            .unwrap_or(stats.current_balance);
-                    }
-
-                    settled_indices.push(i);
-                }
+            let outcome = match self.gamma_client.get_market_outcome(coin, window_end_dt).await {
+                Ok(Some(outcome)) => outcome,
+                Ok(None) => continue, // Not yet resolved
                 Err(e) => {
                     warn!(
                         coin = trade.coin,
                         error = %e,
                         "Failed to check settlement"
                     );
+                    continue;
                 }
+            };
+
+            // Determine if we won based on resolved outcome vs our direction
+            let won = match trade.direction {
+                Direction::Up => outcome == "UP",
+                Direction::Down => outcome == "DOWN",
+            };
+
+            // Calculate P&L
+            let pnl = if won {
+                // Win: receive 1.00 per share, minus entry cost and fee
+                let gross = (Decimal::ONE - trade.entry_price) * trade.shares;
+                gross * (Decimal::ONE - self.config.fee_rate)
+            } else {
+                // Loss: lose entire cost
+                -trade.cost
+            };
+
+            trade.settlement = Some(SettlementResult {
+                won,
+                pnl,
+                settled_at: Utc::now(),
+            });
+
+            info!(
+                trade_id = trade.trade_id,
+                coin = trade.coin,
+                direction = %trade.direction,
+                outcome = %outcome,
+                won = won,
+                pnl = %pnl,
+                "SETTLED directional trade"
+            );
+
+            to_persist.push((trade.trade_id.clone(), won, pnl));
+
+            // Credit balance for wins
+            if won {
+                let winnings = trade.cost + pnl;
+                let _ = self.executor.credit_balance(winnings).await;
             }
+
+            // Update stats
+            {
+                let mut stats = self.stats.write().await;
+                if won {
+                    stats.wins += 1;
+                } else {
+                    stats.losses += 1;
+                }
+                stats.realized_pnl += pnl;
+                stats.current_balance = self
+                    .executor
+                    .get_balance()
+                    .await
+                    .unwrap_or(stats.current_balance);
+            }
+
+            settled_indices.push(i);
         }
 
         // Remove settled trades (iterate in reverse to preserve indices)
@@ -751,8 +803,266 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             self.pending_settlements.remove(i);
         }
 
+        // Persist settlements to database (after mutable borrow released)
+        for (trade_id, won, pnl) in to_persist {
+            self.persist_settlement(&trade_id, won, pnl).await;
+        }
+
         let mut stats = self.stats.write().await;
         stats.pending_settlements = self.pending_settlements.len() as u64;
+    }
+
+    // =========================================================================
+    // Database Persistence Methods
+    // =========================================================================
+
+    /// Persists a filled trade to the database.
+    async fn persist_trade(&self, trade: &DirectionalTradeRecord, window_end_ms: i64) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let window_end = DateTime::from_timestamp_millis(window_end_ms)
+            .unwrap_or_else(Utc::now);
+
+        let direction_str = match trade.direction {
+            Direction::Up => "UP",
+            Direction::Down => "DOWN",
+        };
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO directional_trades
+                (timestamp, trade_id, coin, direction, token_id,
+                 entry_price, shares, cost, estimated_edge, win_probability,
+                 delta_pct, signal_timestamp, window_end,
+                 session_id, mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            "#,
+        )
+        .bind(trade.execution_timestamp)
+        .bind(&trade.trade_id)
+        .bind(&trade.coin)
+        .bind(direction_str)
+        .bind(&trade.token_id)
+        .bind(trade.entry_price)
+        .bind(trade.shares)
+        .bind(trade.cost)
+        .bind(Decimal::from_f64_retain(trade.estimated_edge))
+        .bind(Decimal::from_f64_retain(trade.win_probability))
+        .bind(Decimal::from_f64_retain(trade.delta_pct))
+        .bind(trade.signal_timestamp)
+        .bind(window_end)
+        .bind(&self.session_id)
+        .bind(&self.mode)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(_) => {
+                debug!(
+                    trade_id = trade.trade_id,
+                    session = %self.session_id,
+                    "Trade persisted to database"
+                );
+            }
+            Err(e) => {
+                error!(error = %e, trade_id = trade.trade_id, "Failed to persist trade");
+            }
+        }
+    }
+
+    /// Updates a trade's settlement status in the database.
+    async fn persist_settlement(&self, trade_id: &str, won: bool, pnl: Decimal) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = sqlx::query(
+            r#"
+            UPDATE directional_trades
+            SET settled = TRUE,
+                won = $1,
+                pnl = $2,
+                settled_at = NOW()
+            WHERE trade_id = $3
+              AND session_id = $4
+            "#,
+        )
+        .bind(won)
+        .bind(pnl)
+        .bind(trade_id)
+        .bind(&self.session_id)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(r) if r.rows_affected() > 0 => {
+                debug!(trade_id = trade_id, won = won, pnl = %pnl, "Settlement persisted");
+            }
+            Ok(_) => {
+                warn!(trade_id = trade_id, "Settlement update matched no rows");
+            }
+            Err(e) => {
+                error!(error = %e, trade_id = trade_id, "Failed to persist settlement");
+            }
+        }
+    }
+
+    /// Creates a session record at startup.
+    async fn create_session_record(&self) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO directional_sessions
+                (session_id, started_at, mode, coins, status)
+            VALUES ($1, NOW(), $2, $3, 'active')
+            ON CONFLICT (session_id) DO NOTHING
+            "#,
+        )
+        .bind(&self.session_id)
+        .bind(&self.mode)
+        .bind(
+            &self
+                .config
+                .observe_mode
+                .then(|| "observe".to_string())
+                .unwrap_or_else(|| self.mode.clone()),
+        )
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(_) => info!(session_id = %self.session_id, "Session record created"),
+            Err(e) => warn!(error = %e, "Failed to create session record"),
+        }
+    }
+
+    /// Updates the session record with final stats at shutdown.
+    async fn update_session_record(&self) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let stats = self.stats.read().await;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE directional_sessions
+            SET ended_at = NOW(),
+                signals_received = $2,
+                orders_filled = $3,
+                wins = $4,
+                losses = $5,
+                total_pnl = $6,
+                status = 'completed'
+            WHERE session_id = $1
+            "#,
+        )
+        .bind(&self.session_id)
+        .bind(stats.signals_received as i32)
+        .bind(stats.orders_filled as i32)
+        .bind(stats.wins as i32)
+        .bind(stats.losses as i32)
+        .bind(stats.realized_pnl)
+        .execute(pool)
+        .await;
+
+        match result {
+            Ok(_) => info!(session_id = %self.session_id, "Session record updated"),
+            Err(e) => warn!(error = %e, "Failed to update session record"),
+        }
+    }
+
+    /// Loads unsettled trades from the database for restart recovery.
+    async fn load_unsettled_trades(&mut self) {
+        let pool = match &self.db_pool {
+            Some(p) => p,
+            None => return,
+        };
+
+        let rows = sqlx::query_as::<_, (
+            String,    // trade_id
+            String,    // coin
+            String,    // direction
+            String,    // token_id
+            Decimal,   // entry_price
+            Decimal,   // shares
+            Decimal,   // cost
+            Option<Decimal>, // estimated_edge
+            Option<Decimal>, // win_probability
+            Option<Decimal>, // delta_pct
+            DateTime<Utc>, // signal_timestamp
+            DateTime<Utc>, // timestamp (execution)
+        )>(
+            r#"
+            SELECT trade_id, coin, direction, token_id,
+                   entry_price, shares, cost,
+                   estimated_edge, win_probability, delta_pct,
+                   signal_timestamp, timestamp
+            FROM directional_trades
+            WHERE settled = FALSE
+            ORDER BY timestamp ASC
+            "#,
+        )
+        .fetch_all(pool)
+        .await;
+
+        match rows {
+            Ok(rows) => {
+                let count = rows.len();
+                for row in rows {
+                    let direction = match row.2.as_str() {
+                        "UP" => Direction::Up,
+                        _ => Direction::Down,
+                    };
+
+                    let trade = DirectionalTradeRecord {
+                        trade_id: row.0,
+                        coin: row.1,
+                        direction,
+                        token_id: row.3,
+                        entry_price: row.4,
+                        shares: row.5,
+                        cost: row.6,
+                        status: OrderStatus::Filled,
+                        estimated_edge: row.7
+                            .and_then(|d| d.to_string().parse::<f64>().ok())
+                            .unwrap_or(0.0),
+                        win_probability: row.8
+                            .and_then(|d| d.to_string().parse::<f64>().ok())
+                            .unwrap_or(0.5),
+                        delta_pct: row.9
+                            .and_then(|d| d.to_string().parse::<f64>().ok())
+                            .unwrap_or(0.0),
+                        signal_timestamp: row.10,
+                        execution_timestamp: row.11,
+                        settlement: None,
+                    };
+
+                    self.pending_settlements.push(trade);
+                }
+
+                if count > 0 {
+                    info!(
+                        count = count,
+                        "Loaded unsettled trades from database for recovery"
+                    );
+                    let mut stats = self.stats.write().await;
+                    stats.pending_settlements = self.pending_settlements.len() as u64;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to load unsettled trades");
+            }
+        }
     }
 
     /// Renders the live dashboard to stdout.

@@ -60,10 +60,12 @@
 //! ```
 
 use crate::arbitrage::book_feed::{BookFeed, BookFeedConfig, BookFeedError};
+use crate::arbitrage::data_service::DataServiceHandle;
 use crate::arbitrage::gabagool_detector::{
     GabagoolConfig, GabagoolDetector, GabagoolDirection, GabagoolSignal, GabagoolSignalType,
     MarketSnapshot, OpenPosition,
 };
+use crate::arbitrage::latency_detector::SpotPriceTracker;
 use crate::arbitrage::reference_tracker::{
     ReferenceTracker, ReferenceTrackerConfig, WindowReference,
 };
@@ -236,13 +238,34 @@ pub struct GabagoolRunner {
     stats: Arc<RwLock<GabagoolRunnerStats>>,
     /// Signal history for backtesting.
     history: Arc<RwLock<VecDeque<SignalRecord>>>,
+    /// External data service handle (if provided, skips creating own spot feed).
+    data_handle: Option<DataServiceHandle>,
 }
 
 impl GabagoolRunner {
-    /// Creates a new gabagool runner.
+    /// Creates a new gabagool runner with its own Binance spot feed.
     ///
     /// Returns the runner and a channel to receive signals.
     pub fn new(config: GabagoolRunnerConfig) -> (Self, mpsc::Receiver<GabagoolSignal>) {
+        Self::build(config, None)
+    }
+
+    /// Creates a new gabagool runner backed by a shared [`DataServiceHandle`].
+    ///
+    /// When a data handle is provided, the runner reads spot prices from the
+    /// shared `SpotPriceTracker` instead of spawning its own Binance feed.
+    pub fn with_data_service(
+        config: GabagoolRunnerConfig,
+        data_handle: DataServiceHandle,
+    ) -> (Self, mpsc::Receiver<GabagoolSignal>) {
+        Self::build(config, Some(data_handle))
+    }
+
+    /// Shared constructor logic.
+    fn build(
+        config: GabagoolRunnerConfig,
+        data_handle: Option<DataServiceHandle>,
+    ) -> (Self, mpsc::Receiver<GabagoolSignal>) {
         let (signal_tx, signal_rx) = mpsc::channel(config.signal_buffer_size);
 
         let state = SharedState {
@@ -261,6 +284,7 @@ impl GabagoolRunner {
             should_stop: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(GabagoolRunnerStats::default())),
             history: Arc::new(RwLock::new(VecDeque::new())),
+            data_handle,
         };
 
         (runner, signal_rx)
@@ -328,19 +352,48 @@ impl GabagoolRunner {
             stats.started_at = Some(Utc::now());
         }
 
-        // Spawn spot price feed with reference tracking
-        let state = self.state.clone();
-        let spot_config = self.config.spot_config.clone();
-        let spot_stop = self.should_stop.clone();
-        let stats_clone = self.stats.clone();
-
-        let spot_handle = tokio::spawn(async move {
-            info!("Spot feed task starting...");
-            match Self::run_spot_feed(state, spot_config, spot_stop, stats_clone).await {
-                Ok(()) => info!("Spot feed task finished normally"),
-                Err(e) => error!("Spot feed task failed: {}", e),
-            }
-        });
+        // Spawn spot price data source: either poll DataService tracker or own WebSocket
+        let spot_handle = if let Some(ref dh) = self.data_handle {
+            // Resolve the coin slug from the spot config symbol (e.g. "btcusdt" → "btc")
+            let slug = self
+                .config
+                .spot_config
+                .symbol
+                .to_lowercase()
+                .replace("usdt", "");
+            let tracker = match dh.spot_tracker(&slug) {
+                Some(t) => Arc::clone(t),
+                None => {
+                    warn!(
+                        coin = slug.as_str(),
+                        "DataService has no tracker for coin, cannot run gabagool"
+                    );
+                    return Err(GabagoolRunnerError::Config(format!(
+                        "DataService has no spot tracker for '{slug}'"
+                    )));
+                }
+            };
+            let state = self.state.clone();
+            let stop = self.should_stop.clone();
+            let stats_clone = self.stats.clone();
+            tokio::spawn(async move {
+                info!("Spot feed task starting (DataService shared tracker)...");
+                Self::run_spot_from_tracker(state, tracker, stop, stats_clone).await;
+                info!("Spot feed task finished (DataService)");
+            })
+        } else {
+            let state = self.state.clone();
+            let spot_config = self.config.spot_config.clone();
+            let spot_stop = self.should_stop.clone();
+            let stats_clone = self.stats.clone();
+            tokio::spawn(async move {
+                info!("Spot feed task starting...");
+                match Self::run_spot_feed(state, spot_config, spot_stop, stats_clone).await {
+                    Ok(()) => info!("Spot feed task finished normally"),
+                    Err(e) => error!("Spot feed task failed: {}", e),
+                }
+            })
+        };
 
         // Connect to Polymarket order books
         info!("Connecting to Polymarket order books...");
@@ -494,6 +547,59 @@ impl GabagoolRunner {
         }
 
         Ok(())
+    }
+
+    /// Polls a shared `SpotPriceTracker` (from DataService) and mirrors updates
+    /// into the runner's `SharedState`, keeping the reference tracker and stats
+    /// in sync just like the self-owned WebSocket feed does.
+    async fn run_spot_from_tracker(
+        state: Arc<RwLock<SharedState>>,
+        tracker: Arc<RwLock<SpotPriceTracker>>,
+        should_stop: Arc<AtomicBool>,
+        stats: Arc<RwLock<GabagoolRunnerStats>>,
+    ) {
+        let poll_interval = Duration::from_millis(50);
+        let mut last_seen_ts: Option<i64> = None;
+        let mut last_window_start: Option<i64> = None;
+        let mut first_logged = false;
+
+        while !should_stop.load(Ordering::SeqCst) {
+            // Read latest price from the shared tracker
+            let (price, ts_ms) = {
+                let t = tracker.read().await;
+                (t.current_price(), t.current_timestamp_ms())
+            };
+
+            if let (Some(price), Some(ts)) = (price, ts_ms) {
+                // Only update if the timestamp is new
+                if last_seen_ts != Some(ts) {
+                    last_seen_ts = Some(ts);
+
+                    if !first_logged {
+                        info!(price = format!("${:.2}", price), "First spot price from DataService tracker");
+                        first_logged = true;
+                    }
+
+                    // Mirror into SharedState (same writes as run_spot_feed)
+                    let mut s = state.write().await;
+                    s.reference_tracker.update_price(ts, price);
+                    s.spot_price = Some(price);
+                    s.last_spot_update_ms = Some(ts);
+
+                    // Detect new window
+                    if let Some(ref_) = s.reference_tracker.current_reference() {
+                        if last_window_start != Some(ref_.window_start_ms) {
+                            last_window_start = Some(ref_.window_start_ms);
+                            let mut st = stats.write().await;
+                            st.windows_processed += 1;
+                            st.current_reference_price = Some(ref_.reference_price);
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(poll_interval).await;
+        }
     }
 
     /// Main detection loop.

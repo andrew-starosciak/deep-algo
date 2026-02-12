@@ -208,8 +208,8 @@ pub fn sign_legacy_tx(
         rlp_encode_uint_bytes(&tx.value),
         rlp_encode_bytes(&tx.data),
         rlp_encode_u64(v),
-        rlp_encode_bytes(r_bytes.as_slice()),
-        rlp_encode_bytes(s_bytes.as_slice()),
+        rlp_encode_uint_bytes(r_bytes.as_slice()),
+        rlp_encode_uint_bytes(s_bytes.as_slice()),
     ]);
 
     Ok(signed_rlp)

@@ -26,7 +26,7 @@
 //!                                    └────────────────────────┘
 //! ```
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
@@ -77,6 +77,14 @@ pub enum CrossMarketAutoExecutorError {
 // Configuration
 // =============================================================================
 
+fn default_max_total_fill_cost() -> Decimal {
+    dec!(0.96)
+}
+
+fn default_min_leg_price() -> Decimal {
+    dec!(0.15)
+}
+
 /// Configuration for the cross-market auto executor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CrossMarketAutoExecutorConfig {
@@ -106,11 +114,26 @@ pub struct CrossMarketAutoExecutorConfig {
     /// Minimum spread required to execute.
     pub min_spread: Decimal,
 
+    /// Maximum spread to accept. Spreads above this tend to be traps where
+    /// both legs have low implied probabilities. Data shows 0.08–0.12 is the
+    /// profitable sweet spot; wider spreads are negative EV.
+    /// If None, no upper cap is applied.
+    #[serde(default)]
+    pub max_spread: Option<Decimal>,
+
+    /// Maximum effective total cost (detected prices + 2x slippage) to accept.
+    /// When total fill cost is high, risk/reward collapses: at cost 0.95 with 5 shares
+    /// a win nets +$0.25 but a loss costs -$4.75 (19:1 asymmetry).
+    /// Data shows effective cost >=0.97 is net negative despite high win rate.
+    /// Default: 0.96 (sweet spot: keeps profitable trades, blocks catastrophic losses).
+    #[serde(default = "default_max_total_fill_cost")]
+    pub max_total_fill_cost: Decimal,
+
     /// Slippage tolerance added to buy prices to improve fill rate.
     /// With 500-700ms latency, the book moves between detection and order arrival.
-    /// E.g., 0.02 means buy up to 2 cents above detected price.
+    /// E.g., 0.03 means buy up to 3 cents above detected price.
     /// The effective spread shrinks by 2x this value (both legs).
-    /// Default: 0.02 ($0.02 per share).
+    /// Default: 0.03 ($0.03 per share).
     pub buy_slippage: Decimal,
 
     /// Minimum win probability required to execute.
@@ -175,6 +198,28 @@ pub struct CrossMarketAutoExecutorConfig {
     /// When set, each leg uses exactly this many shares regardless of price.
     /// Must be >= 5 (Polymarket minimum for sell-back on partial fills).
     pub fixed_shares_per_leg: Option<Decimal>,
+
+    /// Minimum price for each leg. Safety net to avoid near-zero tokens.
+    /// Default: 0.15.
+    #[serde(default = "default_min_leg_price")]
+    pub min_leg_price: Decimal,
+
+    /// Maximum leg price ratio (0.0-1.0). Calculated as min(leg1, leg2) / max(leg1, leg2).
+    /// HIGH ratios mean symmetric ~50/50 legs — these are coin flips with big losses.
+    /// Data: ratio >= 0.80 is -$7.46 across 14 trades. Asymmetric < 0.40 is +$2.17.
+    /// E.g., 0.75 rejects pairs where both legs are close in price.
+    /// None = no restriction. Default: None.
+    #[serde(default)]
+    pub max_leg_price_ratio: Option<f64>,
+
+    /// Earliest UTC hour to allow trading (0-23). Wraps midnight when start > end
+    /// (e.g., start=12, end=5 means 12:00-04:59 UTC). None = no restriction.
+    #[serde(default)]
+    pub trading_start_hour_utc: Option<u32>,
+
+    /// Latest UTC hour (exclusive) to allow trading (0-23). None = no restriction.
+    #[serde(default)]
+    pub trading_end_hour_utc: Option<u32>,
 }
 
 impl Default for CrossMarketAutoExecutorConfig {
@@ -188,7 +233,9 @@ impl Default for CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.02),
+            max_spread: None,
+            max_total_fill_cost: dec!(0.96),
+            buy_slippage: dec!(0.03),
             min_win_probability: 0.80,
             max_history: 1000,
             early_exit_enabled: false,
@@ -203,6 +250,10 @@ impl Default for CrossMarketAutoExecutorConfig {
             observe_mode: false,
             exclude_pairs: vec![],
             fixed_shares_per_leg: None,
+            min_leg_price: default_min_leg_price(),
+            max_leg_price_ratio: None,
+            trading_start_hour_utc: None,
+            trading_end_hour_utc: None,
         }
     }
 }
@@ -220,7 +271,9 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(50),
             max_position_per_window: dec!(200),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.02),
+            max_spread: None,
+            max_total_fill_cost: dec!(0.96),
+            buy_slippage: dec!(0.03),
             min_win_probability: 0.85,
             max_history: 1000,
             early_exit_enabled: false,
@@ -235,6 +288,10 @@ impl CrossMarketAutoExecutorConfig {
             observe_mode: false,
             exclude_pairs: vec![],
             fixed_shares_per_leg: None,
+            min_leg_price: default_min_leg_price(),
+            max_leg_price_ratio: None,
+            trading_start_hour_utc: None,
+            trading_end_hour_utc: None,
         }
     }
 
@@ -252,7 +309,9 @@ impl CrossMarketAutoExecutorConfig {
             max_bet_size: dec!(5),
             max_position_per_window: dec!(10),
             min_spread: dec!(0.20),
-            buy_slippage: dec!(0.02),
+            max_spread: None,
+            max_total_fill_cost: dec!(0.96),
+            buy_slippage: dec!(0.03),
             min_win_probability: 0.75,
             max_history: 1000,
             early_exit_enabled: false,
@@ -267,6 +326,10 @@ impl CrossMarketAutoExecutorConfig {
             observe_mode: false,
             exclude_pairs: vec![],
             fixed_shares_per_leg: None,
+            min_leg_price: default_min_leg_price(),
+            max_leg_price_ratio: None,
+            trading_start_hour_utc: None,
+            trading_end_hour_utc: None,
         }
     }
 
@@ -898,8 +961,8 @@ impl CrossMarketWindowTracker {
 ///
 /// Consumes opportunities from `CrossMarketRunner` and executes them via `PolymarketExecutor`.
 pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
-    /// The underlying executor.
-    executor: E,
+    /// The underlying executor (Arc for background sell-back tasks).
+    executor: Arc<E>,
 
     /// Configuration.
     config: CrossMarketAutoExecutorConfig,
@@ -940,12 +1003,9 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
     /// Session ID for grouping trades.
     session_id: String,
 
-    /// Cooldown after execution failures to avoid wasting API calls.
-    /// Tracks when the last execution attempt failed (FOK not filled, etc.)
-    last_both_rejected_at: Option<std::time::Instant>,
-
-    /// Tracks the last time we checked for redeemable positions.
-    last_redeem_check: Option<std::time::Instant>,
+    /// Per-pair cooldown after both legs rejected (FOK not filled).
+    /// Only blocks the specific pair that was rejected, not all trading.
+    pair_cooldowns: std::collections::HashMap<String, std::time::Instant>,
 
     /// Chainlink oracle price tracker for settlement (replaces Binance).
     chainlink_tracker: Arc<RwLock<ChainlinkWindowTracker>>,
@@ -954,7 +1014,7 @@ pub struct CrossMarketAutoExecutor<E: PolymarketExecutor> {
     initial_balance: Option<Decimal>,
 }
 
-impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
+impl<E: PolymarketExecutor + 'static> CrossMarketAutoExecutor<E> {
     /// Creates a new cross-market auto executor.
     pub fn new(executor: E, config: CrossMarketAutoExecutorConfig) -> Self {
         let sizer = CrossMarketKellySizer::new(
@@ -968,7 +1028,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
 
         Self {
-            executor,
+            executor: Arc::new(executor),
             config,
             sizer,
             position: Arc::new(RwLock::new(CrossMarketWindowTracker::default())),
@@ -982,8 +1042,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             should_stop: Arc::new(AtomicBool::new(false)),
             db_pool: None,
             session_id,
-            last_both_rejected_at: None,
-            last_redeem_check: None,
+            pair_cooldowns: std::collections::HashMap::new(),
+
             chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
             initial_balance: None,
         }
@@ -1008,7 +1068,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
 
         Self {
-            executor,
+            executor: Arc::new(executor),
             config,
             sizer,
             position: Arc::new(RwLock::new(CrossMarketWindowTracker::default())),
@@ -1022,8 +1082,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             should_stop: Arc::new(AtomicBool::new(false)),
             db_pool: Some(db_pool),
             session_id,
-            last_both_rejected_at: None,
-            last_redeem_check: None,
+            pair_cooldowns: std::collections::HashMap::new(),
+
             chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
             initial_balance: None,
         }
@@ -1093,21 +1153,21 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
-        // Track last settlement check time - check every 5 seconds for faster settlement
-        let mut last_settlement_check = std::time::Instant::now();
-        let settlement_check_interval = std::time::Duration::from_secs(5);
+        // Periodic task intervals — opportunities are always top priority via biased select.
+        let mut settlement_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut chainlink_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        let mut gamma_interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut persist_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+        let mut redeem_interval = tokio::time::interval(std::time::Duration::from_secs(60));
+        let mut balance_refresh_interval = tokio::time::interval(std::time::Duration::from_secs(15));
 
-        // Track Chainlink polling (every 10 seconds)
-        let mut last_chainlink_poll = std::time::Instant::now();
-        let chainlink_poll_interval = std::time::Duration::from_secs(10);
-
-        // Track last CLOB/Chainlink DB persistence (every 30 seconds)
-        let mut last_price_persist = std::time::Instant::now();
-        let price_persist_interval = std::time::Duration::from_secs(30);
-
-        // Track last Gamma display poll (every 15 seconds)
-        let mut last_gamma_display_poll = std::time::Instant::now();
-        let gamma_display_poll_interval = std::time::Duration::from_secs(15);
+        // Skip the first immediate tick (match existing behavior: start timers from now)
+        settlement_interval.tick().await;
+        chainlink_interval.tick().await;
+        gamma_interval.tick().await;
+        persist_interval.tick().await;
+        redeem_interval.tick().await;
+        balance_refresh_interval.tick().await;
 
         loop {
             if self.should_stop.load(Ordering::SeqCst) {
@@ -1115,85 +1175,12 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                 break;
             }
 
-            // Poll Chainlink oracle prices at window boundaries
-            if last_chainlink_poll.elapsed() >= chainlink_poll_interval {
-                let mut tracker = self.chainlink_tracker.write().await;
-                tracker.poll().await;
-                last_chainlink_poll = std::time::Instant::now();
-            }
-
-            // Persist CLOB snapshots, Chainlink window prices, and window settlements periodically
-            if last_price_persist.elapsed() >= price_persist_interval {
-                self.persist_clob_snapshots().await;
-                self.persist_chainlink_windows().await;
-                self.record_window_settlements().await;
-                last_price_persist = std::time::Instant::now();
-            }
-
-            // Poll Gamma for display-only predicted outcomes (all modes including observe)
-            if last_gamma_display_poll.elapsed() >= gamma_display_poll_interval {
-                self.poll_gamma_for_display().await;
-                self.sync_pending_display().await;
-                last_gamma_display_poll = std::time::Instant::now();
-            }
-
-            // Settlement, early exit, and auto-redeem: skip entirely in observe mode.
-            // Observe mode only collects data — no API calls for settlement/execution.
-            if !self.config.observe_mode {
-                // Check settlement if interval has passed (before waiting for opportunities)
-                if last_settlement_check.elapsed() >= settlement_check_interval {
-                    debug!("Running periodic settlement check...");
-
-                    // Settle DB trades (handles partial fills + orphans from any session)
-                    self.settle_db_trades().await;
-
-                    // Settle in-memory pending trades (paired trades from current session)
-                    if let Err(e) = self.check_pending_settlements().await {
-                        warn!(error = %e, "Settlement check error");
-                    }
-
-                    // Try early exit on profitable positions (before window closes)
-                    if self.config.early_exit_enabled {
-                        if let Err(e) = self.try_early_exit().await {
-                            debug!(error = %e, "Early exit check error (non-fatal)");
-                        }
-                    }
-
-                    // Sync pending display with actual settlement state (shares, early exits)
-                    self.sync_pending_display().await;
-
-                    last_settlement_check = std::time::Instant::now();
-                }
-
-                // Auto-redeem: check for redeemable positions every 60 seconds
-                {
-                    let should_check = match self.last_redeem_check {
-                        None => true,
-                        Some(last) => last.elapsed() >= std::time::Duration::from_secs(60),
-                    };
-                    if should_check {
-                        match self.executor.redeem_resolved_positions().await {
-                            Ok(0) => {}
-                            Ok(n) => {
-                                info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
-                                // Refresh USDC balance after redemption and derive P&L
-                                if let Ok(bal) = self.executor.get_balance().await {
-                                    let mut stats = self.stats.write().await;
-                                    stats.live_balance = Some(bal);
-                                    if let Some(initial) = self.initial_balance {
-                                        stats.realized_pnl = bal - initial;
-                                    }
-                                }
-                            }
-                            Err(e) => debug!(error = %e, "Auto-redeem check failed (non-fatal)"),
-                        }
-                        self.last_redeem_check = Some(std::time::Instant::now());
-                    }
-                }
-            }
-
-            // Wait for next opportunity with short timeout
+            // Biased select: opportunity channel checked first, periodic tasks
+            // only run when no opportunity is waiting. This ensures the hot path
+            // (signal → order) is never blocked by maintenance work.
             tokio::select! {
+                biased;
+
                 opp = opp_rx.recv() => {
                     match opp {
                         Some(o) => {
@@ -1207,8 +1194,67 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                         }
                     }
                 }
+
+                _ = chainlink_interval.tick() => {
+                    let mut tracker = self.chainlink_tracker.write().await;
+                    tracker.poll().await;
+                }
+
+                _ = persist_interval.tick() => {
+                    self.persist_clob_snapshots().await;
+                    self.persist_chainlink_windows().await;
+                    self.record_window_settlements().await;
+                }
+
+                _ = gamma_interval.tick() => {
+                    self.poll_gamma_for_display().await;
+                    self.sync_pending_display().await;
+                }
+
+                _ = settlement_interval.tick(), if !self.config.observe_mode => {
+                    debug!("Running periodic settlement check...");
+                    self.settle_db_trades().await;
+                    if let Err(e) = self.check_pending_settlements().await {
+                        warn!(error = %e, "Settlement check error");
+                    }
+                    if self.config.early_exit_enabled {
+                        if let Err(e) = self.try_early_exit().await {
+                            debug!(error = %e, "Early exit check error (non-fatal)");
+                        }
+                    }
+                    self.sync_pending_display().await;
+                }
+
+                _ = redeem_interval.tick(), if !self.config.observe_mode => {
+                    match self.executor.redeem_resolved_positions().await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
+                            if let Ok(bal) = self.executor.get_balance().await {
+                                let mut stats = self.stats.write().await;
+                                stats.live_balance = Some(bal);
+                                if let Some(initial) = self.initial_balance {
+                                    stats.realized_pnl = bal - initial;
+                                }
+                            }
+                        }
+                        Err(e) => debug!(error = %e, "Auto-redeem check failed (non-fatal)"),
+                    }
+                }
+
+                // Refresh dashboard balance (moved off hot path from handle_opportunity)
+                _ = balance_refresh_interval.tick() => {
+                    if let Ok(bal) = self.executor.get_balance().await {
+                        let mut stats = self.stats.write().await;
+                        stats.live_balance = Some(bal);
+                        if let Some(initial) = self.initial_balance {
+                            stats.realized_pnl = bal - initial;
+                        }
+                    }
+                }
+
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                    // Just a short sleep to avoid busy-looping
+                    // Heartbeat: ensures should_stop is checked at least every 500ms
                 }
             }
         }
@@ -1262,20 +1308,23 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             return Ok(());
         }
 
-        // Cooldown after both legs rejected (e.g., FOK not filled due to low liquidity).
-        // Wait 30 seconds before retrying to avoid wasting API calls on illiquid markets.
-        if let Some(rejected_at) = self.last_both_rejected_at {
-            let cooldown = std::time::Duration::from_secs(30);
-            if rejected_at.elapsed() < cooldown {
+        // Per-pair cooldown after both legs rejected (FOK not filled due to low liquidity).
+        // Only blocks the specific pair — other pairs can still trade.
+        let pair_key = format!("{}/{}", opp.coin1, opp.coin2);
+        let cooldown = std::time::Duration::from_secs(5);
+        if let Some(rejected_at) = self.pair_cooldowns.get(&pair_key) {
+            let elapsed = rejected_at.elapsed();
+            if elapsed < cooldown {
                 debug!(
-                    remaining_secs = (cooldown - rejected_at.elapsed()).as_secs(),
-                    "Skipping opportunity - cooldown after both legs rejected"
+                    pair = %pair_key,
+                    remaining_secs = (cooldown - elapsed).as_secs(),
+                    "Skipping opportunity - pair cooldown after both legs rejected"
                 );
                 self.stats.write().await.opportunities_skipped += 1;
                 return Ok(());
             }
-            // Cooldown expired
-            self.last_both_rejected_at = None;
+            // Cooldown expired — remove entry
+            self.pair_cooldowns.remove(&pair_key);
         }
 
         // Apply filters
@@ -1340,22 +1389,35 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
-        // Calculate bet size using effective balance (USDC + redeemable positions)
-        let balance = self.executor.get_effective_balance().await?;
-        // Update live balance with USDC only (matches MetaMask / on-chain truth)
-        if let Ok(usdc) = self.executor.get_balance().await {
-            self.stats.write().await.live_balance = Some(usdc);
-        }
+        // Fetch balances — minimize API calls on the hot path.
+        // Fixed bet + initial balance captured: only need USDC check (1 call).
+        // Otherwise: fetch effective balance and USDC in parallel (2 calls, concurrent).
+        let need_effective = self.config.fixed_bet_size.is_none() || self.initial_balance.is_none();
+
+        let (usdc_balance, effective_balance) = if need_effective {
+            // Parallel fetch: both calls run concurrently
+            let (usdc_res, eff_res) = tokio::join!(
+                self.executor.get_balance(),
+                self.executor.get_effective_balance(),
+            );
+            (usdc_res?, eff_res?)
+        } else {
+            // Fast path: only 1 API call needed
+            let usdc = self.executor.get_balance().await?;
+            (usdc, usdc)
+        };
+
         // Record initial balance on first query for P&L derivation
         if self.initial_balance.is_none() {
-            self.initial_balance = Some(balance);
+            self.initial_balance = Some(effective_balance);
         }
+
         let bet_per_leg = if let Some(fixed) = self.config.fixed_bet_size {
             fixed
         } else {
             match self
                 .sizer
-                .size(opp.win_probability, opp.total_cost, balance)
+                .size(opp.win_probability, opp.total_cost, effective_balance)
             {
                 Some(size) => size,
                 None => {
@@ -1394,20 +1456,16 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             }
         }
 
-        // Check actual USDC balance covers both legs.
-        // get_effective_balance() includes redeemable positions which can't be
-        // spent directly, so verify real USDC covers the order.
-        {
-            let usdc_balance = self.executor.get_balance().await?;
-            if usdc_balance < estimated_cost {
-                debug!(
-                    usdc_balance = %usdc_balance,
-                    estimated_cost = %estimated_cost,
-                    "Insufficient USDC balance for both legs"
-                );
-                self.stats.write().await.opportunities_skipped += 1;
-                return Ok(());
-            }
+        // Verify real USDC covers the order (effective balance includes
+        // redeemable positions which can't be spent directly).
+        if usdc_balance < estimated_cost {
+            debug!(
+                usdc_balance = %usdc_balance,
+                estimated_cost = %estimated_cost,
+                "Insufficient USDC balance for both legs"
+            );
+            self.stats.write().await.opportunities_skipped += 1;
+            return Ok(());
         }
 
         // Execute both legs
@@ -1462,24 +1520,23 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     warn!(
                         filled_size = %filled_size,
                         fill_price = %fill_price,
-                        "Partial fill - leg 1 only. Selling back immediately."
+                        "Partial fill - leg 1 only. Spawning background sell-back."
                     );
-                    drop(stats); // Release lock before sell-back
+                    drop(stats);
 
-                    // Immediately sell back the filled leg to avoid naked directional exposure.
-                    // Accept a small spread loss (~2-5%) rather than holding a 50/50 bet.
-                    let sell_back = self.sell_back_partial_fill(
-                        &opp.leg1_token_id,
+                    // Spawn background sell-back task that retries for up to 5 minutes.
+                    Self::spawn_background_sell_back(
+                        self.executor.clone(),
+                        self.stats.clone(),
+                        self.db_pool.clone(),
+                        self.session_id.clone(),
+                        self.fee_rate,
+                        opp.clone(),
+                        opp.leg1_token_id.clone(),
                         filled_size,
                         fill_price,
                         "leg1",
-                    )
-                    .await;
-
-                    // If sell-back succeeded, settle the DB trade immediately with actual loss
-                    if let Some((_recovered, loss)) = sell_back {
-                        self.settle_partial_fill_in_db(&opp, loss).await;
-                    }
+                    );
                 }
                 CrossMarketExecutionResult::Leg2OnlyFilled { leg2_result, .. } => {
                     stats.partial_fills += 1;
@@ -1488,29 +1545,30 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                     warn!(
                         filled_size = %filled_size,
                         fill_price = %fill_price,
-                        "Partial fill - leg 2 only. Selling back immediately."
+                        "Partial fill - leg 2 only. Spawning background sell-back."
                     );
-                    drop(stats); // Release lock before sell-back
+                    drop(stats);
 
-                    // Immediately sell back the filled leg to avoid naked directional exposure.
-                    let sell_back = self.sell_back_partial_fill(
-                        &opp.leg2_token_id,
+                    // Spawn background sell-back task that retries for up to 5 minutes.
+                    Self::spawn_background_sell_back(
+                        self.executor.clone(),
+                        self.stats.clone(),
+                        self.db_pool.clone(),
+                        self.session_id.clone(),
+                        self.fee_rate,
+                        opp.clone(),
+                        opp.leg2_token_id.clone(),
                         filled_size,
                         fill_price,
                         "leg2",
-                    )
-                    .await;
-
-                    // If sell-back succeeded, settle the DB trade immediately with actual loss
-                    if let Some((_recovered, loss)) = sell_back {
-                        self.settle_partial_fill_in_db(&opp, loss).await;
-                    }
+                    );
                 }
                 CrossMarketExecutionResult::BothRejected { .. } => {
                     stats.both_rejected += 1;
                     drop(stats);
-                    // Start cooldown to avoid spamming API when there's no liquidity
-                    self.last_both_rejected_at = Some(std::time::Instant::now());
+                    // Start per-pair cooldown to avoid spamming API on this pair
+                    let pair_key = format!("{}/{}", opp.coin1, opp.coin2);
+                    self.pair_cooldowns.insert(pair_key, std::time::Instant::now());
                 }
             }
         }
@@ -2184,6 +2242,32 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
 
     /// Checks if this opportunity should be executed.
     fn should_execute(&self, opp: &CrossMarketOpportunity) -> bool {
+        // Trading hours restriction (time-of-day).
+        // Data: 18-23 UTC is +$9.04, 06-11 UTC is -$5.32.
+        if let (Some(start_hour), Some(end_hour)) = (
+            self.config.trading_start_hour_utc,
+            self.config.trading_end_hour_utc,
+        ) {
+            let current_hour = opp.detected_at.hour();
+            let in_window = if start_hour < end_hour {
+                current_hour >= start_hour && current_hour < end_hour
+            } else if start_hour > end_hour {
+                // Wraps midnight: e.g., 12..5 means 12:00-04:59
+                current_hour >= start_hour || current_hour < end_hour
+            } else {
+                false // start == end: zero-width window
+            };
+            if !in_window {
+                trace!(
+                    current_hour = current_hour,
+                    trading_start = start_hour,
+                    trading_end = end_hour,
+                    "Filter: outside trading hours"
+                );
+                return false;
+            }
+        }
+
         // Check pair filter
         if let Some((c1, c2)) = &self.config.filter_pair {
             let opp_coin1 = Self::parse_coin(&opp.coin1);
@@ -2258,6 +2342,34 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             );
             return false;
         }
+        if let Some(max_spread) = self.config.max_spread {
+            if opp.spread > max_spread {
+                trace!(
+                    spread = %opp.spread,
+                    max = %max_spread,
+                    "Filter: spread too wide (likely low-probability trap)"
+                );
+                return false;
+            }
+        }
+
+        // Check effective total fill cost (detected cost + slippage on both legs).
+        // When fill cost is high (>=0.95), risk/reward collapses: a 5-share win
+        // nets +$0.25 but a loss costs -$4.75 (19:1 asymmetry).
+        {
+            let effective_cost =
+                opp.total_cost + dec!(2) * self.config.buy_slippage;
+            if effective_cost > self.config.max_total_fill_cost {
+                trace!(
+                    total_cost = %opp.total_cost,
+                    slippage = %self.config.buy_slippage,
+                    effective_cost = %effective_cost,
+                    max = %self.config.max_total_fill_cost,
+                    "Filter: effective fill cost too high (catastrophic loss risk)"
+                );
+                return false;
+            }
+        }
 
         // Check win probability
         if opp.win_probability < self.config.min_win_probability {
@@ -2272,15 +2384,34 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
             return false;
         }
 
-        // Check minimum leg price (Polymarket rejects orders below $0.05)
-        if opp.leg1_price < MIN_LEG_PRICE || opp.leg2_price < MIN_LEG_PRICE {
+        // Check minimum leg price (safety net for near-zero tokens).
+        if opp.leg1_price < self.config.min_leg_price || opp.leg2_price < self.config.min_leg_price {
             trace!(
                 leg1 = %opp.leg1_price,
                 leg2 = %opp.leg2_price,
-                min = %MIN_LEG_PRICE,
+                min = %self.config.min_leg_price,
                 "Filter: leg price below minimum"
             );
             return false;
+        }
+
+        // Reject symmetric (near 50/50) leg prices. Data shows ratio >= 0.80
+        // is -$7.46 across 14 trades (coin flips with big losses), while
+        // asymmetric < 0.40 is +$2.17 (market correctly prices direction).
+        if let Some(max_ratio) = self.config.max_leg_price_ratio {
+            let p1 = opp.leg1_price.to_f64().unwrap_or(0.0);
+            let p2 = opp.leg2_price.to_f64().unwrap_or(0.0);
+            let ratio = p1.min(p2) / p1.max(p2);
+            if ratio > max_ratio {
+                trace!(
+                    leg1 = %opp.leg1_price,
+                    leg2 = %opp.leg2_price,
+                    ratio = format!("{:.3}", ratio),
+                    max_ratio = format!("{:.3}", max_ratio),
+                    "Filter: leg prices too symmetric (coin flip)"
+                );
+                return false;
+            }
         }
 
         // Divergence filter: reject when implied loss probability is too high.
@@ -2692,6 +2823,207 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         None
     }
 
+    /// Spawns a background task to sell back a partial fill with extended retries.
+    ///
+    /// On-chain settlement can take 15-30s, and the orderbook may need time for bids
+    /// to appear. This retries every 15s for up to 5 minutes, progressively lowering
+    /// the sell price to find bids. If all retries fail, the token goes to settlement.
+    fn spawn_background_sell_back(
+        executor: Arc<E>,
+        stats: Arc<RwLock<CrossMarketAutoExecutorStats>>,
+        db_pool: Option<PgPool>,
+        session_id: String,
+        _fee_rate: Decimal,
+        opp: CrossMarketOpportunity,
+        token_id: String,
+        filled_size: Decimal,
+        fill_price: Decimal,
+        leg_label: &'static str,
+    ) {
+        tokio::spawn(async move {
+            let pair = format!("{}/{}", opp.coin1, opp.coin2);
+            let cost = filled_size * fill_price;
+
+            // Retry schedule: initial attempt, then every 15s for up to 5 minutes.
+            // Progressively lower sell price: 3%, 5%, 8%, 10%, 15% below fill.
+            let attempts: Vec<(std::time::Duration, Decimal)> = vec![
+                (std::time::Duration::from_secs(0), dec!(0.97)),   // immediate, -3%
+                (std::time::Duration::from_secs(5), dec!(0.95)),   // 5s, -5%
+                (std::time::Duration::from_secs(10), dec!(0.92)),  // 15s, -8%
+                (std::time::Duration::from_secs(15), dec!(0.90)),  // 30s, -10%
+                (std::time::Duration::from_secs(15), dec!(0.87)),  // 45s, -13%
+                (std::time::Duration::from_secs(15), dec!(0.85)),  // 60s, -15%
+                (std::time::Duration::from_secs(30), dec!(0.82)),  // 90s, -18%
+                (std::time::Duration::from_secs(30), dec!(0.80)),  // 120s, -20%
+                (std::time::Duration::from_secs(30), dec!(0.75)),  // 150s, -25%
+                (std::time::Duration::from_secs(30), dec!(0.70)),  // 180s, -30%
+                (std::time::Duration::from_secs(30), dec!(0.60)),  // 210s, -40%
+                (std::time::Duration::from_secs(30), dec!(0.50)),  // 240s, -50%
+                (std::time::Duration::from_secs(30), dec!(0.40)),  // 270s, -60%
+                (std::time::Duration::from_secs(30), dec!(0.30)),  // 300s, -70%
+            ];
+
+            for (i, (delay, price_factor)) in attempts.iter().enumerate() {
+                if *delay > std::time::Duration::ZERO {
+                    tokio::time::sleep(*delay).await;
+                }
+
+                let sell_price = ((fill_price * price_factor) * dec!(100)).floor() / dec!(100);
+                let sell_price = sell_price.max(dec!(0.01));
+                let sell_value = sell_price * filled_size;
+
+                if sell_value < MIN_ORDER_VALUE {
+                    warn!(
+                        leg = leg_label,
+                        pair = %pair,
+                        sell_value = %sell_value,
+                        "Background sell-back: value below minimum, skipping attempt"
+                    );
+                    continue;
+                }
+
+                let sell_order = OrderParams {
+                    token_id: token_id.clone(),
+                    side: Side::Sell,
+                    price: sell_price,
+                    size: filled_size,
+                    order_type: OrderType::Fak,
+                    neg_risk: false,
+                    presigned: None,
+                };
+
+                info!(
+                    leg = leg_label,
+                    pair = %pair,
+                    attempt = i + 1,
+                    sell_price = %sell_price,
+                    discount_pct = format!("{:.0}%", (Decimal::ONE - price_factor) * dec!(100)),
+                    "Background sell-back attempt"
+                );
+
+                match executor.submit_order(sell_order).await {
+                    Ok(result) if result.filled_size > Decimal::ZERO => {
+                        let recovered = result.filled_size * sell_price;
+                        let loss = cost - recovered;
+                        info!(
+                            leg = leg_label,
+                            pair = %pair,
+                            sold = %result.filled_size,
+                            recovered = %recovered,
+                            loss = %loss,
+                            attempt = i + 1,
+                            "Background sell-back FILLED"
+                        );
+
+                        // Update stats
+                        {
+                            let mut s = stats.write().await;
+                            s.realized_pnl -= loss;
+                            s.event_log.push_back(EventLogEntry {
+                                time: Utc::now(),
+                                kind: EventKind::Trim,
+                                message: format!(
+                                    "SELL-BACK {} {} {:.1}sh @ ${:.2} (loss ${:.2})",
+                                    pair, leg_label, result.filled_size, sell_price, loss,
+                                ),
+                            });
+                            while s.event_log.len() > 20 {
+                                s.event_log.pop_front();
+                            }
+                        }
+
+                        // Settle in DB
+                        if let Some(ref pool) = db_pool {
+                            let pnl = -loss;
+                            let db_result = sqlx::query(
+                                r#"
+                                UPDATE cross_market_opportunities
+                                SET status = 'settled',
+                                    trade_result = 'LOSE',
+                                    actual_pnl = $1,
+                                    settled_at = NOW()
+                                WHERE session_id = $2
+                                  AND timestamp = $3
+                                  AND status = 'pending'
+                                "#,
+                            )
+                            .bind(pnl)
+                            .bind(&session_id)
+                            .bind(opp.detected_at)
+                            .execute(pool)
+                            .await;
+
+                            match db_result {
+                                Ok(r) if r.rows_affected() > 0 => {
+                                    info!(pair = %pair, pnl = %pnl, "Partial fill settled in DB (background sell-back)");
+                                }
+                                Ok(_) => {
+                                    debug!("Background sell-back DB update matched no rows");
+                                }
+                                Err(e) => {
+                                    warn!(error = %e, "Background sell-back DB settle failed");
+                                }
+                            }
+                        }
+
+                        return; // Success — done
+                    }
+                    Ok(_) => {
+                        debug!(
+                            leg = leg_label,
+                            pair = %pair,
+                            attempt = i + 1,
+                            "Background sell-back: no fills at this price"
+                        );
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("not enough balance") {
+                            debug!(
+                                leg = leg_label,
+                                pair = %pair,
+                                attempt = i + 1,
+                                "Background sell-back: shares not yet settled on-chain"
+                            );
+                        } else {
+                            warn!(
+                                leg = leg_label,
+                                pair = %pair,
+                                attempt = i + 1,
+                                error = %e,
+                                "Background sell-back: order failed"
+                            );
+                        }
+                    }
+                }
+            }
+
+            warn!(
+                leg = leg_label,
+                pair = %pair,
+                filled_size = %filled_size,
+                fill_price = %fill_price,
+                "Background sell-back exhausted all retries (5 min) — directional exposure remains"
+            );
+
+            // Push event for dashboard
+            {
+                let mut s = stats.write().await;
+                s.event_log.push_back(EventLogEntry {
+                    time: Utc::now(),
+                    kind: EventKind::PartialFill,
+                    message: format!(
+                        "SELL-BACK FAILED {} {} {:.1}sh @ ${:.2} — held to settlement",
+                        pair, leg_label, filled_size, fill_price,
+                    ),
+                });
+                while s.event_log.len() > 20 {
+                    s.event_log.pop_front();
+                }
+            }
+        });
+    }
+
     /// Updates latency statistics.
     async fn update_latency_stats(&self, latency_ms: u64) {
         let mut stats = self.stats.write().await;
@@ -3082,12 +3414,14 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         };
 
         // Load pending executed trades where window has closed.
-        // Skip current-session fully-paired trades (both fills present) — those are
-        // handled by the in-memory settlement in check_pending_settlements().
-        // We DO pick up:
+        // Skip current-session fully-paired trades (both fills present) for the first
+        // 15 minutes — those are handled by the in-memory settlement in
+        // check_pending_settlements(). After 15 minutes, we pick them up here as a
+        // safety net (in case Gamma failed and the in-memory Chainlink fallback also
+        // failed). We DO pick up:
         //   - All trades from other sessions (orphans)
-        //   - Current-session partial fills (one NULL fill price) that never enter the
-        //     in-memory pending list
+        //   - Current-session partial fills (one NULL fill price)
+        //   - Current-session stale trades (>15 min past window close)
         let rows = match sqlx::query_as::<_, (
             i32,                    // id
             String,                 // session_id
@@ -3120,6 +3454,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                   session_id != $1
                   OR leg1_fill_price IS NULL
                   OR leg2_fill_price IS NULL
+                  OR window_end < NOW() - INTERVAL '15 minutes'
               )
             ORDER BY window_end ASC
             "#,
@@ -3336,6 +3671,28 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
                             pnl = %pnl,
                             "Settled DB trade"
                         );
+
+                        // If this was a current-session stale trade (picked up by
+                        // the >15 minute safety net), remove from in-memory pending
+                        // list to prevent double-settlement.
+                        if *original_session_id == self.session_id {
+                            let mut pending = self.pending_settlements.write().await;
+                            let before = pending.len();
+                            pending.retain(|s| {
+                                !(s.coin1 == *coin1
+                                    && s.coin2 == *coin2
+                                    && s.window_end == *window_end)
+                            });
+                            if pending.len() < before {
+                                debug!(
+                                    id = id,
+                                    removed = before - pending.len(),
+                                    "Removed stale trade from in-memory pending list"
+                                );
+                                let mut stats = self.stats.write().await;
+                                stats.pending_settlement = pending.len() as u64;
+                            }
+                        }
 
                         // Push settlement event to dashboard
                         let pnl_sign = if pnl >= Decimal::ZERO { "+" } else { "" };
@@ -3871,8 +4228,8 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         let resolved_high = dec!(0.90);
         let resolved_low = dec!(0.10);
 
-        // Find trades with closed windows (wait at least 60s for market resolution)
-        let min_clob_delay = chrono::Duration::seconds(60);
+        // Find trades with closed windows (wait at least 30s for CLOB token prices to resolve)
+        let min_clob_delay = chrono::Duration::seconds(30);
         let trades_to_check: Vec<PendingPaperSettlement> = {
             let pending = self.pending_settlements.read().await;
             pending
@@ -4479,7 +4836,7 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
         }
 
         let now = Utc::now();
-        let settlement_delay = chrono::Duration::seconds(120); // Wait for Gamma API to have official resolution
+        let settlement_delay = chrono::Duration::seconds(60); // Gamma resolves in 3-7 min; 60s is safe
 
         // Collect trades ready for settlement
         let mut to_settle = Vec::new();
@@ -4557,26 +4914,61 @@ impl<E: PolymarketExecutor> CrossMarketAutoExecutor<E> {
     /// - Winning tokens trade at $1.00 (or very close)
     /// - Losing tokens trade at $0.00 (or very close)
     ///
-    /// Uses the Gamma API exclusively (official resolution from Polymarket/UMA).
-    /// If Gamma doesn't have resolution data yet, returns an error so the trade
-    /// stays pending for retry on the next settlement cycle.
+    /// Uses the Gamma API first (official resolution from Polymarket/UMA).
+    /// Falls back to Chainlink oracle for trades >10 minutes past window close
+    /// (prevents settlements sitting for hours when Gamma is unavailable).
     async fn settle_paper_trade(
         &self,
         settlement: &PendingPaperSettlement,
     ) -> Result<(), CrossMarketAutoExecutorError> {
-        // Use Gamma API only (official outcomes). If not ready yet, trade stays pending.
+        let trade_age = Utc::now() - settlement.window_end;
+
+        // Try Gamma API first (official outcomes).
         let (leg1_won, leg2_won) = match self.try_settle_via_gamma(settlement).await {
             Ok(result) => {
                 info!(trade_id = %settlement.trade_id, "Settled via Gamma API (official outcomes)");
                 result
             }
-            Err(e) => {
-                debug!(
-                    trade_id = %settlement.trade_id,
-                    error = %e,
-                    "Gamma API settlement not available yet, will retry"
-                );
-                return Err(e);
+            Err(gamma_err) => {
+                // Fall back to Chainlink for trades older than 10 minutes.
+                // This prevents settlements sitting for hours when Gamma is
+                // temporarily unavailable or doesn't have resolution data.
+                if trade_age > chrono::Duration::minutes(10) {
+                    debug!(
+                        trade_id = %settlement.trade_id,
+                        error = %gamma_err,
+                        age_minutes = trade_age.num_minutes(),
+                        "Gamma failed for stale trade, trying Chainlink oracle"
+                    );
+                    match self.try_settle_via_chainlink(settlement).await {
+                        Ok(result) => {
+                            info!(
+                                trade_id = %settlement.trade_id,
+                                age_minutes = trade_age.num_minutes(),
+                                "Stale trade settled via Chainlink oracle fallback"
+                            );
+                            result
+                        }
+                        Err(chainlink_err) => {
+                            warn!(
+                                trade_id = %settlement.trade_id,
+                                gamma_error = %gamma_err,
+                                chainlink_error = %chainlink_err,
+                                age_minutes = trade_age.num_minutes(),
+                                "Settlement failed via both Gamma and Chainlink, will retry"
+                            );
+                            return Err(gamma_err);
+                        }
+                    }
+                } else {
+                    debug!(
+                        trade_id = %settlement.trade_id,
+                        error = %gamma_err,
+                        age_secs = trade_age.num_seconds(),
+                        "Gamma not ready yet, will retry"
+                    );
+                    return Err(gamma_err);
+                }
             }
         };
 

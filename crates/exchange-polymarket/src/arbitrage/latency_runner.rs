@@ -59,6 +59,7 @@
 //! ```
 
 use crate::arbitrage::book_feed::{BookFeed, BookFeedConfig, BookFeedError};
+use crate::arbitrage::data_service::DataServiceHandle;
 use crate::arbitrage::latency_detector::{
     LatencyConfig, LatencyDetector, LatencySignal, SpotPriceTracker,
 };
@@ -165,6 +166,8 @@ pub struct LatencyRunner {
     should_stop: Arc<AtomicBool>,
     /// Statistics.
     stats: Arc<RwLock<LatencyRunnerStats>>,
+    /// External data service handle (if provided, skips creating own spot feed).
+    data_handle: Option<DataServiceHandle>,
 }
 
 impl LatencyRunner {
@@ -172,6 +175,25 @@ impl LatencyRunner {
     ///
     /// Returns the runner and a channel to receive signals.
     pub fn new(config: LatencyRunnerConfig) -> (Self, mpsc::Receiver<LatencySignal>) {
+        Self::build(config, None)
+    }
+
+    /// Creates a new latency runner backed by a shared [`DataServiceHandle`].
+    ///
+    /// When a data handle is provided, the runner uses the shared spot tracker
+    /// instead of spawning its own Binance spot feed.
+    pub fn with_data_service(
+        config: LatencyRunnerConfig,
+        data_handle: DataServiceHandle,
+    ) -> (Self, mpsc::Receiver<LatencySignal>) {
+        Self::build(config, Some(data_handle))
+    }
+
+    /// Shared constructor logic.
+    fn build(
+        config: LatencyRunnerConfig,
+        data_handle: Option<DataServiceHandle>,
+    ) -> (Self, mpsc::Receiver<LatencySignal>) {
         let (signal_tx, signal_rx) = mpsc::channel(config.signal_buffer_size);
         let spot_tracker = Arc::new(RwLock::new(SpotPriceTracker::new()));
         let detector = LatencyDetector::new(config.latency_config.clone());
@@ -183,6 +205,7 @@ impl LatencyRunner {
             signal_tx,
             should_stop: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(LatencyRunnerStats::default())),
+            data_handle,
         };
 
         (runner, signal_rx)
@@ -208,8 +231,8 @@ impl LatencyRunner {
 
     /// Runs the latency arbitrage system.
     ///
-    /// This spawns the spot feed in the background and runs the main
-    /// detection loop.
+    /// This spawns the spot feed in the background (unless a [`DataServiceHandle`]
+    /// was provided) and runs the main detection loop.
     pub async fn run(mut self) -> Result<(), LatencyRunnerError> {
         // Validate config
         if self.config.yes_token_id.is_empty() || self.config.no_token_id.is_empty() {
@@ -221,6 +244,7 @@ impl LatencyRunner {
         info!(
             yes_token = %self.config.yes_token_id,
             no_token = %self.config.no_token_id,
+            shared_data = self.data_handle.is_some(),
             "Starting latency arbitrage runner"
         );
 
@@ -230,25 +254,58 @@ impl LatencyRunner {
             stats.started_at = Some(Utc::now());
         }
 
-        // Spawn spot price feed
-        let spot_tracker = self.spot_tracker.clone();
-        let spot_config = self.config.spot_config.clone();
-        let spot_stop = self.should_stop.clone();
+        // Use shared spot tracker from DataService, or spawn own feed
+        let spot_handle: Option<tokio::task::JoinHandle<Result<(), SpotFeedError>>> =
+            if let Some(ref dh) = self.data_handle {
+                // Derive coin slug from spot config symbol (e.g. "btcusdt" → "btc")
+                let coin_slug = self
+                    .config
+                    .spot_config
+                    .symbol
+                    .strip_suffix("usdt")
+                    .unwrap_or(&self.config.spot_config.symbol);
 
-        let spot_handle = tokio::spawn(async move {
-            let mut feed = SpotPriceFeed::new(spot_config, spot_tracker);
-            let stop = feed.stop_handle();
-
-            // Link stop handles
-            tokio::spawn(async move {
-                while !spot_stop.load(Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                match dh.spot_tracker(coin_slug) {
+                    Some(shared_tracker) => {
+                        self.spot_tracker = Arc::clone(shared_tracker);
+                        info!(
+                            coin = coin_slug,
+                            "Using shared spot tracker from DataService"
+                        );
+                        None // No feed to spawn
+                    }
+                    None => {
+                        warn!(
+                            coin = coin_slug,
+                            "DataService has no tracker for coin, cannot run latency runner"
+                        );
+                        return Err(LatencyRunnerError::Config(format!(
+                            "DataService has no spot tracker for '{coin_slug}'"
+                        )));
+                    }
                 }
-                stop.store(true, Ordering::SeqCst);
-            });
+            } else {
+                // No DataService — spawn our own spot feed
+                let spot_tracker = self.spot_tracker.clone();
+                let spot_config = self.config.spot_config.clone();
+                let spot_stop = self.should_stop.clone();
 
-            feed.run().await
-        });
+                let handle = tokio::spawn(async move {
+                    let mut feed = SpotPriceFeed::new(spot_config, spot_tracker);
+                    let stop = feed.stop_handle();
+
+                    // Link stop handles
+                    tokio::spawn(async move {
+                        while !spot_stop.load(Ordering::SeqCst) {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                        stop.store(true, Ordering::SeqCst);
+                    });
+
+                    feed.run().await
+                });
+                Some(handle)
+            };
 
         // Connect to Polymarket order books
         info!("Connecting to Polymarket order books...");
@@ -269,9 +326,11 @@ impl LatencyRunner {
         // Run main detection loop
         let result = self.detection_loop(&book_feed).await;
 
-        // Stop spot feed
+        // Stop spot feed (if we spawned one)
         self.should_stop.store(true, Ordering::SeqCst);
-        let _ = spot_handle.await;
+        if let Some(handle) = spot_handle {
+            let _ = handle.await;
+        }
 
         // Shutdown book feed
         book_feed.shutdown().await;
@@ -437,6 +496,8 @@ pub async fn run_latency_monitor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arbitrage::data_service::{DataService, DataServiceConfig};
+    use crate::models::Coin;
 
     #[test]
     fn test_config_default() {
@@ -466,6 +527,26 @@ mod tests {
         let (runner, _rx) = LatencyRunner::new(config);
 
         assert!(!runner.should_stop.load(Ordering::SeqCst));
+        assert!(runner.data_handle.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_runner_with_data_service() {
+        let ds_config = DataServiceConfig::for_coins(vec![Coin::Btc]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let service = DataService::new(ds_config, None, stop);
+        let data_handle = service.handle();
+
+        let config = LatencyRunnerConfig {
+            yes_token_id: "yes-123".to_string(),
+            no_token_id: "no-456".to_string(),
+            ..Default::default()
+        };
+
+        let (runner, _rx) = LatencyRunner::with_data_service(config, data_handle);
+
+        assert!(runner.data_handle.is_some());
+        assert!(!runner.should_stop.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -492,5 +573,26 @@ mod tests {
         assert!(!stop.load(Ordering::SeqCst));
         stop.store(true, Ordering::SeqCst);
         assert!(stop.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_data_handle_missing_coin_returns_error() {
+        // DataService has ETH but not BTC — runner uses default btcusdt symbol
+        let ds_config = DataServiceConfig::for_coins(vec![Coin::Eth]);
+        let stop = Arc::new(AtomicBool::new(false));
+        let service = DataService::new(ds_config, None, stop);
+        let data_handle = service.handle();
+
+        let config = LatencyRunnerConfig {
+            yes_token_id: "yes-123".to_string(),
+            no_token_id: "no-456".to_string(),
+            // Default spot_config.symbol is "btcusdt"
+            ..Default::default()
+        };
+
+        let (runner, _rx) = LatencyRunner::with_data_service(config, data_handle);
+        let result = runner.run().await;
+
+        assert!(matches!(result, Err(LatencyRunnerError::Config(ref msg)) if msg.contains("btc")));
     }
 }

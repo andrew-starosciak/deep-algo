@@ -22,16 +22,20 @@
 //!     --bet-size 50 --duration 4h
 //! ```
 
+use algo_trade_polymarket::arbitrage::data_service::{DataService, DataServiceConfig};
 use algo_trade_polymarket::arbitrage::{
     AutoExecutor, AutoExecutorConfig, GabagoolConfig, GabagoolRunner, GabagoolRunnerConfig,
     LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig, PolymarketExecutor,
 };
+use algo_trade_polymarket::models::Coin;
 use anyhow::Result;
 use clap::Args;
 use rust_decimal::Decimal;
+use sqlx::PgPool;
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info, warn};
 
@@ -125,6 +129,14 @@ pub struct GabagoolAutoArgs {
     /// Show verbose output.
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Persist trades and signals to database.
+    #[arg(long)]
+    pub persist: bool,
+
+    /// Enable Binance signal aggregation (order book, funding, liquidations).
+    #[arg(long)]
+    pub signals: bool,
 }
 
 impl GabagoolAutoArgs {
@@ -209,6 +221,17 @@ pub async fn run(args: GabagoolAutoArgs) -> Result<()> {
         args.min_edge * 100.0
     );
 
+    // Connect to database if persistence is enabled
+    let db_pool = if args.persist {
+        let database_url = std::env::var("DATABASE_URL")
+            .map_err(|_| anyhow::anyhow!("DATABASE_URL env var required for --persist"))?;
+        let pool = PgPool::connect(&database_url).await?;
+        info!("Database connected for trade persistence");
+        Some(pool)
+    } else {
+        None
+    };
+
     // Build gabagool detector config
     let detector_config = if args.aggressive {
         info!("Using AGGRESSIVE config");
@@ -251,8 +274,44 @@ pub async fn run(args: GabagoolAutoArgs) -> Result<()> {
         info!("Trade history will be exported to: {}", path.display());
     }
 
-    // Create runner and get signal receiver
-    let (runner, signal_rx) = GabagoolRunner::new(runner_config);
+    // Create DataService when --signals is enabled
+    let data_stop = Arc::new(AtomicBool::new(false));
+    let data_handle = if args.signals {
+        // Derive the coin from the runner's spot config symbol (e.g. "btcusdt" -> "btc")
+        let slug = runner_config
+            .spot_config
+            .symbol
+            .to_lowercase()
+            .replace("usdt", "");
+        let coin = Coin::from_slug(&slug).ok_or_else(|| {
+            anyhow::anyhow!("Unknown coin slug '{}' from spot config symbol", slug)
+        })?;
+
+        let data_config = DataServiceConfig {
+            coins: vec![coin],
+            enable_signals: true,
+            signal_compute_interval: Duration::from_secs(5),
+            enable_signal_persistence: db_pool.is_some(),
+            signal_flush_interval: Duration::from_secs(15),
+            enable_raw_persistence: false,
+        };
+        let data_service = DataService::new(data_config, db_pool.clone(), Arc::clone(&data_stop));
+        let handle = data_service.handle();
+
+        tokio::spawn(async move {
+            data_service.run().await;
+        });
+        info!("DataService started for shared Binance data collection");
+        Some(handle)
+    } else {
+        None
+    };
+
+    // Create runner and get signal receiver (with or without DataService)
+    let (runner, signal_rx) = match data_handle {
+        Some(handle) => GabagoolRunner::with_data_service(runner_config, handle),
+        None => GabagoolRunner::new(runner_config),
+    };
 
     // Run based on mode
     match mode {
@@ -273,6 +332,7 @@ pub async fn run(args: GabagoolAutoArgs) -> Result<()> {
                 duration,
                 args.stats_interval_secs,
                 args.verbose,
+                data_stop,
             )
             .await
         }
@@ -294,6 +354,7 @@ pub async fn run(args: GabagoolAutoArgs) -> Result<()> {
                 duration,
                 args.stats_interval_secs,
                 args.verbose,
+                data_stop,
             )
             .await
         }
@@ -309,6 +370,7 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
     duration: Duration,
     stats_interval_secs: u64,
     verbose: bool,
+    data_stop: Arc<AtomicBool>,
 ) -> Result<()> {
     let runner_stop = runner.stop_handle();
     let runner_stats = runner.stats();
@@ -336,11 +398,13 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
     // Set up Ctrl+C handler
     let stop_runner = runner_stop.clone();
     let stop_executor = auto_stop.clone();
+    let data_stop_ctrlc = data_stop.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             info!("Received Ctrl+C, stopping...");
             stop_runner.store(true, Ordering::SeqCst);
             stop_executor.store(true, Ordering::SeqCst);
+            data_stop_ctrlc.store(true, Ordering::SeqCst);
         }
     });
 
@@ -376,9 +440,10 @@ async fn run_auto_trading<E: PolymarketExecutor + Send + 'static>(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    // Stop both components
+    // Stop all components
     runner_stop.store(true, Ordering::SeqCst);
     auto_stop.store(true, Ordering::SeqCst);
+    data_stop.store(true, Ordering::SeqCst);
 
     // Wait for tasks to finish
     let _ = tokio::time::timeout(Duration::from_secs(5), runner_handle).await;
@@ -571,6 +636,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -597,6 +664,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -623,6 +692,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -649,6 +720,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -675,6 +748,8 @@ mod tests {
             aggressive: true,
             conservative: true, // Conflict!
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -702,6 +777,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -727,6 +804,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -752,6 +831,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let result = args.validate();
@@ -781,6 +862,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let bet = args.fixed_bet_size();
@@ -807,6 +890,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         assert!(args.fixed_bet_size().is_none());
@@ -831,6 +916,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let balance = args.paper_balance_decimal();
@@ -856,6 +943,8 @@ mod tests {
             aggressive: false,
             conservative: false,
             verbose: false,
+            persist: false,
+            signals: false,
         };
 
         let duration = args.parsed_duration().unwrap();

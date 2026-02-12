@@ -567,9 +567,12 @@ cmd_live() {
     echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${WHITE}Live bot:${NC}"
-    echo -e "  ${DIM}Pairs:${NC}      BTC/ETH + BTC/XRP (excl ETH/SOL)"
-    echo -e "  ${DIM}Combo:${NC}      coin1up_coin2down"
-    echo -e "  ${DIM}Shares:${NC}     5 per leg (~\$2-4 per pair)"
+    echo -e "  ${DIM}Pairs:${NC}      BTC/ETH, BTC/SOL, ETH/XRP (excl ETH/SOL, SOL/XRP)"
+    echo -e "  ${DIM}Hours:${NC}      24/7 (collecting data)"
+    echo -e "  ${DIM}Combo:${NC}      coin1up_coin2down (direction-neutral)"
+    echo -e "  ${DIM}Shares:${NC}     5 per leg"
+    echo -e "  ${DIM}Spread:${NC}     >= 0.10, reject symmetric ratio > 0.75"
+    echo -e "  ${DIM}Entry:${NC}      10-4 mins before close"
     echo -e "  ${DIM}Max/window:${NC} \$20 / 2 trades"
     echo -e "  ${DIM}Duration:${NC}   ${duration}"
     echo ""
@@ -582,6 +585,7 @@ cmd_live() {
     local live_args=(
         --pair all
         --exclude-pair eth,sol
+        --exclude-pair sol,xrp
         --combination coin1up_coin2down
         --mode live
         --duration "$duration"
@@ -592,8 +596,9 @@ cmd_live() {
         --max-position 20
         --max-trades-per-window 2
         --kelly-fraction 0.25
-        --entry-start-mins 12
-        --entry-end-mins 3
+        --entry-start-mins 10
+        --entry-end-mins 4
+        --max-leg-ratio 0.75
         --stats-interval-secs 1
         --persist
     )

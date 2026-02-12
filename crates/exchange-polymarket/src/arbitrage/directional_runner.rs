@@ -39,11 +39,13 @@
 //! }
 //! ```
 
+use crate::arbitrage::data_service::DataServiceHandle;
 use crate::arbitrage::directional_detector::{
     DirectionalConfig, DirectionalDetector, DirectionalSignal,
 };
 use crate::arbitrage::latency_detector::SpotPriceTracker;
 use crate::arbitrage::reference_tracker::{ReferenceTracker, ReferenceTrackerConfig};
+use crate::arbitrage::signal_aggregator::{SharedSignalMap, SignalAggregator};
 use crate::arbitrage::spot_feed::{SpotPriceFeed, SpotPriceFeedConfig};
 use crate::models::Coin;
 use crate::websocket::{PolymarketWebSocket, WebSocketConfig};
@@ -111,6 +113,8 @@ pub struct DirectionalRunnerConfig {
     pub signal_buffer_size: usize,
     /// Gamma API rate limit (requests per minute).
     pub gamma_rate_limit: u32,
+    /// Enable external signal aggregation (Binance order book, funding, liquidations).
+    pub enable_signals: bool,
 }
 
 impl Default for DirectionalRunnerConfig {
@@ -122,6 +126,7 @@ impl Default for DirectionalRunnerConfig {
             check_interval_ms: 200,
             signal_buffer_size: 100,
             gamma_rate_limit: 30,
+            enable_signals: false,
         }
     }
 }
@@ -165,6 +170,10 @@ pub struct DirectionalRunner {
     should_stop: Arc<AtomicBool>,
     /// Statistics.
     stats: Arc<RwLock<DirectionalRunnerStats>>,
+    /// Shared signal map from SignalAggregator (if enabled).
+    signal_map: Option<SharedSignalMap>,
+    /// External data service handle (if provided, skips creating own feeds).
+    data_handle: Option<DataServiceHandle>,
 }
 
 impl DirectionalRunner {
@@ -172,11 +181,32 @@ impl DirectionalRunner {
     ///
     /// Returns the runner and a channel to receive signals.
     pub fn new(config: DirectionalRunnerConfig) -> (Self, mpsc::Receiver<DirectionalSignal>) {
+        Self::build(config, None)
+    }
+
+    /// Creates a new directional runner backed by a shared [`DataServiceHandle`].
+    ///
+    /// When a data handle is provided, the runner uses shared spot trackers and
+    /// signal map instead of spawning its own Binance feeds and signal aggregator.
+    pub fn with_data_service(
+        config: DirectionalRunnerConfig,
+        data_handle: DataServiceHandle,
+    ) -> (Self, mpsc::Receiver<DirectionalSignal>) {
+        Self::build(config, Some(data_handle))
+    }
+
+    /// Shared constructor logic.
+    fn build(
+        config: DirectionalRunnerConfig,
+        data_handle: Option<DataServiceHandle>,
+    ) -> (Self, mpsc::Receiver<DirectionalSignal>) {
         let (signal_tx, signal_rx) = mpsc::channel(config.signal_buffer_size);
 
         let gamma_client = GammaClient::with_rate_limit(
             std::num::NonZeroU32::new(config.gamma_rate_limit).unwrap_or(nonzero!(30u32)),
         );
+
+        let signal_map = data_handle.as_ref().map(|dh| dh.signal_map().clone());
 
         let runner = Self {
             config,
@@ -184,6 +214,8 @@ impl DirectionalRunner {
             signal_tx,
             should_stop: Arc::new(AtomicBool::new(false)),
             stats: Arc::new(RwLock::new(DirectionalRunnerStats::default())),
+            signal_map,
+            data_handle,
         };
 
         (runner, signal_rx)
@@ -202,7 +234,7 @@ impl DirectionalRunner {
     }
 
     /// Runs the directional trading scanner.
-    pub async fn run(self) -> Result<(), DirectionalRunnerError> {
+    pub async fn run(mut self) -> Result<(), DirectionalRunnerError> {
         if self.config.coins.is_empty() {
             return Err(DirectionalRunnerError::Config(
                 "At least one coin is required".to_string(),
@@ -274,16 +306,27 @@ impl DirectionalRunner {
                 "Initialized coin state"
             );
 
-            // Create spot tracker + feed
-            let spot_tracker = Arc::new(RwLock::new(SpotPriceTracker::new()));
-            let spot_config = SpotPriceFeedConfig {
-                symbol: format!("{}usdt", coin.slug_prefix()),
-                max_reconnect_attempts: 0, // Unlimited reconnects
-                ..Default::default()
+            // Use shared tracker from DataService, or create own + feed
+            let spot_tracker = if let Some(ref dh) = self.data_handle {
+                match dh.spot_tracker(coin.slug_prefix()) {
+                    Some(t) => Arc::clone(t),
+                    None => {
+                        warn!(coin = coin.slug_prefix(), "DataService has no tracker for coin, skipping");
+                        continue;
+                    }
+                }
+            } else {
+                let tracker = Arc::new(RwLock::new(SpotPriceTracker::new()));
+                let spot_config = SpotPriceFeedConfig {
+                    symbol: format!("{}usdt", coin.slug_prefix()),
+                    max_reconnect_attempts: 0, // Unlimited reconnects
+                    ..Default::default()
+                };
+                let feed = SpotPriceFeed::new(spot_config, Arc::clone(&tracker));
+                let feed_stop = feed.stop_handle();
+                spot_feeds.push((feed, feed_stop));
+                tracker
             };
-            let feed = SpotPriceFeed::new(spot_config, Arc::clone(&spot_tracker));
-            let feed_stop = feed.stop_handle();
-            spot_feeds.push((feed, feed_stop));
 
             all_token_ids.push(up_token.token_id.clone());
             all_token_ids.push(down_token.token_id.clone());
@@ -314,6 +357,22 @@ impl DirectionalRunner {
                 }
             });
             feed_handles.push(handle);
+        }
+
+        // Spawn signal aggregator if enabled AND no DataService is providing signals
+        if self.config.enable_signals && self.data_handle.is_none() {
+            let signal_map: SharedSignalMap =
+                Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+            let aggregator = SignalAggregator::new(
+                self.config.coins.clone(),
+                Arc::clone(&signal_map),
+                Arc::clone(&self.should_stop),
+            );
+            info!("Spawning signal aggregator for composite signals");
+            tokio::spawn(async move {
+                aggregator.run().await;
+            });
+            self.signal_map = Some(signal_map);
         }
 
         // Connect Polymarket WebSocket for order books
@@ -360,6 +419,8 @@ impl DirectionalRunner {
         coin_states: &mut [CoinState],
         ws: &PolymarketWebSocket,
     ) -> Result<(), DirectionalRunnerError> {
+        // Read signal map reference (if signals enabled)
+        let signal_map = self.signal_map.clone();
         let check_interval = Duration::from_millis(self.config.check_interval_ms);
         let mut last_window_start_ms: Option<i64> = None;
         let mut first_check_logged = false;
@@ -456,6 +517,14 @@ impl DirectionalRunner {
                     stats.current_down_asks.insert(key, down_ask);
                 }
 
+                // Read external signal for this coin (if available)
+                let external_signal = if let Some(ref map) = signal_map {
+                    let map_read = map.read().await;
+                    map_read.get(state.coin.slug_prefix()).cloned()
+                } else {
+                    None
+                };
+
                 // Run detector
                 let signal = state.detector.check(
                     state.coin.slug_prefix(),
@@ -467,6 +536,7 @@ impl DirectionalRunner {
                     &state.down_token_id,
                     time_remaining_secs,
                     now_ms,
+                    external_signal.as_ref(),
                 );
 
                 if let Some(sig) = signal {

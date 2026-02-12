@@ -14,7 +14,9 @@
 #   --bet-size <amount>   Fixed bet size per leg in USDC (default: Kelly sizing)
 #   --pair <coins>        Coin pair to trade (default: btc,eth)
 #   --combination <type>  Combination filter (default: coin1down_coin2up)
-#   --min-spread <val>    Minimum spread required (default: 0.03)
+#   --min-spread <val>    Minimum spread required (default: 0.20)
+#   --max-spread <val>    Maximum spread to accept (rejects wide-spread traps)
+#   --exclude-pair <c1,c2> Exclude a coin pair (repeatable, e.g. --exclude-pair sol,xrp)
 #   --min-win-prob <val>  Minimum win probability (default: 0.85)
 #   --max-position <val>  Max position per window in USDC (default: 50)
 #   --max-trades <n>      Max paired trades per 15-min window (default: 20)
@@ -69,10 +71,12 @@ COMBINATION="coin1down_coin2up"
 BET_SIZE="1"
 KELLY_FRACTION="0.25"
 MIN_SPREAD="0.20"
+MAX_SPREAD=""
 MIN_WIN_PROB="0.85"
 MAX_LOSS_PROB="0.50"
 MAX_POSITION="10"
 MAX_TRADES_PER_WINDOW="10"
+EXCLUDE_PAIRS=()
 PAPER_BALANCE="1000"
 PERSIST="--persist"
 SESSION_ID=""
@@ -80,6 +84,8 @@ VERBOSE=""
 OVERNIGHT=""
 LOG_FILE=""
 STATS_INTERVAL="1"
+TRADING_START_HOUR=""
+TRADING_END_HOUR=""
 
 # =============================================================================
 # Parse arguments
@@ -116,6 +122,14 @@ while [[ $# -gt 0 ]]; do
             MIN_SPREAD="$2"
             shift 2
             ;;
+        --max-spread)
+            MAX_SPREAD="$2"
+            shift 2
+            ;;
+        --exclude-pair)
+            EXCLUDE_PAIRS+=("$2")
+            shift 2
+            ;;
         --min-win-prob)
             MIN_WIN_PROB="$2"
             shift 2
@@ -150,6 +164,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --session)
             SESSION_ID="$2"
+            shift 2
+            ;;
+        --trading-start-hour-utc)
+            TRADING_START_HOUR="$2"
+            shift 2
+            ;;
+        --trading-end-hour-utc)
+            TRADING_END_HOUR="$2"
             shift 2
             ;;
         --verbose|-v)
@@ -247,12 +269,20 @@ CMD+=(--combination "$COMBINATION")
 CMD+=(--mode "$MODE")
 CMD+=(--duration "$DURATION")
 CMD+=(--min-spread "$MIN_SPREAD")
+[[ -n "$MAX_SPREAD" ]] && CMD+=(--max-spread "$MAX_SPREAD")
 CMD+=(--min-win-prob "$MIN_WIN_PROB")
 CMD+=(--max-loss-prob "$MAX_LOSS_PROB")
 CMD+=(--max-position "$MAX_POSITION")
 CMD+=(--max-trades-per-window "$MAX_TRADES_PER_WINDOW")
 CMD+=(--kelly-fraction "$KELLY_FRACTION")
 CMD+=(--stats-interval-secs "$STATS_INTERVAL")
+[[ -n "$TRADING_START_HOUR" ]] && CMD+=(--trading-start-hour-utc "$TRADING_START_HOUR")
+[[ -n "$TRADING_END_HOUR" ]] && CMD+=(--trading-end-hour-utc "$TRADING_END_HOUR")
+
+# Exclude pairs
+for ep in "${EXCLUDE_PAIRS[@]}"; do
+    CMD+=(--exclude-pair "$ep")
+done
 
 # Only pass --bet-size if explicitly set (otherwise Kelly sizing is used)
 [[ -n "$BET_SIZE" ]] && CMD+=(--bet-size "$BET_SIZE")
