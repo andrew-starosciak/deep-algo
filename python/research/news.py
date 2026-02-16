@@ -8,6 +8,13 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
+from research.news_scoring import (
+    deduplicate_headlines,
+    filter_material_news,
+    format_scored_headlines,
+    score_headlines,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -58,18 +65,71 @@ async def scan(ticker: str, hours: int = 12) -> str:
 
     results = await asyncio.gather(*all_tasks, return_exceptions=True)
 
-    sections = []
+    # Collect all headlines from all sources for unified scoring
+    all_headlines = []
+    errors = []
+
     for source, result in zip(all_sources, results):
         if isinstance(result, Exception):
             logger.warning("News source %s failed: %s", source, result)
-            sections.append(f"**{source}**: Error - {result}")
+            errors.append(f"{source}: {result}")
         elif result:
-            sections.append(f"**{source}**:\n{result}")
+            # Parse headlines from result text
+            # Each source returns formatted text with headlines
+            # We need to extract the structured data
+            # For now, this is a simple approach - we could improve by
+            # having each source return structured data directly
+            lines = result.split("\n")
+            for line in lines:
+                if line.strip() and line.startswith("-"):
+                    # Extract headline and URL
+                    parts = line.split("\n  ")
+                    headline_text = parts[0].strip("- ")
+                    url = parts[1].strip() if len(parts) > 1 else ""
 
-    if not sections:
+                    # Extract source from headline if present
+                    extracted_source = source
+                    if "(" in headline_text and ")" in headline_text:
+                        # Format: "Headline (Source)"
+                        headline_text, extracted_source = headline_text.rsplit("(", 1)
+                        extracted_source = extracted_source.rstrip(")")
+                        headline_text = headline_text.strip()
+
+                    all_headlines.append({
+                        "headline": headline_text,
+                        "url": url,
+                        "source": extracted_source,
+                        "published": None,  # Would need to parse from each source
+                    })
+
+    if not all_headlines and not errors:
         return f"No recent news found for {ticker} in last {hours}h"
 
-    return "\n\n".join(sections)
+    # Score, filter, and deduplicate
+    scored = score_headlines(all_headlines, ticker)
+    material = filter_material_news(scored, min_quality=4.0)  # Keep quality >= 4.0
+    unique = deduplicate_headlines(material)
+
+    # Format output
+    output_lines = ["**Curated News Feed** (scored and filtered for quality):"]
+    output_lines.append("")
+    output_lines.append(format_scored_headlines(unique, max_count=15))
+
+    # Add error summary if any sources failed
+    if errors:
+        output_lines.append("")
+        output_lines.append("**Source Errors:**")
+        for error in errors:
+            output_lines.append(f"- {error}")
+
+    # Add stats
+    output_lines.append("")
+    output_lines.append(
+        f"*Scanned {len(all_headlines)} headlines, filtered to "
+        f"{len(unique)} material stories (quality ≥ 4.0)*"
+    )
+
+    return "\n".join(output_lines)
 
 
 async def _yahoo_rss(ticker: str, cutoff: datetime) -> str:
