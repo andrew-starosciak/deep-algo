@@ -1,4 +1,4 @@
-"""Telegram notifications and human-in-the-loop approvals."""
+"""Notifications and human-in-the-loop approvals via Discord and Telegram."""
 
 from __future__ import annotations
 
@@ -9,6 +9,70 @@ import os
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class MultiNotifier:
+    """Send notifications to both Discord and Telegram (if configured)."""
+
+    def __init__(self):
+        self.discord = None
+        self.telegram = None
+
+        # Initialize Discord if webhook URL is set
+        discord_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+        if discord_url:
+            from openclaw.discord_notify import DiscordNotifier
+            self.discord = DiscordNotifier(discord_url)
+            logger.info("Discord notifier enabled")
+
+        # Initialize Telegram if bot token is set
+        telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+        if telegram_token:
+            self.telegram = TelegramNotifier()
+            logger.info("Telegram notifier enabled")
+
+        if not self.discord and not self.telegram:
+            logger.warning("No notification channels configured (Discord or Telegram)")
+
+    async def send(self, message: str) -> None:
+        """Send message to all configured channels."""
+        tasks = []
+        if self.discord:
+            tasks.append(self.discord.send(message))
+        if self.telegram:
+            tasks.append(self.telegram.send(message))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_recommendation(self, recommendation: dict) -> None:
+        """Send trade recommendation to all channels."""
+        tasks = []
+        if self.discord:
+            tasks.append(self.discord.send_recommendation(recommendation))
+        if self.telegram:
+            tasks.append(self.telegram.send_recommendation(recommendation))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def escalate(self, workflow_name: str, step_id: str, context: dict, error: str | None = None) -> None:
+        """Escalate workflow failure to all channels."""
+        tasks = []
+        if self.discord:
+            tasks.append(self.discord.escalate(workflow_name, step_id, context, error))
+        if self.telegram:
+            tasks.append(self.telegram.escalate(workflow_name, step_id, context, error))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def send_battle_plan(self, plan: dict) -> None:
+        """Send weekly battle plan to all channels."""
+        tasks = []
+        if self.discord:
+            tasks.append(self.discord.send_battle_plan(plan))
+        if self.telegram:
+            tasks.append(self.telegram.send_battle_plan(plan))
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 class TelegramNotifier:

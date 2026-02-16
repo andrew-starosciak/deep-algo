@@ -107,7 +107,7 @@ async def _init_engine(args):
     from agents.risk_checker import RiskCheckerAgent
     from openclaw.engine import WorkflowEngine
     from openclaw.llm import LLMClient
-    from openclaw.notify import TelegramNotifier
+    from openclaw.notify import MultiNotifier
 
     # DB: Postgres if URL provided, else in-memory
     db_url = getattr(args, "db_url", None)
@@ -121,7 +121,7 @@ async def _init_engine(args):
 
     model = getattr(args, "model", "claude-sonnet-4-5-20250929")
     llm = LLMClient(model=model)
-    notifier = TelegramNotifier()
+    notifier = MultiNotifier()  # Auto-detects Discord/Telegram from env vars
 
     engine = WorkflowEngine(db=db, llm=llm, notifier=notifier)
 
@@ -290,10 +290,10 @@ async def _cmd_position_manager(args):
     """Run the position manager service loop."""
     from ib.position_manager import PositionManager
     from ib.types import ManagerConfig
-    from openclaw.notify import TelegramNotifier
+    from openclaw.notify import MultiNotifier
 
     db = await _init_db(args)
-    notifier = TelegramNotifier()
+    notifier = MultiNotifier()
 
     config = ManagerConfig(poll_interval_secs=args.poll_interval)
 
