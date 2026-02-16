@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -13,27 +14,52 @@ logger = logging.getLogger(__name__)
 async def scan(ticker: str, hours: int = 12) -> str:
     """Scan recent news for a ticker from multiple sources.
 
-    Sources:
+    Tier 1 (always enabled):
     1. Yahoo Finance RSS
     2. Google News RSS
     3. SEC EDGAR filings (8-K, Form 4)
+
+    Tier 2 (requires API keys):
+    4. Finnhub News API
+    5. Alpha Vantage News Sentiment
+    6. NewsAPI.org
     """
     logger.info("Scanning news for %s (last %dh)", ticker, hours)
 
     cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
-    # Gather from all sources in parallel
-    results = await asyncio.gather(
+    # Tier 1: Always gather (no API keys required)
+    tier1_tasks = [
         _yahoo_rss(ticker, cutoff),
         _google_news_rss(ticker, cutoff),
         _sec_edgar_filings(ticker, cutoff),
-        return_exceptions=True,
-    )
+    ]
+    tier1_sources = ["Yahoo Finance RSS", "Google News RSS", "SEC EDGAR Filings"]
+
+    # Tier 2: Only if API keys available
+    tier2_tasks = []
+    tier2_sources = []
+
+    if os.environ.get("FINNHUB_API_KEY"):
+        tier2_tasks.append(_finnhub_news(ticker, cutoff))
+        tier2_sources.append("Finnhub News")
+
+    if os.environ.get("ALPHAVANTAGE_API_KEY"):
+        tier2_tasks.append(_alphavantage_news(ticker, cutoff))
+        tier2_sources.append("Alpha Vantage News")
+
+    if os.environ.get("NEWSAPI_KEY"):
+        tier2_tasks.append(_newsapi_news(ticker, cutoff))
+        tier2_sources.append("NewsAPI.org")
+
+    # Gather all in parallel
+    all_tasks = tier1_tasks + tier2_tasks
+    all_sources = tier1_sources + tier2_sources
+
+    results = await asyncio.gather(*all_tasks, return_exceptions=True)
 
     sections = []
-    sources = ["Yahoo Finance RSS", "Google News RSS", "SEC EDGAR Filings"]
-
-    for source, result in zip(sources, results):
+    for source, result in zip(all_sources, results):
         if isinstance(result, Exception):
             logger.warning("News source %s failed: %s", source, result)
             sections.append(f"**{source}**: Error - {result}")
@@ -308,4 +334,220 @@ async def scan_reddit(ticker: str, hours: int = 24) -> str:
         return "Error: httpx not installed"
     except Exception as e:
         logger.error("Reddit scan failed for %s: %s", ticker, e)
+        return f"Error: {e}"
+
+
+async def _finnhub_news(ticker: str, cutoff: datetime) -> str:
+    """Fetch news from Finnhub API.
+
+    Finnhub provides high-quality news from major outlets with good spam filtering.
+    Free tier: 60 calls/min
+
+    API key: Get free at https://finnhub.io/register
+    Set: export FINNHUB_API_KEY=your_key_here
+    """
+    try:
+        import httpx
+
+        api_key = os.environ.get("FINNHUB_API_KEY")
+        if not api_key:
+            return ""
+
+        # Calculate date range (Finnhub uses YYYY-MM-DD format)
+        from_date = cutoff.strftime("%Y-%m-%d")
+        to_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+        url = "https://finnhub.io/api/v1/company-news"
+        params = {
+            "symbol": ticker,
+            "from": from_date,
+            "to": to_date,
+            "token": api_key,
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            articles = resp.json()
+
+        if not articles:
+            return ""
+
+        headlines = []
+        for article in articles[:10]:  # Top 10
+            headline = article.get("headline", "")
+            url = article.get("url", "")
+            source = article.get("source", "Unknown")
+            published = article.get("datetime", 0)
+
+            # Convert Unix timestamp to datetime
+            if published:
+                published_dt = datetime.fromtimestamp(published, tz=timezone.utc)
+                if published_dt < cutoff:
+                    continue
+
+            headlines.append(f"- {headline} ({source})\n  {url}")
+
+        if not headlines:
+            return ""
+
+        return "\n".join(headlines)
+
+    except Exception as e:
+        logger.error("Finnhub API failed for %s: %s", ticker, e)
+        return f"Error: {e}"
+
+
+async def _alphavantage_news(ticker: str, cutoff: datetime) -> str:
+    """Fetch news with AI sentiment scoring from Alpha Vantage.
+
+    Alpha Vantage provides news articles with AI-generated sentiment scores.
+    Free tier: 500 calls/day
+
+    API key: Get free at https://www.alphavantage.co/support/#api-key
+    Set: export ALPHAVANTAGE_API_KEY=your_key_here
+    """
+    try:
+        import httpx
+
+        api_key = os.environ.get("ALPHAVANTAGE_API_KEY")
+        if not api_key:
+            return ""
+
+        url = "https://www.alphavantage.co/query"
+        params = {
+            "function": "NEWS_SENTIMENT",
+            "tickers": ticker,
+            "apikey": api_key,
+            "limit": 50,  # Get more to filter by time
+        }
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        feed = data.get("feed", [])
+        if not feed:
+            return ""
+
+        headlines = []
+        for article in feed:
+            # Parse timestamp (format: "20260216T093000")
+            time_published = article.get("time_published", "")
+            if time_published:
+                try:
+                    published_dt = datetime.strptime(time_published, "%Y%m%dT%H%M%S")
+                    published_dt = published_dt.replace(tzinfo=timezone.utc)
+                    if published_dt < cutoff:
+                        continue
+                except ValueError:
+                    pass  # Skip if can't parse
+
+            title = article.get("title", "")
+            url = article.get("url", "")
+
+            # Get sentiment score for this ticker
+            sentiment_score = 0.0
+            relevance_score = 0.0
+            for ticker_sentiment in article.get("ticker_sentiment", []):
+                if ticker_sentiment.get("ticker") == ticker:
+                    sentiment_score = float(ticker_sentiment.get("ticker_sentiment_score", 0))
+                    relevance_score = float(ticker_sentiment.get("relevance_score", 0))
+                    break
+
+            # Format sentiment: -1 to 1 scale
+            sentiment_label = "neutral"
+            if sentiment_score > 0.15:
+                sentiment_label = "bullish"
+            elif sentiment_score < -0.15:
+                sentiment_label = "bearish"
+
+            headlines.append(
+                f"- {title} (sentiment: {sentiment_label} {sentiment_score:+.2f}, "
+                f"relevance: {relevance_score:.2f})\n  {url}"
+            )
+
+            if len(headlines) >= 10:
+                break
+
+        if not headlines:
+            return ""
+
+        return "\n".join(headlines)
+
+    except Exception as e:
+        logger.error("Alpha Vantage API failed for %s: %s", ticker, e)
+        return f"Error: {e}"
+
+
+async def _newsapi_news(ticker: str, cutoff: datetime) -> str:
+    """Fetch news from NewsAPI.org.
+
+    NewsAPI aggregates from 80,000+ sources including WSJ, Reuters, Bloomberg.
+    Free tier: 100 requests/day (development only)
+
+    API key: Get free at https://newsapi.org/register
+    Set: export NEWSAPI_KEY=your_key_here
+    """
+    try:
+        import httpx
+
+        api_key = os.environ.get("NEWSAPI_KEY")
+        if not api_key:
+            return ""
+
+        url = "https://newsapi.org/v2/everything"
+
+        # Calculate time range (NewsAPI uses ISO 8601)
+        from_time = cutoff.isoformat()
+        to_time = datetime.now(timezone.utc).isoformat()
+
+        # Search for ticker + company name for better results
+        # Note: Ideally we'd have a ticker → company name mapping
+        query = f"{ticker} stock"
+
+        params = {
+            "q": query,
+            "from": from_time,
+            "to": to_time,
+            "sortBy": "publishedAt",
+            "language": "en",
+            "apiKey": api_key,
+        }
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        articles = data.get("articles", [])
+        if not articles:
+            return ""
+
+        headlines = []
+        for article in articles[:10]:  # Top 10
+            title = article.get("title", "")
+            url = article.get("url", "")
+            source = article.get("source", {}).get("name", "Unknown")
+            published = article.get("publishedAt", "")
+
+            # NewsAPI returns ISO format timestamps
+            if published:
+                try:
+                    published_dt = datetime.fromisoformat(published.replace("Z", "+00:00"))
+                    if published_dt < cutoff:
+                        continue
+                except ValueError:
+                    pass
+
+            headlines.append(f"- {title} ({source})\n  {url}")
+
+        if not headlines:
+            return ""
+
+        return "\n".join(headlines)
+
+    except Exception as e:
+        logger.error("NewsAPI failed for %s: %s", ticker, e)
         return f"Error: {e}"
