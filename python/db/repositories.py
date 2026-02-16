@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
-from typing import Any
+from decimal import Decimal
 
 import asyncpg
 
@@ -152,7 +151,7 @@ class Database:
             json.dumps(rec.get("risk_verification"), default=str),
         )
 
-    # --- Positions (read-only from Python — Rust writes these) ---
+    # --- Positions ---
 
     async def get_open_positions(self) -> list[dict]:
         rows = await self.pool.fetch(
@@ -163,6 +162,111 @@ class Database:
             """
         )
         return [dict(r) for r in rows]
+
+    async def insert_position(self, position: dict) -> int:
+        return await self.pool.fetchval(
+            """
+            INSERT INTO options_positions
+                (recommendation_id, ticker, right, strike, expiry,
+                 quantity, avg_fill_price, current_price, cost_basis,
+                 unrealized_pnl, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open')
+            RETURNING id
+            """,
+            position["recommendation_id"],
+            position["ticker"],
+            position["right"],
+            position["strike"],
+            position["expiry"],
+            position["quantity"],
+            position["avg_fill_price"],
+            position["current_price"],
+            position["cost_basis"],
+            position.get("unrealized_pnl", 0.0),
+        )
+
+    async def update_position_price(
+        self, position_id: int, current_price: Decimal, unrealized_pnl: Decimal
+    ):
+        await self.pool.execute(
+            """
+            UPDATE options_positions
+            SET current_price = $2, unrealized_pnl = $3, updated_at = NOW()
+            WHERE id = $1
+            """,
+            position_id,
+            current_price,
+            unrealized_pnl,
+        )
+
+    async def partial_close_position(
+        self, position_id: int, new_quantity: int, realized_pnl: Decimal
+    ):
+        """Update a position after a partial close (reduce quantity, add realized P&L)."""
+        await self.pool.execute(
+            """
+            UPDATE options_positions
+            SET quantity = $2, realized_pnl = realized_pnl + $3, updated_at = NOW()
+            WHERE id = $1
+            """,
+            position_id,
+            new_quantity,
+            realized_pnl,
+        )
+
+    async def close_position(self, position_id: int, reason: str, realized_pnl: Decimal):
+        await self.pool.execute(
+            """
+            UPDATE options_positions
+            SET status = 'closed', close_reason = $2, realized_pnl = $3, closed_at = NOW()
+            WHERE id = $1
+            """,
+            position_id,
+            reason,
+            realized_pnl,
+        )
+
+    async def get_total_options_exposure(self) -> Decimal:
+        val = await self.pool.fetchval(
+            "SELECT COALESCE(SUM(cost_basis), 0) FROM options_positions WHERE status = 'open'"
+        )
+        return Decimal(str(val))
+
+    # --- Recommendations (approval + status) ---
+
+    async def get_approved_recommendations(self) -> list[dict]:
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM trade_recommendations
+            WHERE status = 'approved'
+            ORDER BY approved_at ASC
+            """
+        )
+        return [dict(r) for r in rows]
+
+    async def update_recommendation_status(
+        self, rec_id: int, status: str, reason: str | None = None
+    ):
+        await self.pool.execute(
+            """
+            UPDATE trade_recommendations
+            SET status = $2, rejection_reason = $3
+            WHERE id = $1
+            """,
+            rec_id,
+            status,
+            reason,
+        )
+
+    async def approve_recommendation(self, rec_id: int):
+        await self.pool.execute(
+            """
+            UPDATE trade_recommendations
+            SET status = 'approved', approved_at = NOW()
+            WHERE id = $1
+            """,
+            rec_id,
+        )
 
     # --- Recent workflow runs ---
 

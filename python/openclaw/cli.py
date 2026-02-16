@@ -38,6 +38,23 @@ def main():
     research_parser = subparsers.add_parser("research", help="Run research pipeline only")
     research_parser.add_argument("ticker", help="Ticker symbol")
 
+    # approve <rec_id> — approve a pending recommendation
+    approve_parser = subparsers.add_parser("approve", help="Approve a trade recommendation")
+    approve_parser.add_argument("rec_id", type=int, help="Recommendation ID to approve")
+
+    # position-manager — run the position management service loop
+    pm_parser = subparsers.add_parser(
+        "position-manager", help="Run the position manager service"
+    )
+    pm_parser.add_argument(
+        "--mode", choices=["paper", "live"], default="paper",
+        help="Trading mode (default: paper)",
+    )
+    pm_parser.add_argument(
+        "--poll-interval", type=int, default=30,
+        help="Seconds between poll cycles (default: 30)",
+    )
+
     # status
     subparsers.add_parser("status", help="Show running/recent workflows")
 
@@ -74,8 +91,8 @@ async def _init_engine(args):
     """Initialize the workflow engine with agents and DB."""
     from agents.analyst import AnalystAgent
     from agents.researcher import ResearcherAgent
-    from agents.risk_checker import RiskCheckerAgent
     from agents.reviewer import ReviewerAgent
+    from agents.risk_checker import RiskCheckerAgent
     from openclaw.engine import WorkflowEngine
     from openclaw.llm import LLMClient
     from openclaw.notify import TelegramNotifier
@@ -105,12 +122,26 @@ async def _init_engine(args):
     return engine
 
 
+async def _init_db(args):
+    """Initialize just the DB connection (no engine needed)."""
+    db_url = getattr(args, "db_url", None)
+    if not db_url:
+        print("Error: --db-url required for this command")
+        sys.exit(1)
+    from db.repositories import Database
+    return await Database.connect(db_url)
+
+
 async def _dispatch(args):
     """Route CLI commands to handlers."""
     if args.command == "run":
         await _cmd_run(args)
     elif args.command == "research":
         await _cmd_research(args)
+    elif args.command == "approve":
+        await _cmd_approve(args)
+    elif args.command == "position-manager":
+        await _cmd_position_manager(args)
     elif args.command == "status":
         print("Status: not yet connected to database")
     elif args.command == "watchlist":
@@ -147,11 +178,58 @@ async def _cmd_run(args):
 
     if result is None:
         print("\nWorkflow did not produce a final result (aborted or escalated).")
-    else:
-        print(f"\n{'='*60}")
-        print("  RESULT")
-        print(f"{'='*60}")
-        print(json.dumps(result.model_dump(), indent=2, default=str))
+        return
+
+    print(f"\n{'='*60}")
+    print("  RESULT")
+    print(f"{'='*60}")
+    print(json.dumps(result.final_output.model_dump(), indent=2, default=str))
+
+    # If workflow produced an approved risk verification with a recommended contract,
+    # save a TradeRecommendation to DB for manual approval.
+    await _maybe_save_recommendation(engine, result, args)
+
+
+async def _maybe_save_recommendation(engine, result, args):
+    """Save a TradeRecommendation if the workflow produced one."""
+    from schemas.risk import RiskVerification
+    from schemas.thesis import Thesis
+
+    # Need both the thesis (with contract) and the risk verification (approved)
+    thesis = result.step_outputs.get("evaluate")
+    verification = result.step_outputs.get("verify")
+
+    if not isinstance(thesis, Thesis) or not isinstance(verification, RiskVerification):
+        return
+    if not verification.approved or thesis.recommended_contract is None:
+        return
+
+    # Check if we have a real DB (not in-memory)
+    if not hasattr(engine.db, "save_thesis"):
+        return
+
+    try:
+        # Save thesis first
+        thesis_id = await engine.db.save_thesis(result.run_id, thesis.model_dump())
+
+        # Build and save recommendation
+        rec_data = {
+            "contract": thesis.recommended_contract.model_dump(),
+            "position_size_pct": str(verification.position_size_pct),
+            "position_size_usd": str(
+                verification.position_size_pct * 200000 / 100  # TODO: use real equity
+            ),
+            "exit_targets": ["+50% sell half", "+100% close"],
+            "stop_loss": "-50% hard stop",
+            "max_hold_days": 30,
+            "risk_verification": verification.model_dump(),
+        }
+        rec_id = await engine.db.save_recommendation(thesis_id, result.run_id, rec_data)
+
+        print(f"\nRecommendation #{rec_id} saved (status: pending_review).")
+        print(f"Run 'openclaw approve {rec_id} --db-url ...' to approve for execution.")
+    except Exception:
+        logger.exception("Failed to save recommendation")
 
 
 async def _cmd_research(args):
@@ -164,6 +242,48 @@ async def _cmd_research(args):
     print(f"Gathering research data for {ticker}...\n")
     raw = await pipeline.gather(ticker)
     print(raw)
+
+
+async def _cmd_approve(args):
+    """Approve a pending trade recommendation."""
+    db = await _init_db(args)
+
+    try:
+        await db.approve_recommendation(args.rec_id)
+        print(f"Recommendation #{args.rec_id} approved.")
+        print("The position manager will pick it up on the next poll cycle.")
+    finally:
+        await db.close()
+
+
+async def _cmd_position_manager(args):
+    """Run the position manager service loop."""
+    from ib.position_manager import PositionManager
+    from ib.types import ManagerConfig
+    from openclaw.notify import TelegramNotifier
+
+    db = await _init_db(args)
+    notifier = TelegramNotifier()
+
+    config = ManagerConfig(poll_interval_secs=args.poll_interval)
+
+    if args.mode == "paper":
+        from ib.paper import PaperClient
+        ib_client = PaperClient()
+        print("Starting position manager in PAPER mode")
+    else:
+        from ib.client import IBClient
+        ib_client = IBClient()
+        print("Starting position manager in LIVE mode")
+
+    manager = PositionManager(db=db, ib_client=ib_client, config=config, notifier=notifier)
+
+    try:
+        await manager.run()
+    except KeyboardInterrupt:
+        print("\nPosition manager stopped.")
+    finally:
+        await db.close()
 
 
 if __name__ == "__main__":

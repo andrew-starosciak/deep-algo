@@ -61,6 +61,15 @@ class StepResult:
     error: str | None = None
 
 
+@dataclass
+class WorkflowResult:
+    """Complete result of a workflow run, including all intermediate outputs."""
+
+    final_output: BaseModel
+    step_outputs: dict[str, BaseModel]  # step_id -> output
+    run_id: int
+
+
 class WorkflowEngine:
     """Execute workflows as sequential agent steps with gating."""
 
@@ -82,8 +91,8 @@ class WorkflowEngine:
         self,
         workflow: WorkflowDef,
         initial_input: BaseModel,
-    ) -> BaseModel | None:
-        """Execute a workflow end-to-end. Returns final output or None if aborted."""
+    ) -> WorkflowResult | None:
+        """Execute a workflow end-to-end. Returns WorkflowResult or None if aborted."""
         run_id = await self.db.create_workflow_run(
             workflow_id=workflow.id,
             trigger="manual",
@@ -120,7 +129,15 @@ class WorkflowEngine:
             status="completed",
             result=context.model_dump(),
         )
-        return context
+
+        step_outputs = {
+            r.step_id: r.output for r in all_results if r.output is not None
+        }
+        return WorkflowResult(
+            final_output=context,
+            step_outputs=step_outputs,
+            run_id=run_id,
+        )
 
     async def _execute_step(
         self,
