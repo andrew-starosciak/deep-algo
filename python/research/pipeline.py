@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from research import edgar, earnings, flow, fred, news, premarket, technicals
+from research import edgar, earnings, flow, fred, news, premarket, sectors, technicals
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +49,11 @@ class ResearchPipeline:
         if mode == "weekly_deep_dive":
             tasks.append(fred.economic_calendar())
             labels.append("ECONOMIC CALENDAR")
+
+        # Add sector rotation for deep dives (macro context)
+        if mode == "weekly_deep_dive":
+            tasks.append(sectors.rotation_snapshot(ticker))
+            labels.append("SECTOR ROTATION")
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
