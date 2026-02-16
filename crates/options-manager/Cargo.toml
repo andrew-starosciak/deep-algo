@@ -1,0 +1,25 @@
+[package]
+name = "algo-trade-options-manager"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic options position management — stops, targets, allocation"
+license = "MIT"
+readme = false
+
+[dependencies]
+algo-trade-core = { path = "../core" }
+algo-trade-data = { path = "../data" }
+algo-trade-ib = { path = "../exchange-ib" }
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true }
+serde_json = "1.0"
+anyhow = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+chrono = { version = "0.4", features = ["serde"] }
+rust_decimal = "1.38"
+rust_decimal_macros = "1.38"
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "chrono", "rust_decimal", "json"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
