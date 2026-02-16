@@ -33,6 +33,10 @@ def main():
         "--model", default="claude-sonnet-4-5-20250929",
         help="Claude model to use",
     )
+    run_parser.add_argument(
+        "--equity", type=float, default=None,
+        help="Account equity for position sizing (queries IB if omitted)",
+    )
 
     # research <ticker> — quick research without full workflow
     research_parser = subparsers.add_parser("research", help="Run research pipeline only")
@@ -67,7 +71,15 @@ def main():
     wl_sub.add_parser("show", help="Show current watchlist")
 
     # scheduler
-    subparsers.add_parser("scheduler", help="Start the cron scheduler daemon")
+    sched_parser = subparsers.add_parser("scheduler", help="Start the cron scheduler daemon")
+    sched_parser.add_argument(
+        "--mode", choices=["paper", "live"], default="paper",
+        help="Trading mode for position management (default: paper)",
+    )
+    sched_parser.add_argument(
+        "--model", default="claude-sonnet-4-5-20250929",
+        help="Claude model to use for workflows",
+    )
 
     args = parser.parse_args()
 
@@ -147,7 +159,7 @@ async def _dispatch(args):
     elif args.command == "watchlist":
         print("Watchlist: not yet connected to database")
     elif args.command == "scheduler":
-        print("Scheduler: not yet implemented")
+        await _cmd_scheduler(args)
 
 
 async def _cmd_run(args):
@@ -190,8 +202,23 @@ async def _cmd_run(args):
     await _maybe_save_recommendation(engine, result, args)
 
 
+async def _get_equity(args):
+    """Resolve account equity: CLI flag > IB paper query > default."""
+    from decimal import Decimal
+
+    equity_flag = getattr(args, "equity", None)
+    if equity_flag is not None:
+        return Decimal(str(equity_flag))
+
+    # Default — position manager will re-check with real IB data before executing
+    logger.info("No --equity specified, using default $200,000 for recommendation sizing")
+    return Decimal("200000")
+
+
 async def _maybe_save_recommendation(engine, result, args):
     """Save a TradeRecommendation if the workflow produced one."""
+    from decimal import Decimal
+
     from schemas.risk import RiskVerification
     from schemas.thesis import Thesis
 
@@ -209,6 +236,9 @@ async def _maybe_save_recommendation(engine, result, args):
         return
 
     try:
+        equity = await _get_equity(args)
+        position_size_usd = verification.position_size_pct * equity / Decimal("100")
+
         # Save thesis first
         thesis_id = await engine.db.save_thesis(result.run_id, thesis.model_dump())
 
@@ -216,9 +246,7 @@ async def _maybe_save_recommendation(engine, result, args):
         rec_data = {
             "contract": thesis.recommended_contract.model_dump(),
             "position_size_pct": str(verification.position_size_pct),
-            "position_size_usd": str(
-                verification.position_size_pct * 200000 / 100  # TODO: use real equity
-            ),
+            "position_size_usd": str(position_size_usd),
             "exit_targets": ["+50% sell half", "+100% close"],
             "stop_loss": "-50% hard stop",
             "max_hold_days": 30,
@@ -227,7 +255,9 @@ async def _maybe_save_recommendation(engine, result, args):
         rec_id = await engine.db.save_recommendation(thesis_id, result.run_id, rec_data)
 
         print(f"\nRecommendation #{rec_id} saved (status: pending_review).")
-        print(f"Run 'openclaw approve {rec_id} --db-url ...' to approve for execution.")
+        pct = verification.position_size_pct
+        print(f"  Equity: ${equity:,.0f} | Size: {pct}% = ${position_size_usd:,.0f}")
+        print(f"  Run 'openclaw approve {rec_id} --db-url ...' to approve for execution.")
     except Exception:
         logger.exception("Failed to save recommendation")
 
@@ -282,6 +312,43 @@ async def _cmd_position_manager(args):
         await manager.run()
     except KeyboardInterrupt:
         print("\nPosition manager stopped.")
+    finally:
+        await db.close()
+
+
+async def _cmd_scheduler(args):
+    """Start the cron scheduler daemon with workflows + position management."""
+    from openclaw.notify import TelegramNotifier
+    from openclaw.scheduler import WorkflowScheduler
+
+    db = await _init_db(args)
+    engine = await _init_engine(args)
+    notifier = TelegramNotifier()
+
+    if args.mode == "paper":
+        from ib.paper import PaperClient
+        ib_client = PaperClient()
+        print("Scheduler starting in PAPER mode")
+    else:
+        from ib.client import IBClient
+        ib_client = IBClient()
+        print("Scheduler starting in LIVE mode")
+
+    scheduler = WorkflowScheduler(
+        engine=engine, db=db, ib_client=ib_client, notifier=notifier,
+    )
+
+    print("Registered schedules:")
+    print("  - 8:00 AM ET Mon-Fri: Pre-market research (trade-thesis for watchlist)")
+    print("  - 12:30 PM ET Mon-Fri: Midday position check")
+    print("  - 4:30 PM ET Mon-Fri: Post-market position check")
+    print("  - 10:00 AM ET Saturday: Weekly deep dive")
+    print()
+
+    try:
+        await scheduler.start()
+    except KeyboardInterrupt:
+        print("\nScheduler stopped.")
     finally:
         await db.close()
 
