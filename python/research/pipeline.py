@@ -55,6 +55,11 @@ class ResearchPipeline:
             tasks.append(sectors.rotation_snapshot(ticker))
             labels.append("SECTOR ROTATION")
 
+        # Add earnings transcript for deep dives (if available)
+        if mode == "weekly_deep_dive":
+            tasks.append(earnings.recent_transcript(ticker))
+            labels.append("EARNINGS TRANSCRIPT")
+
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
         sections = []
