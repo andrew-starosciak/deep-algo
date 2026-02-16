@@ -23,3 +23,6 @@ docker-data/
 # AWS latency test state
 scripts/.aws-latency-test.state
 scripts/.aws-latency-key.pem
+
+# Claude Code settings (contains API key)
+.claude/settings.json
