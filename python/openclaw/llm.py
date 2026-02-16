@@ -32,10 +32,9 @@ class LLMClient:
     ):
         self.model = model
         self.max_tokens = max_tokens
-        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
-
-        if not self.api_key:
-            logger.warning("ANTHROPIC_API_KEY not set — LLM calls will fail")
+        # Note: claude CLI uses its own OAuth session, not ANTHROPIC_API_KEY
+        # The api_key parameter is kept for backwards compatibility but not used
+        self.api_key = api_key
 
     async def structured_output(
         self,
@@ -82,16 +81,13 @@ Your response must be parseable as JSON directly."""
         return await self._call_claude(prompt, system)
 
     async def _call_claude(self, prompt: str, system: str | None = None) -> str:
-        """Call claude CLI via subprocess."""
+        """Call claude CLI via subprocess.
+
+        The claude CLI uses OAuth authentication stored by Claude Code,
+        not ANTHROPIC_API_KEY environment variable.
+        """
 
         def _run():
-            env = os.environ.copy()
-            if self.api_key:
-                env["ANTHROPIC_API_KEY"] = self.api_key
-                logger.debug("Set ANTHROPIC_API_KEY in env: %s...", self.api_key[:15])
-            else:
-                logger.warning("No API key available!")
-
             cmd = [
                 "claude",
                 "-p",
@@ -111,7 +107,6 @@ Your response must be parseable as JSON directly."""
                 input=full_prompt,
                 capture_output=True,
                 text=True,
-                env=env,
                 timeout=120,
             )
 
