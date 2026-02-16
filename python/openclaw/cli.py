@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
+
+logger = logging.getLogger(__name__)
 
 
 def main():
@@ -16,33 +19,35 @@ def main():
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable debug logging"
     )
+    parser.add_argument(
+        "--db-url", help="Postgres connection URL (omit for in-memory mode)"
+    )
 
     subparsers = parser.add_subparsers(dest="command")
 
     # run <workflow> [--ticker TICKER]
     run_parser = subparsers.add_parser("run", help="Run a workflow")
-    run_parser.add_argument("workflow", help="Workflow name (e.g., trade-thesis, premarket-prep)")
+    run_parser.add_argument("workflow", help="Workflow name (e.g., trade-thesis)")
     run_parser.add_argument("--ticker", help="Ticker symbol (for trade-thesis workflow)")
+    run_parser.add_argument(
+        "--model", default="claude-sonnet-4-5-20250929",
+        help="Claude model to use",
+    )
+
+    # research <ticker> — quick research without full workflow
+    research_parser = subparsers.add_parser("research", help="Run research pipeline only")
+    research_parser.add_argument("ticker", help="Ticker symbol")
 
     # status
     subparsers.add_parser("status", help="Show running/recent workflows")
 
-    # history
-    subparsers.add_parser("history", help="Past workflow runs and outcomes")
-
     # watchlist
     wl_parser = subparsers.add_parser("watchlist", help="Manage watchlist")
     wl_sub = wl_parser.add_subparsers(dest="wl_command")
-
     wl_add = wl_sub.add_parser("add", help="Add ticker to watchlist")
-    wl_add.add_argument("ticker", help="Ticker symbol")
-    wl_add.add_argument("--sector", required=True, help="Sector classification")
-    wl_add.add_argument("--notes", help="Optional notes")
-
+    wl_add.add_argument("ticker")
+    wl_add.add_argument("--sector", required=True)
     wl_sub.add_parser("show", help="Show current watchlist")
-
-    wl_rm = wl_sub.add_parser("remove", help="Remove ticker from watchlist")
-    wl_rm.add_argument("ticker", help="Ticker symbol")
 
     # scheduler
     subparsers.add_parser("scheduler", help="Start the cron scheduler daemon")
@@ -53,6 +58,10 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # Quiet noisy libraries
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("yfinance").setLevel(logging.WARNING)
 
     if args.command is None:
         parser.print_help()
@@ -61,42 +70,100 @@ def main():
     asyncio.run(_dispatch(args))
 
 
+async def _init_engine(args):
+    """Initialize the workflow engine with agents and DB."""
+    from agents.analyst import AnalystAgent
+    from agents.researcher import ResearcherAgent
+    from agents.risk_checker import RiskCheckerAgent
+    from agents.reviewer import ReviewerAgent
+    from openclaw.engine import WorkflowEngine
+    from openclaw.llm import LLMClient
+    from openclaw.notify import TelegramNotifier
+
+    # DB: Postgres if URL provided, else in-memory
+    db_url = getattr(args, "db_url", None)
+    if db_url:
+        from db.repositories import Database
+        db = await Database.connect(db_url)
+    else:
+        from db.memory import MemoryDatabase
+        db = MemoryDatabase()
+        logger.info("Using in-memory database (no --db-url provided)")
+
+    model = getattr(args, "model", "claude-sonnet-4-5-20250929")
+    llm = LLMClient(model=model)
+    notifier = TelegramNotifier()
+
+    engine = WorkflowEngine(db=db, llm=llm, notifier=notifier)
+
+    # Register all agents
+    engine.register_agent("researcher", ResearcherAgent(llm=llm, db=db))
+    engine.register_agent("analyst", AnalystAgent(llm=llm, db=db))
+    engine.register_agent("risk_checker", RiskCheckerAgent(llm=llm, db=db))
+    engine.register_agent("reviewer", ReviewerAgent(llm=llm, db=db))
+
+    return engine
+
+
 async def _dispatch(args):
-    """Route CLI commands to the appropriate handler."""
+    """Route CLI commands to handlers."""
     if args.command == "run":
-        print(f"Running workflow: {args.workflow}")
-        if args.ticker:
-            print(f"  Ticker: {args.ticker}")
-        # TODO: Initialize engine, load workflow, execute
-        print("  (not yet implemented — scaffolding only)")
-
+        await _cmd_run(args)
+    elif args.command == "research":
+        await _cmd_research(args)
     elif args.command == "status":
-        print("Recent workflow runs:")
-        # TODO: Query workflow_runs table
-        print("  (not yet implemented)")
-
-    elif args.command == "history":
-        print("Workflow history:")
-        # TODO: Query workflow_runs + step_logs
-        print("  (not yet implemented)")
-
+        print("Status: not yet connected to database")
     elif args.command == "watchlist":
-        if args.wl_command == "add":
-            print(f"Adding {args.ticker} to watchlist (sector: {args.sector})")
-            # TODO: INSERT INTO options_watchlist
-        elif args.wl_command == "show":
-            print("Current watchlist:")
-            # TODO: SELECT FROM options_watchlist
-        elif args.wl_command == "remove":
-            print(f"Removing {args.ticker} from watchlist")
-            # TODO: DELETE FROM options_watchlist
-        else:
-            print("Usage: openclaw watchlist {add|show|remove}")
-
+        print("Watchlist: not yet connected to database")
     elif args.command == "scheduler":
-        print("Starting scheduler daemon...")
-        # TODO: Initialize engine + scheduler, run
-        print("  (not yet implemented)")
+        print("Scheduler: not yet implemented")
+
+
+async def _cmd_run(args):
+    """Run a named workflow."""
+    from openclaw.workflows import get_workflow
+    from schemas.research import ResearchRequest
+
+    workflow = get_workflow(args.workflow)
+    engine = await _init_engine(args)
+
+    # Build initial input based on workflow type
+    if args.workflow == "trade-thesis":
+        if not args.ticker:
+            print("Error: --ticker required for trade-thesis workflow")
+            sys.exit(1)
+        initial_input = ResearchRequest(ticker=args.ticker.upper())
+    else:
+        print(f"Error: No input builder for workflow '{args.workflow}'")
+        sys.exit(1)
+
+    print(f"\n{'='*60}")
+    print(f"  Workflow: {workflow.name}")
+    print(f"  Input:    {initial_input.model_dump()}")
+    print(f"  Steps:    {' → '.join(s.id for s in workflow.steps)}")
+    print(f"{'='*60}\n")
+
+    result = await engine.run(workflow, initial_input)
+
+    if result is None:
+        print("\nWorkflow did not produce a final result (aborted or escalated).")
+    else:
+        print(f"\n{'='*60}")
+        print("  RESULT")
+        print(f"{'='*60}")
+        print(json.dumps(result.model_dump(), indent=2, default=str))
+
+
+async def _cmd_research(args):
+    """Run just the research pipeline for a ticker (no LLM, no workflow)."""
+    from research.pipeline import ResearchPipeline
+
+    pipeline = ResearchPipeline()
+    ticker = args.ticker.upper()
+
+    print(f"Gathering research data for {ticker}...\n")
+    raw = await pipeline.gather(ticker)
+    print(raw)
 
 
 if __name__ == "__main__":

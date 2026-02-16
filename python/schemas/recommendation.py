@@ -1,8 +1,6 @@
 """Trade recommendation schemas — the bridge between Python (LLM) and Rust (execution)."""
 
-from __future__ import annotations
-
-from datetime import date
+import datetime as _dt
 from decimal import Decimal
 from typing import Literal
 

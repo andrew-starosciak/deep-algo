@@ -18,7 +18,7 @@ async def next_event(ticker: str) -> str:
         stock = yf.Ticker(ticker)
         cal = stock.calendar
 
-        if cal is None or cal.empty:
+        if not cal:
             return f"No upcoming earnings data for {ticker}"
 
         lines = [f"Earnings calendar for {ticker}:"]

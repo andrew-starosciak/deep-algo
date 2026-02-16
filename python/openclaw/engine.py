@@ -6,9 +6,12 @@ structured output validation at every gate, retry with escalation on failure.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+
+logger = logging.getLogger(__name__)
 from typing import Any, Callable
 
 from pydantic import BaseModel
@@ -144,6 +147,7 @@ class WorkflowEngine:
                 output = None
                 passed = False
                 error = str(e)
+                logger.error("Step [%s] attempt %d error: %s", step.id, attempt, e, exc_info=True)
 
             duration_ms = int((time.monotonic() - start) * 1000)
 

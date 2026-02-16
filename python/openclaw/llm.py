@@ -1,19 +1,28 @@
-"""LLM client — structured output via Claude API + Instructor."""
+"""LLM client using claude CLI (Claude Code subscription)."""
 
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import os
+import re
+import subprocess
 from typing import TypeVar
 
-import anthropic
-import instructor
 from pydantic import BaseModel
 
 T = TypeVar("T", bound=BaseModel)
 
+logger = logging.getLogger(__name__)
+
 
 class LLMClient:
-    """Wrapper around Anthropic Claude API with structured output via Instructor."""
+    """LLM client using claude CLI with Claude Code subscription auth.
+
+    Each call is a fresh context window — no conversation history carried over.
+    Uses subprocess calls to `claude -p` instead of direct API calls.
+    """
 
     def __init__(
         self,
@@ -23,10 +32,10 @@ class LLMClient:
     ):
         self.model = model
         self.max_tokens = max_tokens
-        raw_client = anthropic.Anthropic(
-            api_key=api_key or os.environ.get("ANTHROPIC_API_KEY"),
-        )
-        self.client = instructor.from_anthropic(raw_client)
+        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+
+        if not self.api_key:
+            logger.warning("ANTHROPIC_API_KEY not set — LLM calls will fail")
 
     async def structured_output(
         self,
@@ -34,38 +43,114 @@ class LLMClient:
         response_model: type[T],
         system: str | None = None,
     ) -> T:
-        """Call the LLM and parse the response into a Pydantic model.
+        """Call claude CLI and parse into a Pydantic model.
 
-        Each call is a fresh context window — no conversation history carried over.
-        This matches the Antfarm pattern of isolated agent contexts.
+        Includes the JSON schema in the prompt to guide structured output.
         """
-        messages = [{"role": "user", "content": prompt}]
+        # Include schema in prompt for structured output
+        schema = response_model.model_json_schema()
+        schema_str = json.dumps(schema, indent=2)
 
-        response = self.client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=system or "You are a financial research analyst.",
-            messages=messages,
-            response_model=response_model,
+        full_prompt = f"""{prompt}
+
+IMPORTANT: Respond with ONLY valid JSON (no markdown code fences, no extra text) that matches this exact schema:
+
+{schema_str}
+
+Your response must be parseable as JSON directly."""
+
+        logger.debug(
+            "LLM call: model=%s schema=%s prompt_len=%d",
+            self.model, response_model.__name__, len(full_prompt),
         )
 
-        return response
+        text = await self._call_claude(full_prompt, system)
+
+        # Extract JSON from response (handle markdown fences if present)
+        json_str = self._extract_json(text)
+
+        logger.info("LLM response: schema=%s json_len=%d", response_model.__name__, len(json_str))
+
+        return response_model.model_validate_json(json_str)
 
     async def text_output(
         self,
         prompt: str,
         system: str | None = None,
     ) -> str:
-        """Call the LLM and return raw text (for summaries, battle plans, etc.)."""
-        raw_client = anthropic.Anthropic(
-            api_key=os.environ.get("ANTHROPIC_API_KEY"),
-        )
+        """Call claude CLI and return raw text."""
+        return await self._call_claude(prompt, system)
 
-        response = raw_client.messages.create(
-            model=self.model,
-            max_tokens=self.max_tokens,
-            system=system or "You are a financial research analyst.",
-            messages=[{"role": "user", "content": prompt}],
-        )
+    async def _call_claude(self, prompt: str, system: str | None = None) -> str:
+        """Call claude CLI via subprocess."""
 
-        return response.content[0].text
+        def _run():
+            env = os.environ.copy()
+            if self.api_key:
+                env["ANTHROPIC_API_KEY"] = self.api_key
+                logger.debug("Set ANTHROPIC_API_KEY in env: %s...", self.api_key[:15])
+            else:
+                logger.warning("No API key available!")
+
+            cmd = [
+                "claude",
+                "-p",
+                "--output-format", "json",
+                "--model", self.model,
+            ]
+            logger.debug("Running command: %s", ' '.join(cmd))
+
+            if system:
+                # Prepend system message to prompt (claude CLI doesn't have --system flag)
+                full_prompt = f"<system>{system}</system>\n\n{prompt}"
+            else:
+                full_prompt = prompt
+
+            result = subprocess.run(
+                cmd,
+                input=full_prompt,
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=120,
+            )
+
+            if result.returncode != 0:
+                logger.error("claude CLI failed: returncode=%d stdout=%s stderr=%s",
+                             result.returncode, result.stdout[:500], result.stderr[:500])
+                raise RuntimeError(
+                    f"claude CLI failed (rc={result.returncode}): "
+                    f"stderr={result.stderr[:200]} stdout={result.stdout[:200]}"
+                )
+
+            # Parse JSON envelope from claude CLI
+            try:
+                data = json.loads(result.stdout)
+            except json.JSONDecodeError as e:
+                logger.error("Failed to parse claude CLI output: %s", result.stdout[:200])
+                raise RuntimeError(f"Invalid JSON from claude CLI: {e}")
+
+            if data.get("is_error"):
+                error_msg = data.get("result", "Unknown error")
+                raise RuntimeError(f"claude CLI error: {error_msg}")
+
+            return data.get("result", "")
+
+        return await asyncio.get_event_loop().run_in_executor(None, _run)
+
+    def _extract_json(self, text: str) -> str:
+        """Extract JSON from text, handling markdown code fences."""
+        text = text.strip()
+
+        # Remove markdown fences if present
+        if text.startswith("```"):
+            # Find the content between fences
+            match = re.search(r'```(?:json)?\s*\n(.*?)\n```', text, re.DOTALL)
+            if match:
+                return match.group(1).strip()
+            # Fallback: strip first and last lines
+            lines = text.split('\n')
+            if len(lines) >= 3:
+                return '\n'.join(lines[1:-1]).strip()
+
+        return text

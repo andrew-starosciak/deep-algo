@@ -1,10 +1,8 @@
 """Thesis evaluation schemas."""
 
-from __future__ import annotations
-
-from datetime import date
+import datetime as _dt
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -40,7 +38,7 @@ class ContractSpec(BaseModel):
     ticker: str
     right: Literal["call", "put"]
     strike: Decimal
-    expiry: date
+    expiry: _dt.date
     strategy: Literal["naked", "debit_spread"] = "naked"
     entry_price_low: Decimal
     entry_price_high: Decimal
@@ -56,4 +54,4 @@ class Thesis(BaseModel):
     scores: ThesisScore
     supporting_evidence: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
-    recommended_contract: ContractSpec | None = None
+    recommended_contract: Optional[ContractSpec] = None

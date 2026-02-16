@@ -1,10 +1,8 @@
 """Research pipeline schemas."""
 
-from __future__ import annotations
-
-from datetime import date, datetime
+import datetime as _dt
 from decimal import Decimal
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -36,8 +34,8 @@ class Catalyst(BaseModel):
     """An upcoming catalyst event."""
 
     type: Literal["earnings", "fda", "fed", "macro", "other"]
-    date: date | None = None
-    days_until: int | None = None
+    date: Optional[_dt.date] = None
+    days_until: Optional[int] = None
     description: str
 
 
@@ -46,7 +44,7 @@ class NewsItem(BaseModel):
 
     headline: str
     source: str
-    timestamp: datetime | None = None
+    timestamp: Optional[_dt.datetime] = None
     relevance_score: float = 0.5
 
 
@@ -61,12 +59,12 @@ class ResearchSummary(BaseModel):
     """Structured output from the researcher agent."""
 
     ticker: str
-    timestamp: datetime
+    timestamp: _dt.datetime
     news_summary: str = ""
     news_items: list[NewsItem] = Field(default_factory=list)
     technicals: TechnicalLevels
     options_flow: OptionsFlowSummary = Field(default_factory=OptionsFlowSummary)
-    catalyst: Catalyst | None = None
+    catalyst: Optional[Catalyst] = None
     macro_context: str = ""
     iv_rank: float = Field(default=50.0, ge=0.0, le=100.0)
     opportunity_score: int = Field(default=5, ge=1, le=10)

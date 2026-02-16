@@ -55,10 +55,12 @@ class BaseAgent:
         extra_context = await self.gather_context(input_data)
         prompt_template = self._load_prompt()
 
-        prompt = prompt_template.format(
-            input=input_data.model_dump_json(indent=2),
-            **extra_context,
-        )
+        # Use simple string replacement instead of .format() to avoid issues
+        # with curly braces in raw data (e.g., JSON, code snippets)
+        replacements = {"input": input_data.model_dump_json(indent=2), **extra_context}
+        prompt = prompt_template
+        for key, value in replacements.items():
+            prompt = prompt.replace(f"{{{key}}}", str(value))
 
         return await self.llm.structured_output(
             system=f"You are a {self.role}.",

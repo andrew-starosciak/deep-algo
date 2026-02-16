@@ -2,27 +2,33 @@
 
 from __future__ import annotations
 
-from typing import Any
+import logging
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
 from agents.base import BaseAgent
 from openclaw.llm import LLMClient
+from research.pipeline import ResearchPipeline
+
+T = TypeVar("T", bound=BaseModel)
+
+logger = logging.getLogger(__name__)
 
 
 class ResearcherAgent(BaseAgent):
     """Gathers data from multiple sources, then uses LLM to synthesize."""
 
-    def __init__(self, llm: LLMClient, db: Any = None, research_pipeline: Any = None):
+    def __init__(self, llm: LLMClient, db: Any = None):
         super().__init__(llm, db)
-        self.research_pipeline = research_pipeline
+        self.pipeline = ResearchPipeline()
 
     @property
     def role(self) -> str:
         return (
             "senior equity research analyst specializing in options trading. "
             "You synthesize news, technicals, options flow, and macro data "
-            "into actionable research summaries with opportunity scores."
+            "into actionable research summaries with opportunity scores (1-10)."
         )
 
     @property
@@ -35,8 +41,6 @@ class ResearcherAgent(BaseAgent):
         ticker = data.get("ticker", "")
         mode = data.get("mode", "premarket")
 
-        if self.research_pipeline is None:
-            return {"raw_data": "Research pipeline not configured. Use input data only."}
-
-        raw = await self.research_pipeline.gather(ticker, mode)
-        return {"raw_data": raw}
+        logger.info("Gathering research data for %s (mode=%s)", ticker, mode)
+        raw = await self.pipeline.gather(ticker, mode)
+        return {"raw_data": raw, "ticker": ticker}

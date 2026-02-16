@@ -1,8 +1,7 @@
 """Risk verification schemas."""
 
-from __future__ import annotations
-
 from decimal import Decimal
+from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -18,4 +17,4 @@ class RiskVerification(BaseModel):
         default_factory=list,
         description="Correlation flags with HyperLiquid/Polymarket positions",
     )
-    rejection_reason: str | None = None
+    rejection_reason: Optional[str] = None
