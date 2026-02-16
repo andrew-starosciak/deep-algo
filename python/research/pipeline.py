@@ -15,21 +15,39 @@ class ResearchPipeline:
     """Gather data from all sources for a given ticker."""
 
     async def gather(self, ticker: str, mode: str = "premarket") -> str:
-        """Run all data sources in parallel, return combined raw text for LLM."""
+        """Run all data sources in parallel, return combined raw text for LLM.
+
+        Mode options:
+        - premarket: Quick scan before market open (news, technicals, flow)
+        - midday: Intraday check (lighter weight)
+        - postmarket: End of day review
+        - weekly_deep_dive: Comprehensive weekend analysis (includes Reddit sentiment)
+        """
         logger.info("Gathering research for %s (mode=%s)", ticker, mode)
 
-        results = await asyncio.gather(
+        # Core sources (always fetch)
+        tasks = [
             news.scan(ticker, hours=12),
             technicals.analyze(ticker),
             flow.unusual_activity(ticker),
             earnings.next_event(ticker),
             fred.macro_snapshot(),
-            return_exceptions=True,
-        )
-
-        sections = []
+        ]
         labels = ["NEWS", "TECHNICALS", "OPTIONS FLOW", "EARNINGS", "MACRO"]
 
+        # Add Reddit sentiment for deep dives (helps gauge retail positioning)
+        if mode == "weekly_deep_dive":
+            tasks.append(news.scan_reddit(ticker, hours=72))  # Last 3 days
+            labels.append("REDDIT SENTIMENT")
+
+        # Add economic calendar for deep dives
+        if mode == "weekly_deep_dive":
+            tasks.append(fred.economic_calendar())
+            labels.append("ECONOMIC CALENDAR")
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        sections = []
         for label, result in zip(labels, results):
             if isinstance(result, Exception):
                 sections.append(f"## {label}\nError: {result}")
