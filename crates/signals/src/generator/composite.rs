@@ -408,15 +408,31 @@ impl CompositeSignal {
     }
 
     /// Combines signals using weighted average.
+    ///
+    /// Only active signals (strength > 0) contribute to the denominator, so
+    /// dormant signals don't dilute the direction score of active ones.
     fn combine_weighted_average(&self, signals: &[(f64, SignalValue)]) -> SignalValue {
         if signals.is_empty() {
             return SignalValue::neutral();
         }
 
+        // Only count active signals (strength > 0) in the denominator so that
+        // dormant signals don't dilute the contributions of firing ones.
+        let active_weight: f64 = signals
+            .iter()
+            .filter(|(_, s)| s.strength > f64::EPSILON)
+            .map(|(w, _)| w)
+            .sum();
         let total_weight: f64 = signals.iter().map(|(w, _)| w).sum();
-        if total_weight < f64::EPSILON {
+
+        // Use active weight for direction score, fall back to total if none active
+        let denom = if active_weight > f64::EPSILON {
+            active_weight
+        } else if total_weight > f64::EPSILON {
+            total_weight
+        } else {
             return SignalValue::neutral();
-        }
+        };
 
         // Calculate weighted direction score: Up = +1, Down = -1, Neutral = 0
         let direction_score: f64 = signals
@@ -430,15 +446,23 @@ impl CompositeSignal {
                 w * dir_value * s.strength
             })
             .sum::<f64>()
-            / total_weight;
+            / denom;
 
-        // Calculate weighted average strength
-        let avg_strength: f64 =
-            signals.iter().map(|(w, s)| w * s.strength).sum::<f64>() / total_weight;
+        // Calculate weighted average strength (over active signals only)
+        let avg_strength: f64 = signals
+            .iter()
+            .filter(|(_, s)| s.strength > f64::EPSILON)
+            .map(|(w, s)| w * s.strength)
+            .sum::<f64>()
+            / denom;
 
-        // Calculate weighted average confidence
-        let avg_confidence: f64 =
-            signals.iter().map(|(w, s)| w * s.confidence).sum::<f64>() / total_weight;
+        // Calculate weighted average confidence (over active signals only)
+        let avg_confidence: f64 = signals
+            .iter()
+            .filter(|(_, s)| s.strength > f64::EPSILON)
+            .map(|(w, s)| w * s.confidence)
+            .sum::<f64>()
+            / denom;
 
         // Determine direction from score
         let direction = if direction_score > 0.1 {

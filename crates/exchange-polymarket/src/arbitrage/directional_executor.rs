@@ -15,6 +15,7 @@
 //! └── Render dashboard (or log in verbose mode)
 //! ```
 
+use crate::arbitrage::clob_timing_runner::ClobTimingRunnerStats;
 use crate::arbitrage::directional_detector::{Direction, DirectionalSignal};
 use crate::arbitrage::directional_runner::DirectionalRunnerStats;
 use crate::arbitrage::execution::{
@@ -101,7 +102,7 @@ impl Default for DirectionalExecutorConfig {
             kelly_fraction: 0.25,
             fixed_bet_size: None,
             min_bet_size: dec!(5),
-            max_bet_size: dec!(100),
+            max_bet_size: dec!(10),
             min_edge: 0.03,
             max_position_per_window: dec!(200),
             max_trades_per_window: 1,
@@ -329,8 +330,12 @@ pub struct DirectionalExecutor<E: PolymarketExecutor> {
     pending_settlements: Vec<DirectionalTradeRecord>,
     /// Gamma client for settlement resolution checks.
     gamma_client: GammaClient,
-    /// Runner stats (for dashboard).
+    /// Runner stats (for dashboard — directional-auto mode).
     runner_stats: Option<Arc<RwLock<DirectionalRunnerStats>>>,
+    /// CLOB timing runner stats (for dashboard — clob-timing mode).
+    clob_timing_stats: Option<Arc<RwLock<ClobTimingRunnerStats>>>,
+    /// Dashboard title (overridable per strategy).
+    dashboard_title: String,
     /// Stop flag.
     should_stop: Arc<AtomicBool>,
     /// Trade counter for ID generation.
@@ -364,6 +369,8 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             pending_settlements: Vec::new(),
             gamma_client: GammaClient::new(),
             runner_stats: None,
+            clob_timing_stats: None,
+            dashboard_title: "Directional Trading Bot".to_string(),
             should_stop: Arc::new(AtomicBool::new(false)),
             trade_counter: 0,
             db_pool: None,
@@ -399,6 +406,8 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             pending_settlements: Vec::new(),
             gamma_client: GammaClient::new(),
             runner_stats: None,
+            clob_timing_stats: None,
+            dashboard_title: "Directional Trading Bot".to_string(),
             should_stop: Arc::new(AtomicBool::new(false)),
             trade_counter: 0,
             db_pool: Some(db_pool),
@@ -407,9 +416,19 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
         }
     }
 
-    /// Sets the runner stats handle for dashboard display.
+    /// Sets the runner stats handle for dashboard display (directional-auto mode).
     pub fn set_runner_stats(&mut self, stats: Arc<RwLock<DirectionalRunnerStats>>) {
         self.runner_stats = Some(stats);
+    }
+
+    /// Sets the CLOB timing runner stats handle for dashboard display.
+    pub fn set_clob_timing_stats(&mut self, stats: Arc<RwLock<ClobTimingRunnerStats>>) {
+        self.clob_timing_stats = Some(stats);
+    }
+
+    /// Overrides the dashboard title (e.g., "CLOB Timing Strategy").
+    pub fn set_dashboard_title(&mut self, title: impl Into<String>) {
+        self.dashboard_title = title.into();
     }
 
     /// Returns the executor stats handle.
@@ -1073,12 +1092,24 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
         } else {
             None
         };
+        let clob_stats = if let Some(ref cs) = self.clob_timing_stats {
+            Some(cs.read().await.clone())
+        } else {
+            None
+        };
 
         // Clear screen and move cursor to top
         print!("\x1b[2J\x1b[H");
 
+        // Pad title to fit in the 66-char box
+        let title = &self.dashboard_title;
+        let pad = 64_usize.saturating_sub(8 + title.len());
         println!("\x1b[36m╔══════════════════════════════════════════════════════════════════╗\x1b[0m");
-        println!("\x1b[36m║\x1b[0m        \x1b[1;37mDirectional Trading Bot\x1b[0m                               \x1b[36m║\x1b[0m");
+        println!(
+            "\x1b[36m║\x1b[0m        \x1b[1;37m{}\x1b[0m{}\x1b[36m║\x1b[0m",
+            title,
+            " ".repeat(pad)
+        );
         println!("\x1b[36m╚══════════════════════════════════════════════════════════════════╝\x1b[0m");
         println!();
 
@@ -1106,7 +1137,35 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
         }
         println!();
 
-        // Spot prices from runner
+        // CLOB prices from clob-timing runner
+        if let Some(ref cs) = clob_stats {
+            if !cs.current_up_prices.is_empty() {
+                println!("\x1b[1;37m  CLOB Prices:\x1b[0m");
+                let mut coins: Vec<_> = cs.current_up_prices.keys().collect();
+                coins.sort();
+                for coin in coins {
+                    let up = cs.current_up_prices.get(coin).copied().unwrap_or(dec!(0));
+                    let down = cs.current_down_prices.get(coin).copied().unwrap_or(dec!(0));
+                    let displacement = if up > dec!(0.50) {
+                        up - dec!(0.50)
+                    } else {
+                        dec!(0.50) - up
+                    };
+                    let dir_arrow = if up > dec!(0.50) { "\x1b[32m▲\x1b[0m" } else if up < dec!(0.50) { "\x1b[31m▼\x1b[0m" } else { " " };
+                    println!(
+                        "    {:<4} Up:{:<6} Dn:{:<6} {} disp:{}",
+                        coin, up, down, dir_arrow, displacement,
+                    );
+                }
+                println!(
+                    "    \x1b[2mWindows:{} Signals:{} Errors:{}\x1b[0m",
+                    cs.windows_seen, cs.signals_emitted, cs.errors
+                );
+                println!();
+            }
+        }
+
+        // Spot prices from directional runner
         if let Some(ref rs) = runner_stats {
             println!("\x1b[1;37m  Spot Prices:\x1b[0m");
             for (coin, price) in &rs.current_spot_prices {
@@ -1267,7 +1326,7 @@ mod tests {
         let config = DirectionalExecutorConfig::default();
         assert!((config.kelly_fraction - 0.25).abs() < 0.001);
         assert_eq!(config.min_bet_size, dec!(5));
-        assert_eq!(config.max_bet_size, dec!(100));
+        assert_eq!(config.max_bet_size, dec!(10));
         assert!((config.min_edge - 0.03).abs() < 0.001);
         assert_eq!(config.max_position_per_window, dec!(200));
         assert_eq!(config.max_trades_per_window, 1);

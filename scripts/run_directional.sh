@@ -5,9 +5,14 @@
 # Runs the single-leg directional trading bot with spot price confirmation.
 #
 # Usage:
-#   ./scripts/run_directional.sh [options]
+#   ./scripts/run_directional.sh [options]           # Run locally
+#   ./scripts/run_directional.sh redeploy            # Build + upload binary + migrate on EC2
+#   ./scripts/run_directional.sh start [options]     # Start on EC2 (background)
+#   ./scripts/run_directional.sh stop                # Stop on EC2
+#   ./scripts/run_directional.sh logs                # Tail remote logs
+#   ./scripts/run_directional.sh ssh                 # SSH into EC2 instance
 #
-# Options:
+# Local options:
 #   --mode paper|live           Trading mode (default: paper)
 #   --duration <time>          How long to run (default: 1h)
 #   --coins <list>             Coins to trade (default: btc,eth,sol,xrp)
@@ -41,14 +46,29 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
     set +a
 fi
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-DIM='\033[2m'
-NC='\033[0m'
+# =============================================================================
+# EC2 support via shared library
+# =============================================================================
+
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/ec2-common.sh"
+
+_DIR_BOT_NAME="directional"
+_DIR_PID_FILE="/tmp/directional.pid"
+_DIR_LOG_FILE="/tmp/directional.log"
+_DIR_PROCESS_PATTERN="algo-trade directional-auto"
+_DIR_CLI_CMD="directional-auto"
+
+_dir_build_remote_args() {
+    local args="--mode paper --duration 1h --coins btc,eth,sol,xrp --persist --verbose"
+    [[ $# -gt 0 ]] && args="$*"
+    echo "$args"
+}
+
+if ec2_dispatch "$_DIR_BOT_NAME" "$_DIR_PID_FILE" "$_DIR_LOG_FILE" \
+    "$_DIR_PROCESS_PATTERN" "$_DIR_CLI_CMD" "_dir_build_remote_args" "$@"; then
+    exit 0
+fi
 
 # =============================================================================
 # Default configuration
@@ -157,7 +177,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            head -35 "$0" | tail -34
+            head -34 "$0" | tail -33
             exit 0
             ;;
         *)

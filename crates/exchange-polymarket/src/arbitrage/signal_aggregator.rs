@@ -15,17 +15,18 @@
 //! detector falls back to delta-only confidence.
 
 use algo_trade_core::{
-    LiquidationAggregate, OrderBookSnapshot, PriceLevel, SignalContext, SignalGenerator,
-    SignalValue,
+    LiquidationAggregate, OhlcvCandle, OrderBookSnapshot, PriceLevel, SignalContext,
+    SignalGenerator, SignalValue,
 };
 use algo_trade_data::{FundingRateRecord, LiquidationRecord, OrderBookSnapshotRecord};
 use algo_trade_signals::{
-    CollectorConfig, CompositeSignal, FundingCollector, FundingRateSignal,
+    ClobVelocitySignal, CollectorConfig, CompositeSignal, FundingCollector, FundingRateSignal,
     LiquidationCascadeSignal, LiquidationCollector, LiquidationCollectorConfig,
     LiquidationRatioConfig, LiquidationRatioSignal, MomentumExhaustionConfig,
     MomentumExhaustionSignal, NewsSignal, OrderBookCollector, OrderBookImbalanceSignal,
 };
 use algo_trade_signals::generator::{CvdDivergenceConfig, CvdDivergenceSignal};
+use crate::gamma::GammaClient;
 use crate::models::Coin;
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -52,6 +53,10 @@ struct CoinCollectorState {
     liquidation_aggregate: Option<LiquidationAggregate>,
     /// Latest mid price.
     mid_price: Option<Decimal>,
+    /// Rolling CLOB price history for velocity signal: (timestamp, yes_price).
+    clob_price_history: Vec<(chrono::DateTime<chrono::Utc>, f64)>,
+    /// Recent OHLCV candles for momentum exhaustion signal.
+    historical_ohlcv: Vec<OhlcvCandle>,
 }
 
 impl CoinCollectorState {
@@ -62,6 +67,8 @@ impl CoinCollectorState {
             funding_rate: None,
             liquidation_aggregate: None,
             mid_price: None,
+            clob_price_history: Vec::new(),
+            historical_ohlcv: Vec::new(),
         }
     }
 
@@ -84,6 +91,12 @@ impl CoinCollectorState {
         }
         if let Some(ref agg) = self.liquidation_aggregate {
             ctx = ctx.with_liquidation_aggregates(agg.clone());
+        }
+        if !self.clob_price_history.is_empty() {
+            ctx = ctx.with_clob_price_history(self.clob_price_history.clone());
+        }
+        if !self.historical_ohlcv.is_empty() {
+            ctx = ctx.with_historical_ohlcv(self.historical_ohlcv.clone());
         }
 
         ctx
@@ -146,12 +159,15 @@ impl SignalAggregator {
         }
     }
 
-    /// Builds a composite signal with all 7 generators and plan-specified weights.
+    /// Builds a composite signal with all 7 generators.
+    ///
+    /// Uses RequireN(2) combination: at least 2 active signals must agree on a
+    /// direction before producing a directional output. This prevents any single
+    /// signal (e.g. liquidation cascade at strength ~1.0) from dominating the
+    /// composite.
     fn build_composite() -> CompositeSignal {
-        // Weights from the plan:
-        // OrderBookImbalance: 1.5, LiquidationCascade: 1.2, FundingRate: 1.0,
-        // CvdDivergence: 1.0, MomentumExhaustion: 0.8, News: 0.7, LiquidationRatio: 0.5
         CompositeSignal::weighted_average("directional_composite")
+            .require_agreement(2)
             .with_generator(Box::new(OrderBookImbalanceSignal::new(0.1, 1.5, 50)))
             .with_generator(Box::new(LiquidationCascadeSignal::new(
                 Decimal::new(5000, 0),
@@ -164,7 +180,13 @@ impl SignalAggregator {
                 CvdDivergenceConfig::default(),
             )))
             .with_generator(Box::new(MomentumExhaustionSignal::new(
-                MomentumExhaustionConfig::default(),
+                MomentumExhaustionConfig {
+                    big_move_threshold: 0.005, // 0.5% — tuned for 15-min windows (~$500 BTC move)
+                    big_move_lookback: 5,      // 5 one-minute candles
+                    stall_ratio: 0.3,          // stall if range < 30% of big move
+                    stall_lookback: 3,         // check last 3 candles for stall
+                    min_candles: 8,            // need 8 minutes of data
+                },
                 0.8,
             )))
             .with_generator(Box::new(
@@ -176,6 +198,7 @@ impl SignalAggregator {
                     ..LiquidationRatioConfig::default()
                 },
             )))
+            .with_generator(Box::new(ClobVelocitySignal::new()))
     }
 
     /// Parses a JSON `[[price, qty], ...]` array into `Vec<PriceLevel>`.
@@ -401,6 +424,99 @@ impl SignalAggregator {
             });
         }
 
+        // Spawn Polymarket CLOB price poller (for velocity signal)
+        {
+            let states = Arc::clone(&coin_states);
+            let stop = Arc::clone(&self.stop);
+            let coins = self.coins.clone();
+            let max_clob_history = 120; // ~10 minutes at 5s intervals
+            tokio::spawn(async move {
+                let gamma = GammaClient::new();
+                let mut poll_interval = tokio::time::interval(Duration::from_secs(5));
+                while !stop.load(Ordering::Relaxed) {
+                    poll_interval.tick().await;
+                    let markets = gamma.get_15min_markets_for_coins(&coins).await;
+                    let now = Utc::now();
+                    let mut states = states.write().await;
+                    for market in &markets {
+                        if let Some(up_price) = market.up_price() {
+                            // Match market to coin by checking the question text
+                            for coin in &coins {
+                                let slug = coin.slug_prefix();
+                                let prefix = slug.to_uppercase();
+                                if market.question.contains(&prefix) {
+                                    if let Some(state) = states.get_mut(slug) {
+                                        let price_f64 = up_price
+                                            .to_string()
+                                            .parse::<f64>()
+                                            .unwrap_or(0.5);
+                                        state.clob_price_history.push((now, price_f64));
+                                        if state.clob_price_history.len() > max_clob_history {
+                                            state.clob_price_history.remove(0);
+                                        }
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
+        // Spawn OHLCV poller — fetches last 20 one-minute candles per coin from
+        // Binance Futures REST API every 60 seconds. Feeds momentum_exhaustion signal.
+        {
+            let states = Arc::clone(&coin_states);
+            let stop = Arc::clone(&self.stop);
+            let coins = self.coins.clone();
+            tokio::spawn(async move {
+                use algo_trade_signals::collector::{Interval, OhlcvCollector};
+                let collector = OhlcvCollector::new();
+                let mut poll_interval = tokio::time::interval(Duration::from_secs(60));
+                // Skip the first tick so we don't fire immediately at startup
+                poll_interval.tick().await;
+                while !stop.load(Ordering::Relaxed) {
+                    poll_interval.tick().await;
+                    let now = Utc::now();
+                    let start = now - chrono::Duration::minutes(20);
+                    for coin in &coins {
+                        let symbol = format!("{}USDT", coin.slug_prefix().to_uppercase());
+                        match collector.fetch(&symbol, Interval::OneMinute, start, now).await {
+                            Ok((records, _stats)) => {
+                                let candles: Vec<OhlcvCandle> = records
+                                    .into_iter()
+                                    .map(|r| OhlcvCandle {
+                                        timestamp: r.timestamp,
+                                        open: r.open,
+                                        high: r.high,
+                                        low: r.low,
+                                        close: r.close,
+                                        volume: r.volume,
+                                    })
+                                    .collect();
+                                if !candles.is_empty() {
+                                    let mut states = states.write().await;
+                                    if let Some(state) =
+                                        states.get_mut(coin.slug_prefix())
+                                    {
+                                        state.historical_ohlcv = candles;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    symbol = %symbol,
+                                    error = %e,
+                                    "Failed to fetch OHLCV candles"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // Build composite signal per coin
         let mut composites: HashMap<String, CompositeSignal> = self
             .coins
@@ -471,6 +587,7 @@ mod tests {
         assert!(state.liquidation_aggregate.is_none());
         assert!(state.mid_price.is_none());
         assert!(state.imbalance_history.is_empty());
+        assert!(state.clob_price_history.is_empty());
     }
 
     #[test]
@@ -498,9 +615,9 @@ mod tests {
     }
 
     #[test]
-    fn test_build_composite_has_7_generators() {
+    fn test_build_composite_has_8_generators() {
         let composite = SignalAggregator::build_composite();
-        assert_eq!(composite.generator_count(), 7);
+        assert_eq!(composite.generator_count(), 8);
     }
 
     #[test]

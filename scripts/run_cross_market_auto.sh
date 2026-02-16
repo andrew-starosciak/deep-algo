@@ -5,7 +5,12 @@
 # Runs the automated cross-market correlation arbitrage bot with a live dashboard.
 #
 # Usage:
-#   ./scripts/run_cross_market_auto.sh [options]
+#   ./scripts/run_cross_market_auto.sh [options]           # Run locally
+#   ./scripts/run_cross_market_auto.sh redeploy            # Build + upload binary + migrate on EC2
+#   ./scripts/run_cross_market_auto.sh start [options]     # Start on EC2 (background)
+#   ./scripts/run_cross_market_auto.sh stop                # Stop on EC2
+#   ./scripts/run_cross_market_auto.sh logs                # Tail remote logs
+#   ./scripts/run_cross_market_auto.sh ssh                 # SSH into EC2 instance
 #
 # Options:
 #   --overnight           Run overnight (12h duration, persist, log to file)
@@ -51,14 +56,29 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
     set +a
 fi
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-DIM='\033[2m'
-NC='\033[0m'
+# =============================================================================
+# EC2 support via shared library
+# =============================================================================
+
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/ec2-common.sh"
+
+_CMA_BOT_NAME="cross-market-auto"
+_CMA_PID_FILE="/tmp/cross_market_auto.pid"
+_CMA_LOG_FILE="/tmp/cross_market_auto.log"
+_CMA_PROCESS_PATTERN="algo-trade cross-market-auto"
+_CMA_CLI_CMD="cross-market-auto"
+
+_cma_build_remote_args() {
+    local args="--mode paper --duration 1h --pair all --persist --verbose"
+    [[ $# -gt 0 ]] && args="$*"
+    echo "$args"
+}
+
+if ec2_dispatch "$_CMA_BOT_NAME" "$_CMA_PID_FILE" "$_CMA_LOG_FILE" \
+    "$_CMA_PROCESS_PATTERN" "$_CMA_CLI_CMD" "_cma_build_remote_args" "$@"; then
+    exit 0
+fi
 
 # =============================================================================
 # Default configuration
@@ -179,7 +199,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            head -35 "$0" | tail -34
+            head -40 "$0" | tail -39
             exit 0
             ;;
         *)

@@ -3,6 +3,7 @@
 pub mod approve_allowances;
 pub mod arbitrage_bot;
 pub mod backfill_funding;
+pub mod clob_timing;
 pub mod backfill_ohlcv;
 pub mod backfill_signals;
 pub mod binary_backtest;
@@ -30,6 +31,7 @@ pub mod window_timing;
 
 pub use approve_allowances::{run as run_approve_allowances, ApproveAllowancesArgs};
 pub use arbitrage_bot::{run_arbitrage_bot, ArbitrageBotArgs};
+pub use clob_timing::{run as run_clob_timing, ClobTimingArgs};
 pub use backfill_funding::{run_backfill_funding, BackfillFundingArgs};
 pub use backfill_ohlcv::{run_backfill_ohlcv, BackfillOhlcvArgs};
 pub use backfill_signals::{run_backfill_signals, BackfillSignalsArgs};

@@ -40,50 +40,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/ec2-common.sh"
+
 REGION="eu-west-1"
 INSTANCE_TYPE="t3.micro"
 KEY_NAME="algo-trade-latency-test"
 SG_NAME="algo-trade-latency-sg"
 INSTANCE_TAG="algo-trade-latency"
 
-STATE_FILE="$SCRIPT_DIR/.aws-latency-test.state"
-KEY_FILE="$SCRIPT_DIR/.aws-latency-key.pem"
 DUMPS_DIR="$PROJECT_ROOT/data/aws-dumps"
 
-REMOTE_DB_NAME="algo_trade"
-REMOTE_DB_USER="algo"
-REMOTE_DB_PASS="algo_trade_local"
-REMOTE_DATABASE_URL="postgres://${REMOTE_DB_USER}:${REMOTE_DB_PASS}@localhost/${REMOTE_DB_NAME}"
-
-SSH_USER="ubuntu"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
-
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-DIM='\033[2m'
-NC='\033[0m'
-
 # =============================================================================
-# Helpers
+# Helpers (provisioning-specific)
 # =============================================================================
-
-info()  { echo -e "${GREEN}[+]${NC} $*"; }
-warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
-error() { echo -e "${RED}[x]${NC} $*" >&2; }
-dim()   { echo -e "${DIM}    $*${NC}"; }
-
-load_state() {
-    if [[ ! -f "$STATE_FILE" ]]; then
-        error "No deployment found. Run 'deploy' first."
-        exit 1
-    fi
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
-}
 
 save_state() {
     cat > "$STATE_FILE" <<EOF
@@ -95,14 +65,6 @@ ALLOCATION_ID=$ALLOCATION_ID
 REGION=$REGION
 INSTANCE_MARKET=${INSTANCE_MARKET:-on-demand}
 EOF
-}
-
-remote_ssh() {
-    ssh $SSH_OPTS -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" "$@"
-}
-
-remote_scp() {
-    scp $SSH_OPTS -i "$KEY_FILE" "$@"
 }
 
 wait_for_ssh() {
@@ -118,47 +80,6 @@ wait_for_ssh() {
     done
     error "SSH not available after ${max_attempts} attempts"
     return 1
-}
-
-sync_and_migrate() {
-    info "Syncing migrations..."
-    remote_ssh "mkdir -p ~/migrations"
-    remote_scp "$PROJECT_ROOT/scripts/migrations/"*.sql "$SSH_USER@$PUBLIC_IP:~/migrations/"
-
-    info "Running new migrations..."
-    remote_ssh "bash -s" <<'RUN_MIGRATIONS'
-set -euo pipefail
-export PGPASSWORD="algo_trade_local"
-DB_ARGS="-h localhost -U algo -d algo_trade"
-
-# Create tracking table if it doesn't exist
-psql $DB_ARGS -c "
-CREATE TABLE IF NOT EXISTS schema_migrations (
-    filename TEXT PRIMARY KEY,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);" 2>/dev/null
-
-applied=0
-skipped=0
-for f in $(ls ~/migrations/*.sql | sort); do
-    fname=$(basename "$f")
-    # Check if already applied
-    already=$(psql $DB_ARGS -tAc "SELECT 1 FROM schema_migrations WHERE filename = '$fname'" 2>/dev/null)
-    if [[ "$already" == "1" ]]; then
-        skipped=$((skipped + 1))
-        continue
-    fi
-    echo "  Applying $fname..."
-    if psql $DB_ARGS -f "$f" 2>&1 | tail -3; then
-        psql $DB_ARGS -c "INSERT INTO schema_migrations (filename) VALUES ('$fname');" 2>/dev/null
-        applied=$((applied + 1))
-    else
-        echo "  ERROR applying $fname — stopping"
-        exit 1
-    fi
-done
-echo "Migrations: $applied applied, $skipped already up-to-date"
-RUN_MIGRATIONS
 }
 
 # =============================================================================

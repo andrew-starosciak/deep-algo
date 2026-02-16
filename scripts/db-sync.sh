@@ -29,20 +29,8 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
     set +a
 fi
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-DIM='\033[2m'
-NC='\033[0m'
-
-# SSH config from deploy state
-STATE_FILE="$SCRIPT_DIR/.aws-latency-test.state"
-KEY_FILE="$SCRIPT_DIR/.aws-latency-key.pem"
-SSH_USER="ubuntu"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/ec2-common.sh"
 
 # =============================================================================
 # Defaults
@@ -100,27 +88,12 @@ done
 # Validation
 # =============================================================================
 
-if [[ ! -f "$STATE_FILE" ]]; then
-    echo -e "${RED}ERROR: No EC2 state file found at $STATE_FILE${NC}"
-    echo "Run ./scripts/aws-latency-test.sh deploy first"
-    exit 1
-fi
-
-source "$STATE_FILE"
-
-if [[ -z "${PUBLIC_IP:-}" ]]; then
-    echo -e "${RED}ERROR: No PUBLIC_IP in state file${NC}"
-    exit 1
-fi
+load_state
 
 if [[ -z "$DUMP_MODE" && -z "${DATABASE_URL:-}" ]]; then
     echo -e "${RED}ERROR: DATABASE_URL required for DB sync (or use --dump for CSV)${NC}"
     exit 1
 fi
-
-remote_ssh() {
-    ssh $SSH_OPTS -i "$KEY_FILE" "$SSH_USER@$PUBLIC_IP" "$@"
-}
 
 # =============================================================================
 # Time range

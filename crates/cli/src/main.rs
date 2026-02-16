@@ -7,7 +7,7 @@ mod tui_live_bot;
 
 use commands::{
     ApproveAllowancesArgs, ArbitrageBotArgs, BackfillFundingArgs, BackfillOhlcvArgs,
-    BackfillSignalsArgs, BinaryBacktestArgs, CalculateReturnsArgs, CheckDepthArgs,
+    BackfillSignalsArgs, BinaryBacktestArgs, CalculateReturnsArgs, CheckDepthArgs, ClobTimingArgs,
     CollectPolymarketArgs, CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs,
     CrossMarketBacktestArgs, CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
     DirectionalAutoArgs, EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs,
@@ -164,6 +164,8 @@ enum Commands {
     RedeemPositions(RedeemPositionsArgs),
     /// Run automated single-leg directional trading (spot confirmation)
     DirectionalAuto(DirectionalAutoArgs),
+    /// Run CLOB first-move timing strategy (displacement from midpoint)
+    ClobTiming(ClobTimingArgs),
 }
 
 #[tokio::main]
@@ -217,6 +219,23 @@ async fn main() -> anyhow::Result<()> {
             // Dashboard mode - redirect logs to file to prevent screen corruption
             let log_path = std::env::var("DIRECTIONAL_LOG")
                 .unwrap_or_else(|_| "/tmp/directional_auto.log".to_string());
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_path)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                )
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false)
+                .init();
+        }
+        Commands::ClobTiming(args) if !args.verbose => {
+            // Dashboard mode - redirect logs to file to prevent screen corruption
+            let log_path = std::env::var("CLOB_TIMING_LOG")
+                .unwrap_or_else(|_| "/tmp/clob_timing.log".to_string());
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -359,6 +378,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::DirectionalAuto(args) => {
             commands::run_directional_auto(args).await?;
+        }
+        Commands::ClobTiming(args) => {
+            commands::run_clob_timing(args).await?;
         }
     }
 

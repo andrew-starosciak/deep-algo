@@ -3,6 +3,7 @@
 //! This module contains implementations of various signal generators
 //! that produce trading signals based on market data analysis.
 
+pub mod clob_velocity;
 mod composite;
 pub mod cvd_divergence;
 mod funding_rate;
@@ -12,6 +13,7 @@ pub mod momentum;
 pub mod news_signal;
 mod orderbook_imbalance;
 
+pub use clob_velocity::{ClobVelocityConfig, ClobVelocitySignal};
 pub use composite::{
     adjust_weights_for_multicollinearity, calculate_correlation_matrix, combine_bayesian,
     CombinationMethod, CompositeSignal, CorrelationMatrix,

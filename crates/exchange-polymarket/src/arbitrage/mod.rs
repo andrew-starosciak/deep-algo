@@ -68,6 +68,9 @@ pub mod approvals;
 pub mod auto_executor;
 pub mod book_feed;
 
+// CLOB first-move timing strategy
+pub mod clob_timing_runner;
+
 // Unified data collection service
 pub mod data_service;
 pub mod raw_data_writer;
@@ -251,6 +254,11 @@ pub use cross_market_auto_executor::{
 // Unified data collection service
 pub use data_service::{
     signal_to_snapshot, DataService, DataServiceConfig, DataServiceHandle, SignalSnapshotWriter,
+};
+
+// CLOB first-move timing strategy
+pub use clob_timing_runner::{
+    ClobTimingConfig, ClobTimingRunner, ClobTimingRunnerError, ClobTimingRunnerStats,
 };
 
 // Single-leg directional trading

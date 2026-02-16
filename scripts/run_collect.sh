@@ -7,9 +7,14 @@
 # Designed for EC2 data collection without running a trading bot.
 #
 # Usage:
-#   ./scripts/run_collect.sh [options]
+#   ./scripts/run_collect.sh [options]           # Run locally
+#   ./scripts/run_collect.sh redeploy            # Build + upload binary + migrate on EC2
+#   ./scripts/run_collect.sh start [options]     # Start collector on EC2 (background)
+#   ./scripts/run_collect.sh stop                # Stop collector on EC2
+#   ./scripts/run_collect.sh logs                # Tail remote collector logs
+#   ./scripts/run_collect.sh ssh                 # SSH into EC2 instance
 #
-# Options:
+# Local options:
 #   --duration <time>   How long to collect (default: 24h)
 #   --coins <list>      Coins for signal aggregation (default: btc,eth,sol,xrp)
 #   --sources <list>    Raw data sources (default: orderbook,funding,liquidations,tradeticks,polymarket,news)
@@ -17,10 +22,14 @@
 #   --help              Show this help
 #
 # Examples:
-#   ./scripts/run_collect.sh                          # All data + signals, 24h
-#   ./scripts/run_collect.sh --duration 7d            # Collect for a week
-#   ./scripts/run_collect.sh --coins btc,eth          # Specific coins only
-#   ./scripts/run_collect.sh --no-signals             # Raw data only, no composite signals
+#   ./scripts/run_collect.sh                          # All data + signals, 24h (local)
+#   ./scripts/run_collect.sh --duration 7d            # Collect for a week (local)
+#   ./scripts/run_collect.sh redeploy                 # Build + upload to EC2
+#   ./scripts/run_collect.sh start                    # Start collector on EC2
+#   ./scripts/run_collect.sh start --duration 7d      # Start with custom duration
+#   ./scripts/run_collect.sh stop                     # Stop EC2 collector
+#   ./scripts/run_collect.sh logs                     # Tail EC2 logs
+#   ./scripts/run_collect.sh ssh                      # SSH into EC2 instance
 #
 
 set -euo pipefail
@@ -36,27 +45,67 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
     set +a
 fi
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-WHITE='\033[1;37m'
-DIM='\033[2m'
-NC='\033[0m'
+# =============================================================================
+# EC2 support via shared library
+# =============================================================================
+
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/ec2-common.sh"
+
+_COLLECT_BOT_NAME="collector"
+_COLLECT_PID_FILE="/tmp/collector.pid"
+_COLLECT_LOG_FILE="/tmp/collector.log"
+_COLLECT_PROCESS_PATTERN="algo-trade collect-signals"
+_COLLECT_CLI_CMD="collect-signals"
+
+_collect_build_remote_args() {
+    local duration="24h"
+    local coins="btc,eth,sol,xrp"
+    local sources="orderbook,funding,liquidations,tradeticks,polymarket,news"
+    local signals="1"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --duration)  duration="$2"; shift 2 ;;
+            --coins)     coins="$2"; shift 2 ;;
+            --sources)   sources="$2"; shift 2 ;;
+            --no-signals) signals=""; shift ;;
+            *)           shift ;;
+        esac
+    done
+
+    local args="--duration $duration --coins $coins --sources $sources"
+    [[ -n "$signals" ]] && args+=" --signals"
+    echo "$args"
+}
+
+if ec2_dispatch "$_COLLECT_BOT_NAME" "$_COLLECT_PID_FILE" "$_COLLECT_LOG_FILE" \
+    "$_COLLECT_PROCESS_PATTERN" "$_COLLECT_CLI_CMD" "_collect_build_remote_args" "$@"; then
+    exit 0
+fi
 
 # =============================================================================
+# Help
+# =============================================================================
+
+case "${1:-}" in
+    --help|-h)
+        head -33 "$0" | tail -32
+        exit 0
+        ;;
+esac
+
+# =============================================================================
+# Local run (original behavior)
+# =============================================================================
+
 # Default configuration
-# =============================================================================
-
 DURATION="24h"
 COINS="btc,eth,sol,xrp"
 SOURCES="orderbook,funding,liquidations,tradeticks,polymarket,news"
 SIGNALS="1"
 
-# =============================================================================
 # Parse arguments
-# =============================================================================
-
 while [[ $# -gt 0 ]]; do
     case $1 in
         --duration)
@@ -75,10 +124,6 @@ while [[ $# -gt 0 ]]; do
             SIGNALS=""
             shift
             ;;
-        --help|-h)
-            head -28 "$0" | tail -27
-            exit 0
-            ;;
         *)
             echo "Unknown option: $1"
             exit 1
@@ -86,27 +131,18 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# =============================================================================
 # Validation
-# =============================================================================
-
 if [[ -z "${DATABASE_URL:-}" ]]; then
     echo -e "${RED}ERROR: DATABASE_URL required for data collection${NC}"
     exit 1
 fi
 
-# =============================================================================
 # Migrations
-# =============================================================================
-
 echo -e "${DIM}Running database migrations...${NC}"
 "$SCRIPT_DIR/migrate.sh" 2>&1 | grep -E '\[APPLY\]|\[SKIP\]|Error' || true
 echo ""
 
-# =============================================================================
 # Build
-# =============================================================================
-
 echo -e "${DIM}Building release binary...${NC}"
 if ! cargo build -p algo-trade-cli --release 2>&1 | tail -3; then
     echo -e "${RED}Build failed.${NC}"
@@ -114,20 +150,14 @@ if ! cargo build -p algo-trade-cli --release 2>&1 | tail -3; then
 fi
 echo ""
 
-# =============================================================================
 # Build command
-# =============================================================================
-
 CMD=(cargo run -p algo-trade-cli --release -- collect-signals)
 CMD+=(--duration "$DURATION")
 CMD+=(--coins "$COINS")
 CMD+=(--sources "$SOURCES")
 [[ -n "$SIGNALS" ]] && CMD+=(--signals)
 
-# =============================================================================
 # Display configuration
-# =============================================================================
-
 echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${CYAN}║${NC}        ${WHITE}Data Collection${NC}                                        ${CYAN}║${NC}"
 echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
@@ -144,10 +174,7 @@ else
 fi
 echo ""
 
-# =============================================================================
 # Run
-# =============================================================================
-
 mkdir -p "$PROJECT_ROOT/logs"
 LOG_FILE="$PROJECT_ROOT/logs/collect-$(date +%Y%m%d-%H%M%S).log"
 

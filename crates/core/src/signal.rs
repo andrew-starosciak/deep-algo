@@ -250,6 +250,8 @@ pub struct SignalContext {
     pub historical_ohlcv: Option<Vec<OhlcvCandle>>,
     /// 24-hour liquidation aggregate for ratio signal
     pub liquidation_aggregates_24h: Option<LiquidationAggregate>,
+    /// Historical CLOB prices for velocity signal: (timestamp, yes_price 0.0-1.0)
+    pub clob_price_history: Option<Vec<(DateTime<Utc>, f64)>>,
 }
 
 impl SignalContext {
@@ -270,6 +272,7 @@ impl SignalContext {
             news_events: None,
             historical_ohlcv: None,
             liquidation_aggregates_24h: None,
+            clob_price_history: None,
         }
     }
 
@@ -347,6 +350,13 @@ impl SignalContext {
     #[must_use]
     pub fn with_liquidation_aggregates_24h(mut self, aggregate: LiquidationAggregate) -> Self {
         self.liquidation_aggregates_24h = Some(aggregate);
+        self
+    }
+
+    /// Sets historical CLOB prices for velocity signal.
+    #[must_use]
+    pub fn with_clob_price_history(mut self, history: Vec<(DateTime<Utc>, f64)>) -> Self {
+        self.clob_price_history = Some(history);
         self
     }
 
