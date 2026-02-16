@@ -210,6 +210,8 @@ pub async fn run(args: ClobTimingArgs) -> Result<()> {
         fee_rate: dec!(0.02),
         stats_interval_secs: 5,
         settlement_interval_secs: 30,
+        buy_slippage: dec!(0.05),
+        max_retries: 1,
     };
 
     // Create runner

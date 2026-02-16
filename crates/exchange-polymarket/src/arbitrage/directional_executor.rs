@@ -94,6 +94,14 @@ pub struct DirectionalExecutorConfig {
 
     /// Settlement check interval in seconds.
     pub settlement_interval_secs: u64,
+
+    /// Slippage added to entry price before FOK order (default: 0.05 = 5 cents).
+    /// Covers bid-ask spread + latency drift from Gamma last-traded price.
+    pub buy_slippage: Decimal,
+
+    /// Number of retry attempts with FAK at progressively aggressive prices.
+    /// 0 = no retry (FOK only). Default: 1.
+    pub max_retries: u32,
 }
 
 impl Default for DirectionalExecutorConfig {
@@ -110,6 +118,8 @@ impl Default for DirectionalExecutorConfig {
             fee_rate: dec!(0.02),
             stats_interval_secs: 5,
             settlement_interval_secs: 30,
+            buy_slippage: dec!(0.05),
+            max_retries: 1,
         }
     }
 }
@@ -614,17 +624,23 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             return;
         }
 
-        // Submit FOK buy order
+        // Apply slippage: round UP to $0.01 tick grid, cap at $0.99
+        let aggressive_price = ((signal.entry_price + self.config.buy_slippage) * dec!(100)).ceil() / dec!(100);
+        let aggressive_price = aggressive_price.min(dec!(0.99));
+
+        // Submit FOK buy order at slippage-adjusted price
         let order = OrderParams::buy_fok(
             &signal.entry_token_id,
-            signal.entry_price,
+            aggressive_price,
             shares,
         );
 
         info!(
             coin = signal.coin,
             direction = %signal.direction,
-            price = %signal.entry_price,
+            signal_price = %signal.entry_price,
+            order_price = %aggressive_price,
+            slippage = %self.config.buy_slippage,
             shares = %shares,
             cost = %bet_size,
             edge = format!("{:.4}", signal.estimated_edge),
@@ -636,7 +652,7 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             stats.orders_attempted += 1;
         }
 
-        let result = match self.executor.submit_order(order).await {
+        let mut result = match self.executor.submit_order(order).await {
             Ok(r) => r,
             Err(e) => {
                 error!(error = %e, "Order submission failed");
@@ -645,6 +661,40 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                 return;
             }
         };
+
+        // Retry with FAK at more aggressive price if FOK was rejected
+        if result.status == OrderStatus::Rejected && self.config.max_retries > 0 {
+            for attempt in 1..=self.config.max_retries {
+                let retry_price = ((aggressive_price + self.config.buy_slippage * Decimal::from(attempt)) * dec!(100)).ceil() / dec!(100);
+                let retry_price = retry_price.min(dec!(0.99));
+
+                info!(
+                    coin = signal.coin,
+                    attempt = attempt,
+                    retry_price = %retry_price,
+                    "Retrying with FAK order"
+                );
+
+                let retry_order = OrderParams::buy_fak(
+                    &signal.entry_token_id,
+                    retry_price,
+                    shares,
+                );
+
+                match self.executor.submit_order(retry_order).await {
+                    Ok(r) => {
+                        result = r;
+                        if result.status.has_fills() {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, attempt = attempt, "Retry order submission failed");
+                        break;
+                    }
+                }
+            }
+        }
 
         // Process result
         if result.status == OrderStatus::Filled || result.status == OrderStatus::PartiallyFilled {
@@ -1332,6 +1382,8 @@ mod tests {
         assert_eq!(config.max_trades_per_window, 1);
         assert!(!config.observe_mode);
         assert_eq!(config.fee_rate, dec!(0.02));
+        assert_eq!(config.buy_slippage, dec!(0.05));
+        assert_eq!(config.max_retries, 1);
     }
 
     #[test]

@@ -155,6 +155,20 @@ impl OrderParams {
         }
     }
 
+    /// Creates a new FAK buy order (for retry after FOK rejection).
+    #[must_use]
+    pub fn buy_fak(token_id: impl Into<String>, price: Decimal, size: Decimal) -> Self {
+        Self {
+            token_id: token_id.into(),
+            side: Side::Buy,
+            price,
+            size,
+            order_type: OrderType::Fak,
+            neg_risk: false,
+            presigned: None,
+        }
+    }
+
     /// Creates a new FAK sell order (for unwinding).
     #[must_use]
     pub fn sell_fak(token_id: impl Into<String>, price: Decimal, size: Decimal) -> Self {

@@ -145,6 +145,10 @@ pub struct AutoExecutorConfig {
 
     /// NO token ID for the market.
     pub no_token_id: String,
+
+    /// Slippage added to entry price before FOK order (default: 0.05 = 5 cents).
+    /// Covers bid-ask spread + latency drift from Gamma last-traded price.
+    pub buy_slippage: Decimal,
 }
 
 impl Default for AutoExecutorConfig {
@@ -164,6 +168,7 @@ impl Default for AutoExecutorConfig {
             max_history: 1000,
             yes_token_id: String::new(),
             no_token_id: String::new(),
+            buy_slippage: dec!(0.05),
         }
     }
 }
@@ -187,6 +192,7 @@ impl AutoExecutorConfig {
             max_history: 100,
             yes_token_id: String::new(),
             no_token_id: String::new(),
+            buy_slippage: dec!(0.05),
         }
     }
 
@@ -208,6 +214,7 @@ impl AutoExecutorConfig {
             max_history: 500,
             yes_token_id: String::new(),
             no_token_id: String::new(),
+            buy_slippage: dec!(0.05),
         }
     }
 
@@ -975,21 +982,27 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
             return Ok(());
         }
 
+        // Apply slippage: round UP to $0.01 tick grid, cap at $0.99
+        let aggressive_price = ((signal.entry_price + self.config.buy_slippage) * dec!(100)).ceil() / dec!(100);
+        let aggressive_price = aggressive_price.min(dec!(0.99));
+
         // Try to get a pre-signed order for lower latency
         let presigned = self
-            .try_get_presigned(token_id, Side::Buy, signal.entry_price)
+            .try_get_presigned(token_id, Side::Buy, aggressive_price)
             .await;
 
         // Create order (with pre-signed data if available)
         let order = if let Some(data) = presigned {
-            OrderParams::buy_fok(token_id, signal.entry_price, shares).with_presigned(data)
+            OrderParams::buy_fok(token_id, aggressive_price, shares).with_presigned(data)
         } else {
-            OrderParams::buy_fok(token_id, signal.entry_price, shares)
+            OrderParams::buy_fok(token_id, aggressive_price, shares)
         };
 
         info!(
             direction = ?signal.direction,
-            price = %signal.entry_price,
+            signal_price = %signal.entry_price,
+            order_price = %aggressive_price,
+            slippage = %self.config.buy_slippage,
             shares = %shares,
             bet_size = %bet_size,
             edge = signal.estimated_edge,
@@ -1077,24 +1090,30 @@ impl<E: PolymarketExecutor> AutoExecutor<E> {
             return Ok(());
         }
 
+        // Apply slippage: round UP to $0.01 tick grid, cap at $0.99
+        let aggressive_price = ((signal.entry_price + self.config.buy_slippage) * dec!(100)).ceil() / dec!(100);
+        let aggressive_price = aggressive_price.min(dec!(0.99));
+
         // Try to get a pre-signed order for lower latency
         let presigned = self
-            .try_get_presigned(token_id, Side::Buy, signal.entry_price)
+            .try_get_presigned(token_id, Side::Buy, aggressive_price)
             .await;
 
         // Create order (with pre-signed data if available)
         let order = if let Some(data) = presigned {
-            OrderParams::buy_fok(token_id, signal.entry_price, shares).with_presigned(data)
+            OrderParams::buy_fok(token_id, aggressive_price, shares).with_presigned(data)
         } else {
-            OrderParams::buy_fok(token_id, signal.entry_price, shares)
+            OrderParams::buy_fok(token_id, aggressive_price, shares)
         };
 
         info!(
             direction = ?signal.direction,
-            price = %signal.entry_price,
+            signal_price = %signal.entry_price,
+            order_price = %aggressive_price,
+            slippage = %self.config.buy_slippage,
             shares = %shares,
             existing_price = %existing.entry_price,
-            total_cost = %(existing.entry_price + signal.entry_price),
+            total_cost = %(existing.entry_price + aggressive_price),
             presigned = order.is_presigned(),
             "Executing HEDGE"
         );

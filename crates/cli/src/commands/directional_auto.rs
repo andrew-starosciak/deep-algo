@@ -247,6 +247,8 @@ pub async fn run(args: DirectionalAutoArgs) -> Result<()> {
         fee_rate: dec!(0.02),
         stats_interval_secs: args.stats_interval_secs,
         settlement_interval_secs: 30,
+        buy_slippage: dec!(0.05),
+        max_retries: 1,
     };
 
     // Create DataService when --signals or --raw-persist is enabled
