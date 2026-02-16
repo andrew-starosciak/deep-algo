@@ -169,8 +169,8 @@ class Database:
             INSERT INTO options_positions
                 (recommendation_id, ticker, right, strike, expiry,
                  quantity, avg_fill_price, current_price, cost_basis,
-                 unrealized_pnl, status)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open')
+                 unrealized_pnl, status, opened_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open', NOW())
             RETURNING id
             """,
             position["recommendation_id"],
@@ -182,7 +182,7 @@ class Database:
             position["avg_fill_price"],
             position["current_price"],
             position["cost_basis"],
-            position.get("unrealized_pnl", 0.0),
+            position.get("unrealized_pnl", Decimal("0")),
         )
 
     async def update_position_price(
@@ -250,7 +250,7 @@ class Database:
         await self.pool.execute(
             """
             UPDATE trade_recommendations
-            SET status = $2, rejection_reason = $3
+            SET status = $2, rejected_reason = $3
             WHERE id = $1
             """,
             rec_id,
