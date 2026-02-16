@@ -6,7 +6,7 @@ import asyncio
 import logging
 from datetime import datetime, timezone
 
-from research import edgar, earnings, flow, fred, news, technicals
+from research import edgar, earnings, flow, fred, news, premarket, technicals
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,11 @@ class ResearchPipeline:
             fred.macro_snapshot(),
         ]
         labels = ["NEWS", "TECHNICALS", "OPTIONS FLOW", "EARNINGS", "MACRO"]
+
+        # Add pre-market pricing for morning scans
+        if mode == "premarket":
+            tasks.append(premarket.snapshot(ticker))
+            labels.append("PRE-MARKET")
 
         # Add Reddit sentiment for deep dives (helps gauge retail positioning)
         if mode == "weekly_deep_dive":
