@@ -309,6 +309,44 @@ class Database:
             rec_id,
         )
 
+    async def reject_recommendation(self, rec_id: int, reason: str | None = None):
+        await self.pool.execute(
+            """
+            UPDATE trade_recommendations
+            SET status = 'rejected', rejected_reason = $2
+            WHERE id = $1
+            """,
+            rec_id,
+            reason,
+        )
+
+    async def get_recommendation(self, rec_id: int) -> dict | None:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM trade_recommendations WHERE id = $1",
+            rec_id,
+        )
+        if not row:
+            return None
+        rec = dict(row)
+        # Parse JSON fields
+        for key in ("exit_targets", "risk_verification"):
+            if isinstance(rec.get(key), str):
+                try:
+                    rec[key] = json.loads(rec[key])
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        return rec
+
+    async def get_pending_recommendations(self) -> list[dict]:
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM trade_recommendations
+            WHERE status = 'pending_review'
+            ORDER BY created_at DESC
+            """
+        )
+        return [dict(r) for r in rows]
+
     # --- Recent workflow runs ---
 
     async def recent_runs(self, limit: int = 20) -> list[dict]:

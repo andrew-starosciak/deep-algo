@@ -220,11 +220,48 @@ class DiscordBot:
         self._ready = asyncio.Event()
         self._channel = None
 
+        # Dependencies wired in later via set_context()
+        self._db = None
+        self._engine = None
+
         # Register event handlers
         @self.client.event
         async def on_ready():
             logger.info(f"Discord bot connected as {self.client.user}")
             self._ready.set()
+
+        @self.client.event
+        async def on_message(message):
+            if message.author == self.client.user:
+                return
+            if not message.content.startswith("!"):
+                return
+
+            parts = message.content.strip().split()
+            cmd = parts[0].lower()
+            args = parts[1:]
+
+            handlers = {
+                "!status": self._cmd_status,
+                "!watchlist": self._cmd_watchlist,
+                "!analyze": self._cmd_analyze,
+                "!portfolio": self._cmd_portfolio,
+                "!help": self._cmd_help,
+            }
+            handler = handlers.get(cmd)
+            if handler:
+                try:
+                    await handler(message.channel, args)
+                except Exception as e:
+                    logger.exception("Command %s failed", cmd)
+                    await message.channel.send(f"Error running `{cmd}`: {e}")
+
+    def set_context(self, db: Any = None, engine: Any = None) -> None:
+        """Wire in database and workflow engine after init."""
+        if db is not None:
+            self._db = db
+        if engine is not None:
+            self._engine = engine
 
     async def start_background(self):
         """Start the Discord bot in the background."""
@@ -449,6 +486,265 @@ class DiscordBot:
             fields=fields,
             color=color.value,
         )
+
+    # --- Chat commands ---
+
+    async def _cmd_help(self, channel, args: list[str]) -> None:
+        """List available commands."""
+        embed = discord.Embed(
+            title="OpenClaw Commands",
+            description="Available chat commands:",
+            color=discord.Color.blue(),
+        )
+        commands = [
+            ("`!status`", "Open positions, pending recommendations, next jobs"),
+            ("`!watchlist`", "Current watchlist tickers"),
+            ("`!analyze <TICKER>`", "Run on-demand trade thesis (~2 min)"),
+            ("`!portfolio`", "Account summary, exposure, recent P&L"),
+            ("`!help`", "Show this message"),
+        ]
+        for name, desc in commands:
+            embed.add_field(name=name, value=desc, inline=False)
+        await channel.send(embed=embed)
+
+    async def _cmd_status(self, channel, args: list[str]) -> None:
+        """Show open positions, pending recommendations, next scheduled jobs."""
+        if not self._db:
+            await channel.send("Database not connected.")
+            return
+
+        positions = await self._db.get_open_positions()
+        pending = await self._db.get_pending_recommendations()
+        approved = await self._db.get_approved_recommendations()
+
+        embed = discord.Embed(title="System Status", color=discord.Color.blue())
+
+        # Open positions
+        if positions:
+            lines = []
+            for p in positions[:10]:
+                pnl = p.get("unrealized_pnl", 0)
+                pnl_str = f"+${pnl}" if pnl >= 0 else f"-${abs(pnl)}"
+                lines.append(
+                    f"`{p['ticker']}` {p.get('right', '?')}"
+                    f" ${p.get('strike', '?')} {p.get('expiry', '?')}"
+                    f" — {pnl_str}"
+                )
+            embed.add_field(
+                name=f"Open Positions ({len(positions)})",
+                value="\n".join(lines),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Open Positions", value="None", inline=False)
+
+        # Pending recommendations
+        if pending:
+            lines = []
+            for r in pending[:5]:
+                lines.append(
+                    f"#{r.get('id', '?')} `{r.get('ticker', '?')}`"
+                    f" {r.get('right', '?')} ${r.get('strike', '?')}"
+                )
+            embed.add_field(
+                name=f"Pending Review ({len(pending)})",
+                value="\n".join(lines),
+                inline=False,
+            )
+        else:
+            embed.add_field(name="Pending Review", value="None", inline=False)
+
+        # Approved (awaiting execution)
+        if approved:
+            lines = [
+                f"#{r.get('id', '?')} `{r.get('ticker', '?')}`"
+                for r in approved[:5]
+            ]
+            embed.add_field(
+                name=f"Approved / Awaiting Exec ({len(approved)})",
+                value="\n".join(lines),
+                inline=False,
+            )
+
+        # Next scheduled jobs
+        embed.add_field(
+            name="Scheduled Jobs",
+            value=(
+                "Pre-market research: **8:00 AM ET** Mon-Fri\n"
+                "Midday position check: **12:30 PM ET** Mon-Fri\n"
+                "Post-market check: **4:30 PM ET** Mon-Fri\n"
+                "Weekly deep dive: **10:00 AM ET** Saturday"
+            ),
+            inline=False,
+        )
+
+        await channel.send(embed=embed)
+
+    async def _cmd_watchlist(self, channel, args: list[str]) -> None:
+        """Show current watchlist tickers."""
+        if not self._db:
+            await channel.send("Database not connected.")
+            return
+
+        watchlist = await self._db.get_watchlist()
+        embed = discord.Embed(title="Watchlist", color=discord.Color.blue())
+
+        if watchlist:
+            lines = []
+            for w in watchlist:
+                notes = w.get("notes") or ""
+                sector = w.get("sector", "")
+                line = f"`{w['ticker']}`"
+                if sector:
+                    line += f" — {sector}"
+                if notes:
+                    line += f" ({notes})"
+                lines.append(line)
+            embed.description = "\n".join(lines)
+        else:
+            embed.description = "Watchlist is empty."
+
+        await channel.send(embed=embed)
+
+    async def _cmd_analyze(self, channel, args: list[str]) -> None:
+        """Run trade-thesis workflow for a ticker (background task)."""
+        if not self._db or not self._engine:
+            await channel.send("Engine not connected. Cannot run analysis.")
+            return
+
+        if not args:
+            await channel.send("Usage: `!analyze <TICKER>`")
+            return
+
+        ticker = args[0].upper()
+        await channel.send(f"Analyzing **{ticker}**... this may take ~2 minutes.")
+
+        # Run in background so other commands aren't blocked
+        asyncio.create_task(self._run_analyze(channel, ticker))
+
+    async def _run_analyze(self, channel, ticker: str) -> None:
+        """Background task for !analyze."""
+        try:
+            from openclaw.workflows import get_workflow
+            from schemas.research import ResearchRequest
+
+            workflow = get_workflow("trade-thesis")
+            initial_input = ResearchRequest(ticker=ticker)
+
+            result = await self._engine.run(workflow, initial_input)
+
+            if result is None:
+                await channel.send(
+                    f"Analysis for **{ticker}** complete — no actionable opportunity found."
+                )
+                return
+
+            # Extract thesis if available
+            thesis = result.step_outputs.get("evaluate")
+            if thesis is None:
+                await channel.send(
+                    f"Analysis for **{ticker}** complete — did not pass evaluation gate."
+                )
+                return
+
+            embed = discord.Embed(
+                title=f"Analysis: {ticker}",
+                color=(
+                    discord.Color.green()
+                    if getattr(thesis, "direction", "") == "bullish"
+                    else discord.Color.red()
+                    if getattr(thesis, "direction", "") == "bearish"
+                    else discord.Color.gold()
+                ),
+            )
+
+            embed.add_field(
+                name="Direction",
+                value=getattr(thesis, "direction", "N/A").capitalize(),
+                inline=True,
+            )
+            scores = getattr(thesis, "scores", None)
+            if scores:
+                embed.add_field(
+                    name="Score",
+                    value=f"{getattr(scores, 'overall', '?')}/10",
+                    inline=True,
+                )
+
+            contract = getattr(thesis, "recommended_contract", None)
+            if contract:
+                embed.add_field(
+                    name="Contract",
+                    value=str(contract),
+                    inline=False,
+                )
+
+            thesis_text = getattr(thesis, "thesis_text", "")
+            if thesis_text:
+                embed.add_field(
+                    name="Thesis",
+                    value=thesis_text[:1024],
+                    inline=False,
+                )
+
+            await channel.send(embed=embed)
+
+        except Exception as e:
+            logger.exception("!analyze failed for %s", ticker)
+            await channel.send(f"Analysis for **{ticker}** failed: {e}")
+
+    async def _cmd_portfolio(self, channel, args: list[str]) -> None:
+        """Show account summary, exposure, and recent P&L."""
+        if not self._db:
+            await channel.send("Database not connected.")
+            return
+
+        positions = await self._db.get_open_positions()
+        exposure = await self._db.get_total_options_exposure()
+
+        embed = discord.Embed(title="Portfolio Summary", color=discord.Color.blue())
+
+        embed.add_field(
+            name="Total Exposure",
+            value=f"${exposure:,.2f}",
+            inline=True,
+        )
+        embed.add_field(
+            name="Open Positions",
+            value=str(len(positions)),
+            inline=True,
+        )
+
+        # Calculate aggregate unrealized P&L
+        total_pnl = sum(
+            float(p.get("unrealized_pnl", 0) or 0) for p in positions
+        )
+        pnl_color = "+" if total_pnl >= 0 else ""
+        embed.add_field(
+            name="Unrealized P&L",
+            value=f"{pnl_color}${total_pnl:,.2f}",
+            inline=True,
+        )
+
+        # Position breakdown
+        if positions:
+            lines = []
+            for p in positions[:15]:
+                pnl = float(p.get("unrealized_pnl", 0) or 0)
+                pnl_str = f"+${pnl:,.2f}" if pnl >= 0 else f"-${abs(pnl):,.2f}"
+                cost = float(p.get("cost_basis", 0) or 0)
+                lines.append(
+                    f"`{p['ticker']}` {p.get('right', '?')}"
+                    f" ${p.get('strike', '?')} {p.get('expiry', '?')}"
+                    f" | cost ${cost:,.0f} | P&L {pnl_str}"
+                )
+            embed.add_field(
+                name="Positions",
+                value="\n".join(lines),
+                inline=False,
+            )
+
+        await channel.send(embed=embed)
 
     async def close(self):
         """Shutdown the Discord bot."""
