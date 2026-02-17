@@ -51,8 +51,16 @@ def main():
         "position-manager", help="Run the position manager service"
     )
     pm_parser.add_argument(
-        "--mode", choices=["paper", "live"], default="paper",
-        help="Trading mode (default: paper)",
+        "--mode", choices=["sim", "paper", "live"], default="sim",
+        help="sim=local shim, paper=IB paper(4002), live=IB live(4001) (default: sim)",
+    )
+    pm_parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="IB Gateway host (default: 127.0.0.1)",
+    )
+    pm_parser.add_argument(
+        "--port", type=int, default=None,
+        help="IB Gateway port (default: auto by mode — paper=4002, live=4001)",
     )
     pm_parser.add_argument(
         "--poll-interval", type=int, default=30,
@@ -73,8 +81,16 @@ def main():
     # scheduler
     sched_parser = subparsers.add_parser("scheduler", help="Start the cron scheduler daemon")
     sched_parser.add_argument(
-        "--mode", choices=["paper", "live"], default="paper",
-        help="Trading mode for position management (default: paper)",
+        "--mode", choices=["sim", "paper", "live"], default="sim",
+        help="sim=local shim, paper=IB paper(4002), live=IB live(4001) (default: sim)",
+    )
+    sched_parser.add_argument(
+        "--host", default="127.0.0.1",
+        help="IB Gateway host (default: 127.0.0.1)",
+    )
+    sched_parser.add_argument(
+        "--port", type=int, default=None,
+        help="IB Gateway port (default: auto by mode — paper=4002, live=4001)",
     )
     sched_parser.add_argument(
         "--model", default="claude-sonnet-4-5-20250929",
@@ -286,6 +302,44 @@ async def _cmd_approve(args):
         await db.close()
 
 
+def _resolve_port(args) -> int:
+    """Resolve the IB Gateway port from explicit flag or mode default."""
+    if args.port is not None:
+        return args.port
+    return 4002 if args.mode == "paper" else 4001
+
+
+def _confirm_live_mode(port: int) -> None:
+    """Require explicit confirmation before connecting to IB live gateway."""
+    print(f"\n  WARNING: You are about to connect to IB LIVE gateway (port {port}).")
+    print("  Real money orders will be placed.\n")
+    answer = input("  Type 'YES' to confirm: ").strip()
+    if answer != "YES":
+        print("Aborted.")
+        sys.exit(0)
+
+
+def _build_ib_client(args):
+    """Build the appropriate IB client based on --mode, --host, --port."""
+    mode = args.mode
+
+    if mode == "sim":
+        from ib.paper import PaperClient
+        print("Starting in SIM mode (local shim, no IB connection)")
+        return PaperClient()
+
+    from ib.client import IBClient, IBConfig
+    host = args.host
+    port = _resolve_port(args)
+
+    if mode == "live":
+        _confirm_live_mode(port)
+
+    label = "PAPER" if mode == "paper" else "LIVE"
+    print(f"Starting in {label} mode (IB Gateway at {host}:{port})")
+    return IBClient(config=IBConfig(host=host, port=port))
+
+
 async def _cmd_position_manager(args):
     """Run the position manager service loop."""
     from ib.position_manager import PositionManager
@@ -294,17 +348,8 @@ async def _cmd_position_manager(args):
 
     db = await _init_db(args)
     notifier = MultiNotifier()
-
     config = ManagerConfig(poll_interval_secs=args.poll_interval)
-
-    if args.mode == "paper":
-        from ib.paper import PaperClient
-        ib_client = PaperClient()
-        print("Starting position manager in PAPER mode")
-    else:
-        from ib.client import IBClient
-        ib_client = IBClient()
-        print("Starting position manager in LIVE mode")
+    ib_client = _build_ib_client(args)
 
     manager = PositionManager(db=db, ib_client=ib_client, config=config, notifier=notifier)
 
@@ -318,21 +363,13 @@ async def _cmd_position_manager(args):
 
 async def _cmd_scheduler(args):
     """Start the cron scheduler daemon with workflows + position management."""
-    from openclaw.notify import TelegramNotifier
+    from openclaw.notify import MultiNotifier
     from openclaw.scheduler import WorkflowScheduler
 
     db = await _init_db(args)
     engine = await _init_engine(args)
-    notifier = TelegramNotifier()
-
-    if args.mode == "paper":
-        from ib.paper import PaperClient
-        ib_client = PaperClient()
-        print("Scheduler starting in PAPER mode")
-    else:
-        from ib.client import IBClient
-        ib_client = IBClient()
-        print("Scheduler starting in LIVE mode")
+    notifier = MultiNotifier()
+    ib_client = _build_ib_client(args)
 
     scheduler = WorkflowScheduler(
         engine=engine, db=db, ib_client=ib_client, notifier=notifier,

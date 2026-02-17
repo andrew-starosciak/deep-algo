@@ -195,6 +195,36 @@ services:
     profiles:
       - collect  # Only start with: docker compose --profile collect up
 
+  # ==========================================================================
+  # IB Gateway (only starts with --profile ib)
+  # ==========================================================================
+  ib-gateway:
+    image: ghcr.io/gnzsnz/ib-gateway:latest
+    container_name: ib-gateway
+    environment:
+      TWS_USERID: ${IBKR_USERNAME}
+      TWS_PASSWORD: ${IBKR_PASSWORD}
+      TRADING_MODE: ${IB_TRADING_MODE:-paper}
+      TIME_ZONE: America/New_York
+      TWOFA_TIMEOUT_ACTION: restart
+      READ_ONLY_API: "no"
+      BYPASS_WARNING: "yes"
+      VNC_SERVER_PASSWORD: ${VNC_PASSWORD:-}
+    ports:
+      - "4001:4001"
+      - "4002:4002"
+      - "5900:5900"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "4002"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+    profiles:
+      - ib
+    networks:
+      - algo-trade-network
+
 volumes:
   timescale-data:
     driver: local

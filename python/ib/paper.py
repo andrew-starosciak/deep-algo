@@ -6,7 +6,7 @@ import datetime as _dt
 import logging
 from decimal import Decimal
 
-from ib.types import AccountSummary, Fill, OptionQuote
+from ib.types import AccountSummary, Fill, IBPortfolioItem, OptionQuote
 from schemas.thesis import ContractSpec
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,10 @@ class PaperClient:
             buying_power=self._equity * 4,
             available_funds=self._equity,
         )
+
+    async def portfolio(self) -> list[IBPortfolioItem]:
+        """No real portfolio in sim mode."""
+        return []
 
     async def get_option_quote(self, contract: ContractSpec) -> OptionQuote:
         """Return a quote using the contract's entry price range."""

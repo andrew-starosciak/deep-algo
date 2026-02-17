@@ -2,6 +2,12 @@
 
 This guide walks through deploying the OpenClaw-orchestrated LLM-driven options trading system to AWS EC2.
 
+## 📚 Documentation Quick Links
+
+- **[IB Deployment Update (Feb 2025)](docs/IB-DEPLOYMENT-UPDATE.md)** - What we fixed and next steps
+- **[IB Gateway Troubleshooting](docs/IB-GATEWAY-TROUBLESHOOTING.md)** - Comprehensive debugging guide
+- **This README** - Initial setup and deployment commands
+
 ## Prerequisites
 
 1. **AWS CLI** installed and configured:
@@ -10,7 +16,25 @@ This guide walks through deploying the OpenClaw-orchestrated LLM-driven options 
    # Enter your AWS access key ID, secret access key, and default region
    ```
 
-2. **Discord Webhook** (recommended for notifications):
+2. **Interactive Brokers Account** with 2FA enrolled:
+   - Paper trading account (or live if you prefer)
+   - 2FA enabled (mandatory as of Feb 2025)
+   - IBKR Mobile app installed (for push notifications)
+   - API access enabled: Account Management → Settings → API → "ActiveX and Socket Clients"
+   - **Important:** You'll need to approve 2FA on your phone ~once per week
+
+3. **Discord Bot** (recommended for interactive approval buttons):
+   - Go to https://discord.com/developers/applications
+   - Create New Application → Bot → Copy Token
+   - Enable "Message Content Intent" and "Server Members Intent"
+   - Invite to your server with appropriate permissions
+   - Add to `.env`:
+     ```bash
+     DISCORD_BOT_TOKEN=your_bot_token
+     DISCORD_CHANNEL_ID=  # Auto-detected from first message
+     ```
+
+4. **Discord Webhook** (alternative to bot, less features):
    - Go to your Discord server → Server Settings → Integrations → Webhooks
    - Create a new webhook, copy the URL
    - Add to `.env`:

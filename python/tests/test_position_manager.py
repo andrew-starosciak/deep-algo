@@ -2,7 +2,7 @@
 
 Covers: tick cycle, recommendation execution, allocation rejection,
 hard stop, time stop, profit target 1 (partial), profit target 2 (full),
-zero-quote rejection, and notifier integration.
+zero-quote rejection, notifier integration, and position sync.
 """
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, call
 import pytest
 
 from ib.position_manager import PositionManager
-from ib.types import AccountSummary, Fill, ManagerConfig, OptionQuote
+from ib.types import AccountSummary, Fill, IBPortfolioItem, ManagerConfig, OptionQuote
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -63,6 +63,7 @@ def _make_position(
     quantity: int = 2,
     avg_fill_price: Decimal = Decimal("9.00"),
     dte_days: int = 30,
+    ib_con_id: int | None = None,
 ) -> dict:
     """Return a position dict as it would come from the DB."""
     return {
@@ -79,8 +80,36 @@ def _make_position(
         "unrealized_pnl": pnl,
         "realized_pnl": Decimal("0"),
         "status": "open",
+        "ib_con_id": ib_con_id,
         "opened_at": _dt.datetime.now(_dt.UTC),
     }
+
+
+def _make_ib_portfolio_item(
+    con_id: int = 12345,
+    symbol: str = "NVDA",
+    right: str = "call",
+    strike: Decimal = Decimal("140"),
+    position: int = 2,
+    avg_cost: Decimal = Decimal("9.00"),
+    market_price: Decimal = Decimal("10.00"),
+    unrealized_pnl: Decimal = Decimal("200"),
+) -> IBPortfolioItem:
+    return IBPortfolioItem(
+        con_id=con_id,
+        symbol=symbol,
+        sec_type="OPT",
+        right=right,
+        strike=strike,
+        expiry=_dt.date.today() + _dt.timedelta(days=30),
+        position=position,
+        avg_cost=avg_cost,
+        market_price=market_price,
+        market_value=market_price * position * 100,
+        unrealized_pnl=unrealized_pnl,
+        realized_pnl=Decimal("0"),
+        account="U1234567",
+    )
 
 
 @pytest.fixture
@@ -101,6 +130,7 @@ def mock_ib():
         buying_power=Decimal("800000"),
         available_funds=Decimal("200000"),
     )
+    ib.portfolio.return_value = []
     return ib
 
 
@@ -125,7 +155,8 @@ async def test_tick_empty_db(manager, mock_db):
     await manager._tick()
 
     mock_db.get_approved_recommendations.assert_awaited_once()
-    mock_db.get_open_positions.assert_awaited_once()
+    # get_open_positions called twice: once by _sync_positions, once by _tick
+    assert mock_db.get_open_positions.await_count == 2
     mock_db.insert_position.assert_not_awaited()
     mock_db.close_position.assert_not_awaited()
 
@@ -464,3 +495,107 @@ async def test_tick_processes_multiple_positions(manager, mock_db, mock_ib):
 
     # Both positions should get price updates
     assert mock_db.update_position_price.await_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Position sync from IB
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sync_discovers_new_ib_position(manager, mock_db, mock_ib):
+    """IB has a position not in DB → inserted as external."""
+    ib_item = _make_ib_portfolio_item(con_id=99999, symbol="AAPL")
+    mock_ib.portfolio.return_value = [ib_item]
+    mock_db.get_open_positions.return_value = []
+    mock_db.find_position_by_contract.return_value = None
+
+    await manager._sync_positions()
+
+    mock_db.insert_position.assert_awaited_once()
+    pos = mock_db.insert_position.await_args[0][0]
+    assert pos["ticker"] == "AAPL"
+    assert pos["ib_con_id"] == 99999
+    assert pos["recommendation_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_sync_updates_existing_position(manager, mock_db, mock_ib):
+    """Both IB and DB have the position → price/pnl updated."""
+    ib_item = _make_ib_portfolio_item(
+        con_id=12345, market_price=Decimal("11.00"), unrealized_pnl=Decimal("400")
+    )
+    mock_ib.portfolio.return_value = [ib_item]
+
+    db_pos = _make_position(pos_id=1, ib_con_id=12345)
+    mock_db.get_open_positions.return_value = [db_pos]
+
+    await manager._sync_positions()
+
+    mock_db.update_position_price.assert_awaited_once_with(
+        1, Decimal("11.00"), Decimal("400")
+    )
+    mock_db.insert_position.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sync_closes_stale_position(manager, mock_db, mock_ib):
+    """DB has a position with con_id, IB doesn't → marked closed."""
+    mock_ib.portfolio.return_value = []
+
+    db_pos = _make_position(pos_id=5, ib_con_id=55555)
+    mock_db.get_open_positions.return_value = [db_pos]
+
+    await manager._sync_positions()
+
+    mock_db.close_position.assert_awaited_once_with(5, "external", Decimal("0"))
+
+
+@pytest.mark.asyncio
+async def test_sync_backfills_con_id(manager, mock_db, mock_ib):
+    """Matched by contract details → con_id backfilled."""
+    ib_item = _make_ib_portfolio_item(con_id=77777)
+    mock_ib.portfolio.return_value = [ib_item]
+
+    # No match by con_id (no positions have ib_con_id set)
+    db_pos = _make_position(pos_id=3, ib_con_id=None)
+    mock_db.get_open_positions.return_value = [db_pos]
+
+    # But find_position_by_contract returns a match
+    mock_db.find_position_by_contract.return_value = db_pos
+
+    await manager._sync_positions()
+
+    mock_db.update_position_con_id.assert_awaited_once_with(3, 77777)
+    mock_db.update_position_price.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_sync_skips_non_options(manager, mock_db, mock_ib):
+    """Stocks in IB portfolio are ignored."""
+    stock = IBPortfolioItem(
+        con_id=11111, symbol="AAPL", sec_type="STK", position=100,
+        avg_cost=Decimal("150"), market_price=Decimal("155"),
+        market_value=Decimal("15500"), unrealized_pnl=Decimal("500"),
+        realized_pnl=Decimal("0"), account="U1234567",
+    )
+    mock_ib.portfolio.return_value = [stock]
+    mock_db.get_open_positions.return_value = []
+
+    await manager._sync_positions()
+
+    mock_db.insert_position.assert_not_awaited()
+    mock_db.update_position_price.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sync_empty_portfolio(manager, mock_db, mock_ib):
+    """Empty portfolio, no DB positions — no changes."""
+    mock_ib.portfolio.return_value = []
+    mock_db.get_open_positions.return_value = []
+
+    await manager._sync_positions()
+
+    mock_db.insert_position.assert_not_awaited()
+    mock_db.update_position_price.assert_not_awaited()
+    mock_db.close_position.assert_not_awaited()

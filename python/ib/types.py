@@ -37,6 +37,25 @@ class Fill(BaseModel):
     avg_fill_price: Decimal
     commission: Decimal
     filled_at: _dt.datetime
+    con_id: int | None = None
+
+
+class IBPortfolioItem(BaseModel):
+    """A position as reported by IB Gateway."""
+
+    con_id: int
+    symbol: str
+    sec_type: str
+    right: str | None = None
+    strike: Decimal | None = None
+    expiry: _dt.date | None = None
+    position: int
+    avg_cost: Decimal
+    market_price: Decimal
+    market_value: Decimal
+    unrealized_pnl: Decimal
+    realized_pnl: Decimal
+    account: str
 
 
 class AccountSummary(BaseModel):
@@ -51,7 +70,7 @@ class OptionsPosition(BaseModel):
     """An open options position tracked by the manager."""
 
     id: int
-    recommendation_id: int
+    recommendation_id: int | None = None
     ticker: str
     right: Literal["call", "put"]
     strike: Decimal
@@ -63,6 +82,7 @@ class OptionsPosition(BaseModel):
     unrealized_pnl: Decimal
     realized_pnl: Decimal = Decimal("0")
     status: str = "open"
+    ib_con_id: int | None = None
     opened_at: _dt.datetime = Field(default_factory=lambda: _dt.datetime.now(_dt.UTC))
 
     def pnl_pct(self) -> Decimal:

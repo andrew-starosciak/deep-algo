@@ -169,11 +169,11 @@ class Database:
             INSERT INTO options_positions
                 (recommendation_id, ticker, right, strike, expiry,
                  quantity, avg_fill_price, current_price, cost_basis,
-                 unrealized_pnl, status, opened_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'open', NOW())
+                 unrealized_pnl, ib_con_id, status, opened_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', NOW())
             RETURNING id
             """,
-            position["recommendation_id"],
+            position.get("recommendation_id"),
             position["ticker"],
             position["right"],
             position["strike"],
@@ -183,6 +183,7 @@ class Database:
             position["current_price"],
             position["cost_basis"],
             position.get("unrealized_pnl", Decimal("0")),
+            position.get("ib_con_id"),
         )
 
     async def update_position_price(
@@ -231,6 +232,46 @@ class Database:
             "SELECT COALESCE(SUM(cost_basis), 0) FROM options_positions WHERE status = 'open'"
         )
         return Decimal(str(val))
+
+    # --- Position sync ---
+
+    async def get_position_by_con_id(self, con_id: int) -> dict | None:
+        """Find an open position by IB contract ID."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT * FROM options_positions
+            WHERE ib_con_id = $1 AND status = 'open'
+            """,
+            con_id,
+        )
+        return dict(row) if row else None
+
+    async def find_position_by_contract(
+        self, ticker: str, right: str, strike, expiry
+    ) -> dict | None:
+        """Fallback: match by contract details when con_id not available."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT * FROM options_positions
+            WHERE ticker = $1 AND "right" = $2 AND strike = $3 AND expiry = $4
+              AND status = 'open'
+            ORDER BY opened_at DESC
+            LIMIT 1
+            """,
+            ticker,
+            right,
+            float(strike),
+            expiry,
+        )
+        return dict(row) if row else None
+
+    async def update_position_con_id(self, position_id: int, con_id: int):
+        """Backfill ib_con_id on an existing position."""
+        await self.pool.execute(
+            "UPDATE options_positions SET ib_con_id = $2 WHERE id = $1",
+            position_id,
+            con_id,
+        )
 
     # --- Recommendations (approval + status) ---
 

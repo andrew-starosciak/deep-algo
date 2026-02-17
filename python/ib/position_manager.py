@@ -30,9 +30,26 @@ class PositionManager:
     async def run(self) -> None:
         """Run the service loop until cancelled."""
         logger.info(
-            "PositionManager started (poll every %ds)", self.config.poll_interval_secs
+            "PositionManager starting (poll every %ds)", self.config.poll_interval_secs
         )
-        await self.ib.connect()
+
+        # Connect to IB Gateway with retry logic (handles ib_insync bug #303)
+        logger.info("Connecting to IB Gateway (may take 30-60s on fresh starts)...")
+        try:
+            await self.ib.connect(max_retries=5, retry_delay=5.0)
+        except RuntimeError as e:
+            logger.error("Failed to connect to IB Gateway: %s", e)
+            logger.error(
+                "Troubleshooting:\n"
+                "  1. Check IB Gateway container is running: docker ps | grep ib-gateway\n"
+                "  2. Check IB Gateway logs: docker logs ib-gateway\n"
+                "  3. Verify 2FA approval: Check IBKR Mobile app for push notification\n"
+                "  4. VNC into Gateway UI: vncviewer localhost:5900 (password: ibgateway)\n"
+                "  5. Verify API enabled in IBKR account settings"
+            )
+            raise
+
+        logger.info("Successfully connected to IB Gateway — position manager running")
 
         try:
             while True:
@@ -43,19 +60,93 @@ class PositionManager:
                 await asyncio.sleep(self.config.poll_interval_secs)
         finally:
             await self.ib.disconnect()
+            logger.info("Position manager stopped")
 
     async def _tick(self) -> None:
-        """One poll cycle: execute recs → update prices → check rules."""
-        # 1. Execute approved recommendations
+        """One poll cycle: sync IB → execute recs → check rules."""
+        # 1. Sync positions from IB (IB is source of truth)
+        await self._sync_positions()
+
+        # 2. Execute approved recommendations
         approved = await self.db.get_approved_recommendations()
         for rec in approved:
             await self._execute_recommendation(rec)
 
-        # 2. Fetch open positions and update prices
+        # 3. Fetch open positions and check stop/target rules
         positions = await self.db.get_open_positions()
         for pos_dict in positions:
             pos = OptionsPosition(**pos_dict)
             await self._update_and_check(pos)
+
+    async def _sync_positions(self) -> None:
+        """Reconcile DB positions with IB portfolio (IB is source of truth)."""
+        try:
+            ib_items = await self.ib.portfolio()
+        except Exception:
+            logger.warning("Failed to fetch IB portfolio — skipping sync")
+            return
+
+        # Filter to long options only
+        ib_options = [i for i in ib_items if i.sec_type == "OPT" and i.position > 0]
+
+        db_positions = await self.db.get_open_positions()
+        db_by_con_id = {
+            p["ib_con_id"]: p for p in db_positions if p.get("ib_con_id")
+        }
+
+        seen_db_ids: set[int] = set()
+
+        for ib_item in ib_options:
+            # Try to match by con_id first
+            db_pos = db_by_con_id.get(ib_item.con_id)
+
+            if db_pos is None:
+                # Fallback: match by contract details
+                db_pos = await self.db.find_position_by_contract(
+                    ib_item.symbol, ib_item.right, ib_item.strike, ib_item.expiry
+                )
+                if db_pos:
+                    await self.db.update_position_con_id(db_pos["id"], ib_item.con_id)
+
+            if db_pos:
+                # Known position — update price from IB
+                seen_db_ids.add(db_pos["id"])
+                await self.db.update_position_price(
+                    db_pos["id"], ib_item.market_price, ib_item.unrealized_pnl
+                )
+            else:
+                # New position not in our DB — insert as external
+                cost_basis = ib_item.avg_cost * abs(ib_item.position) * 100
+                pos_id = await self.db.insert_position({
+                    "recommendation_id": None,
+                    "ib_con_id": ib_item.con_id,
+                    "ticker": ib_item.symbol,
+                    "right": ib_item.right,
+                    "strike": ib_item.strike,
+                    "expiry": ib_item.expiry,
+                    "quantity": abs(ib_item.position),
+                    "avg_fill_price": ib_item.avg_cost,
+                    "current_price": ib_item.market_price,
+                    "cost_basis": cost_basis,
+                    "unrealized_pnl": ib_item.unrealized_pnl,
+                })
+                logger.info(
+                    "Synced external position: %s (con_id=%d, pos_id=%d)",
+                    ib_item.symbol, ib_item.con_id, pos_id,
+                )
+
+        # Positions in DB but gone from IB → mark closed
+        ib_con_ids = {i.con_id for i in ib_options}
+        for db_pos in db_positions:
+            if db_pos["id"] not in seen_db_ids:
+                con_id = db_pos.get("ib_con_id")
+                if con_id and con_id not in ib_con_ids:
+                    await self.db.close_position(
+                        db_pos["id"], "external", Decimal("0")
+                    )
+                    logger.info(
+                        "Closed stale position %d (no longer in IB)", db_pos["id"]
+                    )
 
     async def _execute_recommendation(self, rec: dict) -> None:
         """Execute an approved recommendation: place order, record position."""
@@ -112,6 +203,7 @@ class PositionManager:
             cost_basis = fill.avg_fill_price * fill.quantity * 100
             await self.db.insert_position({
                 "recommendation_id": rec_id,
+                "ib_con_id": fill.con_id,
                 "ticker": ticker,
                 "right": rec["right"],
                 "strike": Decimal(str(rec["strike"])),

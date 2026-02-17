@@ -510,14 +510,49 @@ cmd_start_gateway() {
             -e TRADING_MODE='${ib_trading_mode:-paper}' \
             -e TIME_ZONE=America/New_York \
             -e TWOFA_TIMEOUT_ACTION=restart \
+            -e RELOGIN_AFTER_TWOFA_TIMEOUT=yes \
             -e READ_ONLY_API=no \
             -e BYPASS_WARNING=yes \
-            -p 4001:4001 -p 4002:4002 \
+            -e VNC_SERVER_PASSWORD=ibgateway \
+            -e AUTO_RESTART_TIME='02:00 AM' \
+            -e EXISTING_SESSION_DETECTED_ACTION=primaryoverride \
+            -p 127.0.0.1:4001:4003 \
+            -p 127.0.0.1:4002:4004 \
+            -p 127.0.0.1:5900:5900 \
+            --ulimit nofile=10000:10000 \
             --restart unless-stopped \
+            --health-cmd=\"timeout 1 bash -c '</dev/tcp/0.0.0.0/4004' && echo up || exit 1\" \
+            --health-interval=10s \
+            --health-start-period=60s \
+            --health-retries=5 \
             ghcr.io/gnzsnz/ib-gateway:latest
     "
 
-    info "IB Gateway started. Check: ./scripts/deploy-ib-options.sh status"
+    info "IB Gateway starting (initializing for 60s)..."
+    info "IMPORTANT: Check your IBKR Mobile app for 2FA push notification and APPROVE it!"
+    info ""
+    info "Waiting for container health check..."
+    sleep 10
+
+    # Wait for health check to pass
+    for i in {1..12}; do
+        health_status=$(remote_ssh "docker inspect --format='{{.State.Health.Status}}' ib-gateway 2>/dev/null || echo none")
+        if [ "$health_status" = "healthy" ]; then
+            info "IB Gateway is healthy and ready!"
+            break
+        elif [ "$health_status" = "unhealthy" ]; then
+            warn "IB Gateway health check failed. Check logs: ./scripts/deploy-ib-options.sh logs gateway"
+            break
+        fi
+        info "Health status: $health_status (waiting... $i/12)"
+        sleep 5
+    done
+
+    info ""
+    info "IB Gateway started. Access:"
+    info "  - VNC viewer: localhost:5900 (password: ibgateway) via SSH tunnel"
+    info "  - Logs: ./scripts/deploy-ib-options.sh logs gateway"
+    info "  - Status: ./scripts/deploy-ib-options.sh status"
 }
 
 # =============================================================================

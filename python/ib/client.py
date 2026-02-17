@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import datetime as _dt
 import logging
 from dataclasses import dataclass
 from decimal import Decimal
 
-from ib.types import AccountSummary, Fill, OptionQuote
+from ib.types import AccountSummary, Fill, IBPortfolioItem, OptionQuote
 from schemas.thesis import ContractSpec
 
 logger = logging.getLogger(__name__)
@@ -35,18 +36,78 @@ class IBClient:
         if self._ib is None:
             raise RuntimeError("IBClient is not connected. Call connect() first.")
 
-    async def connect(self) -> None:
+    async def connect(self, max_retries: int = 5, retry_delay: float = 5.0) -> None:
+        """Connect to IB Gateway with retry logic.
+
+        Known issue: ib_insync bug #303 causes first connect() to often fail with TimeoutError
+        on fresh Gateway starts. This implements retry logic with backoff.
+
+        Args:
+            max_retries: Maximum connection attempts (default 5)
+            retry_delay: Seconds to wait between retries (default 5.0)
+        """
+        import asyncio
         from ib_async import IB
 
-        self._ib = IB()
-        await self._ib.connectAsync(
-            host=self._config.host,
-            port=self._config.port,
-            clientId=self._config.client_id,
-        )
-        logger.info(
-            "Connected to IB at %s:%d (client_id=%d)",
-            self._config.host, self._config.port, self._config.client_id,
+        last_error = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Connecting to IB at %s:%d (client_id=%d, attempt %d/%d)",
+                    self._config.host, self._config.port, self._config.client_id,
+                    attempt, max_retries,
+                )
+
+                self._ib = IB()
+                # 10s timeout per attempt (not 30s) to fail fast and retry
+                await asyncio.wait_for(
+                    self._ib.connectAsync(
+                        host=self._config.host,
+                        port=self._config.port,
+                        clientId=self._config.client_id,
+                        timeout=10,
+                    ),
+                    timeout=12.0,  # Slightly higher than internal timeout
+                )
+
+                # Wait for nextValidId callback (confirms handshake complete)
+                await asyncio.sleep(1)
+
+                # Subscribe to account updates so portfolio() has data
+                # Pass empty string '' to subscribe to all accounts
+                await self._ib.reqAccountUpdatesAsync(account='')
+
+                logger.info(
+                    "Successfully connected to IB at %s:%d (client_id=%d)",
+                    self._config.host, self._config.port, self._config.client_id,
+                )
+                return  # Success!
+
+            except (TimeoutError, asyncio.TimeoutError, OSError, ConnectionRefusedError) as e:
+                last_error = e
+                if self._ib:
+                    try:
+                        self._ib.disconnect()
+                    except Exception:
+                        pass
+                    self._ib = None
+
+                if attempt < max_retries:
+                    logger.warning(
+                        "Connection attempt %d/%d failed: %s — retrying in %.1fs",
+                        attempt, max_retries, e, retry_delay,
+                    )
+                    await asyncio.sleep(retry_delay)
+                else:
+                    logger.error(
+                        "Failed to connect after %d attempts. Last error: %s",
+                        max_retries, e,
+                    )
+
+        # All retries exhausted
+        raise RuntimeError(
+            f"Could not connect to IB Gateway at {self._config.host}:{self._config.port} "
+            f"after {max_retries} attempts. Last error: {last_error}"
         )
 
     async def disconnect(self) -> None:
@@ -64,6 +125,38 @@ class IBClient:
             buying_power=Decimal(values.get("BuyingPower", "0")),
             available_funds=Decimal(values.get("AvailableFunds", "0")),
         )
+
+    async def portfolio(self) -> list[IBPortfolioItem]:
+        """Get all portfolio positions with P&L from IB."""
+        self._require_connected()
+        items = self._ib.portfolio()
+        result = []
+        for item in items:
+            c = item.contract
+            expiry = None
+            if c.lastTradeDateOrContractMonth:
+                try:
+                    expiry = _dt.datetime.strptime(
+                        c.lastTradeDateOrContractMonth, "%Y%m%d"
+                    ).date()
+                except ValueError:
+                    pass
+            result.append(IBPortfolioItem(
+                con_id=c.conId,
+                symbol=c.symbol,
+                sec_type=c.secType,
+                right={"C": "call", "P": "put"}.get(c.right),
+                strike=Decimal(str(c.strike)) if c.strike else None,
+                expiry=expiry,
+                position=int(item.position),
+                avg_cost=Decimal(str(item.averageCost)),
+                market_price=Decimal(str(item.marketPrice)),
+                market_value=Decimal(str(item.marketValue)),
+                unrealized_pnl=Decimal(str(item.unrealizedPNL)),
+                realized_pnl=Decimal(str(item.realizedPNL)),
+                account=item.account,
+            ))
+        return result
 
     async def get_option_quote(self, contract: ContractSpec) -> OptionQuote:
         """Get a live quote for an options contract."""
@@ -167,6 +260,7 @@ class IBClient:
             avg_fill_price=avg_price,
             commission=commission,
             filled_at=_dt.datetime.now(_dt.UTC),
+            con_id=ib_contract.conId if ib_contract.conId else None,
         )
 
     async def cancel_order(self, order_id: int) -> None:

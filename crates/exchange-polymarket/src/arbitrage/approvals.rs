@@ -203,6 +203,12 @@ pub async fn set_polymarket_allowances(
 /// Gas limit for redeemPositions (uses ~80-120k gas).
 const REDEEM_GAS_LIMIT: u64 = 200_000;
 
+/// Gas limit for NegRiskAdapter redeemPositions (wrapping overhead, ~150-200k gas).
+const NEG_RISK_REDEEM_GAS_LIMIT: u64 = 300_000;
+
+/// Conditional token decimals (matches USDCe's 6 decimals).
+pub const CTF_DECIMALS: u32 = 6;
+
 /// Builds `redeemPositions(address collateralToken, bytes32 parentCollectionId, bytes32 conditionId, uint256[] indexSets)` calldata.
 ///
 /// The function selector is computed from keccak256 of the canonical signature.
@@ -249,15 +255,67 @@ fn build_redeem_positions(condition_id: &[u8; 32], index_sets: &[u32]) -> Vec<u8
     offset[31] = 0x80;
     data.extend_from_slice(&offset);
 
-    // array length
+    // array length (uint256)
     let mut len = [0u8; 32];
-    len[31] = index_sets.len() as u8;
+    let len_bytes = (index_sets.len() as u64).to_be_bytes();
+    len[24..32].copy_from_slice(&len_bytes);
     data.extend_from_slice(&len);
 
     // array elements
     for &idx in index_sets {
         let mut val = [0u8; 32];
         val[28..32].copy_from_slice(&(idx as u32).to_be_bytes());
+        data.extend_from_slice(&val);
+    }
+
+    data
+}
+
+/// Builds NegRiskAdapter `redeemPositions(bytes32 conditionId, uint256[] amounts)` calldata.
+///
+/// The NegRiskAdapter has a simpler interface than the CTF — it handles the
+/// collateral token and parent collection internally.
+fn build_neg_risk_redeem_positions(condition_id: &[u8; 32], amounts: &[u128]) -> Vec<u8> {
+    use sha3::{Digest, Keccak256};
+
+    // Compute function selector: keccak256("redeemPositions(bytes32,uint256[])")
+    let selector = {
+        let mut hasher = Keccak256::new();
+        hasher.update(b"redeemPositions(bytes32,uint256[])");
+        let hash = hasher.finalize();
+        [hash[0], hash[1], hash[2], hash[3]]
+    };
+
+    // ABI encode:
+    // [0]  selector (4 bytes)
+    // [4]  conditionId (bytes32) - static param
+    // [36] offset to amounts array (0x40 = 64, past the 2 static slots)
+    // [68] length of amounts
+    // [100+] amounts elements (each uint256 = 32 bytes)
+
+    let mut data = Vec::with_capacity(100 + amounts.len() * 32);
+
+    // Function selector
+    data.extend_from_slice(&selector);
+
+    // conditionId (bytes32)
+    data.extend_from_slice(condition_id);
+
+    // offset to dynamic array: conditionId (32) + offset slot (32) = 64 = 0x40
+    let mut offset = [0u8; 32];
+    offset[31] = 0x40;
+    data.extend_from_slice(&offset);
+
+    // array length (uint256)
+    let mut len = [0u8; 32];
+    let len_bytes = (amounts.len() as u64).to_be_bytes();
+    len[24..32].copy_from_slice(&len_bytes);
+    data.extend_from_slice(&len);
+
+    // array elements (uint256, big-endian)
+    for &amount in amounts {
+        let mut val = [0u8; 32];
+        val[16..32].copy_from_slice(&amount.to_be_bytes());
         data.extend_from_slice(&val);
     }
 
@@ -360,6 +418,104 @@ pub async fn redeem_positions(
     Ok(tx_hashes)
 }
 
+/// Redeems neg_risk positions via the NegRiskAdapter contract.
+///
+/// For neg_risk markets (like 15-minute binary options), tokens are wrapped by
+/// the NegRiskAdapter. Standard `CTF.redeemPositions()` won't work because the
+/// tokens have a non-zero parentCollectionId. The NegRiskAdapter handles this
+/// internally via `redeemPositions(bytes32 conditionId, uint256[] amounts)`.
+///
+/// # Arguments
+/// * `wallet` - Wallet to sign and send from
+/// * `rpc_url` - Polygon RPC URL
+/// * `conditions` - List of (conditionId_hex, amounts_per_outcome_slot)
+///
+/// # Returns
+/// Transaction hashes for each redemption.
+pub async fn redeem_neg_risk_positions(
+    wallet: &Wallet,
+    rpc_url: &str,
+    conditions: &[(&str, Vec<u128>)],
+) -> Result<Vec<String>, TxError> {
+    let http = Client::new();
+    let adapter_addr = parse_address(NEG_RISK_ADAPTER)?;
+
+    let mut nonce = polygon_tx::get_nonce(&http, rpc_url, wallet.address()).await?;
+    let gas_price = polygon_tx::get_gas_price(&http, rpc_url).await?;
+    let gas_price = gas_price + gas_price / 5; // 20% buffer
+
+    info!(
+        nonce,
+        gas_price_gwei = gas_price / 1_000_000_000,
+        count = conditions.len(),
+        "Starting neg_risk redemption transactions via NegRiskAdapter"
+    );
+
+    let mut tx_hashes = Vec::new();
+
+    for (condition_id_hex, amounts) in conditions {
+        let stripped = condition_id_hex.strip_prefix("0x").unwrap_or(condition_id_hex);
+        let cid_bytes = hex::decode(stripped)
+            .map_err(|e| TxError::Rlp(format!("Invalid conditionId '{}': {}", condition_id_hex, e)))?;
+        if cid_bytes.len() != 32 {
+            return Err(TxError::Rlp(format!(
+                "conditionId wrong length: {} bytes",
+                cid_bytes.len()
+            )));
+        }
+        let mut cid = [0u8; 32];
+        cid.copy_from_slice(&cid_bytes);
+
+        let calldata = build_neg_risk_redeem_positions(&cid, amounts);
+
+        let tx = LegacyTx {
+            nonce,
+            gas_price,
+            gas_limit: NEG_RISK_REDEEM_GAS_LIMIT,
+            to: adapter_addr,
+            value: [0u8; 32],
+            data: calldata,
+        };
+
+        let signed = polygon_tx::sign_legacy_tx(&tx, POLYGON_CHAIN_ID, wallet.expose_private_key())?;
+        let hash = polygon_tx::broadcast_tx(&http, rpc_url, &signed).await?;
+        info!(
+            tx_hash = %hash,
+            condition_id = %condition_id_hex,
+            amounts = ?amounts,
+            "Neg risk redemption tx sent to NegRiskAdapter"
+        );
+        tx_hashes.push(hash);
+        nonce += 1;
+    }
+
+    // Wait for receipts
+    info!("Waiting for {} neg_risk redemption transactions to confirm...", tx_hashes.len());
+    let mut all_success = true;
+
+    for hash in &tx_hashes {
+        match polygon_tx::wait_for_receipt(&http, rpc_url, hash, 60).await {
+            Ok(true) => info!(tx_hash = %hash, "Neg risk redemption confirmed"),
+            Ok(false) => {
+                warn!(tx_hash = %hash, "Neg risk redemption reverted!");
+                all_success = false;
+            }
+            Err(e) => {
+                warn!(tx_hash = %hash, error = %e, "Failed to get neg risk receipt");
+                all_success = false;
+            }
+        }
+    }
+
+    if all_success {
+        info!("All {} neg_risk redemptions confirmed", tx_hashes.len());
+    } else {
+        warn!("Some neg_risk redemptions failed — check hashes on Polygonscan");
+    }
+
+    Ok(tx_hashes)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -413,5 +569,85 @@ mod tests {
     fn parse_invalid_address() {
         assert!(parse_address("0xinvalid").is_err());
         assert!(parse_address("0x1234").is_err()); // too short
+    }
+
+    #[test]
+    fn redeem_positions_calldata_format() {
+        let cid = [0x42; 32];
+        let data = build_redeem_positions(&cid, &[1, 2]);
+
+        // 4 (selector) + 32 (collateral) + 32 (parent) + 32 (cid) + 32 (offset) + 32 (len) + 2*32 (elements)
+        assert_eq!(data.len(), 228);
+        // conditionId at offset 68..100
+        assert_eq!(&data[68..100], &[0x42; 32]);
+        // array length at offset 132..164: should be 2
+        assert_eq!(data[163], 2);
+        // first element = 1 (indexSet)
+        assert_eq!(data[195], 1);
+        // second element = 2 (indexSet)
+        assert_eq!(data[227], 2);
+    }
+
+    #[test]
+    fn neg_risk_redeem_calldata_format() {
+        let cid = [0xAB; 32];
+        let amounts = vec![100_000_000u128, 0u128]; // 100 tokens for outcome 0, 0 for outcome 1
+
+        let data = build_neg_risk_redeem_positions(&cid, &amounts);
+
+        // 4 (selector) + 32 (cid) + 32 (offset) + 32 (len) + 2*32 (elements) = 164
+        assert_eq!(data.len(), 164);
+
+        // conditionId at offset 4..36
+        assert_eq!(&data[4..36], &[0xAB; 32]);
+
+        // offset at 36..68: should be 0x40 = 64
+        assert_eq!(data[67], 0x40);
+
+        // array length at 68..100: should be 2
+        assert_eq!(data[99], 2);
+
+        // first amount (100_000_000 = 0x05F5E100) in big-endian u128 at offset 100..132
+        let amount_bytes = &data[100..132];
+        // last 4 bytes should contain the value
+        assert_eq!(amount_bytes[28], 0x05);
+        assert_eq!(amount_bytes[29], 0xF5);
+        assert_eq!(amount_bytes[30], 0xE1);
+        assert_eq!(amount_bytes[31], 0x00);
+        // rest should be zero
+        assert_eq!(&amount_bytes[0..28], &[0u8; 28]);
+
+        // second amount (0) at offset 132..164
+        assert_eq!(&data[132..164], &[0u8; 32]);
+    }
+
+    #[test]
+    fn neg_risk_redeem_selector_differs_from_ctf() {
+        use sha3::{Digest, Keccak256};
+
+        let ctf_selector = {
+            let mut h = Keccak256::new();
+            h.update(b"redeemPositions(address,bytes32,bytes32,uint256[])");
+            let hash = h.finalize();
+            [hash[0], hash[1], hash[2], hash[3]]
+        };
+
+        let neg_risk_selector = {
+            let mut h = Keccak256::new();
+            h.update(b"redeemPositions(bytes32,uint256[])");
+            let hash = h.finalize();
+            [hash[0], hash[1], hash[2], hash[3]]
+        };
+
+        // Different function signatures must produce different selectors
+        assert_ne!(ctf_selector, neg_risk_selector);
+
+        // Verify our calldata uses the correct selectors
+        let cid = [0x01; 32];
+        let ctf_data = build_redeem_positions(&cid, &[1]);
+        let neg_data = build_neg_risk_redeem_positions(&cid, &[100]);
+
+        assert_eq!(&ctf_data[0..4], &ctf_selector);
+        assert_eq!(&neg_data[0..4], &neg_risk_selector);
     }
 }

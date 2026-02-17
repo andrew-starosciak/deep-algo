@@ -792,63 +792,132 @@ impl ClobClient {
 
         let positions = self.get_positions().await?;
 
-        // Group redeemable positions by condition ID → set of index sets
-        let mut redeemable: HashMap<String, Vec<u32>> = HashMap::new();
+        // Separate redeemable positions into standard CTF vs neg_risk paths.
+        // Standard markets: redeem via CTF.redeemPositions(collateral, parent, cid, indexSets)
+        // Neg risk markets: redeem via NegRiskAdapter.redeemPositions(cid, amounts)
+        let mut standard: HashMap<String, Vec<u32>> = HashMap::new();
+        let mut neg_risk: HashMap<String, Vec<(u32, f64)>> = HashMap::new();
+
         for pos in &positions {
-            if !pos.redeemable {
+            if !pos.redeemable || pos.size <= 0.0 {
                 continue;
             }
-            if pos.size <= 0.0 {
-                continue;
-            }
-            // outcome_index: 0 → indexSet 1 (binary 01), 1 → indexSet 2 (binary 10)
-            let idx_set = match pos.outcome_index {
-                Some(0) => 1u32,
-                Some(1) => 2u32,
-                _ => {
-                    // Fallback: try both
-                    let entry = redeemable.entry(pos.condition_id.clone()).or_default();
-                    if !entry.contains(&1) { entry.push(1); }
-                    if !entry.contains(&2) { entry.push(2); }
-                    continue;
+
+            if pos.negative_risk {
+                // Neg risk: collect (outcome_index, size) per condition
+                let outcome_idx = match pos.outcome_index {
+                    Some(idx) if idx >= 0 => idx as u32,
+                    Some(idx) => {
+                        warn!(
+                            condition_id = %pos.condition_id,
+                            outcome_index = idx,
+                            "Neg risk position has invalid negative outcome_index, skipping"
+                        );
+                        continue;
+                    }
+                    None => {
+                        warn!(
+                            condition_id = %pos.condition_id,
+                            title = %pos.title,
+                            "Neg risk position missing outcome_index, skipping"
+                        );
+                        continue;
+                    }
+                };
+                neg_risk
+                    .entry(pos.condition_id.clone())
+                    .or_default()
+                    .push((outcome_idx, pos.size));
+            } else {
+                // Standard CTF: collect index sets per condition
+                let idx_set = match pos.outcome_index {
+                    Some(0) => 1u32,
+                    Some(1) => 2u32,
+                    _ => {
+                        let entry = standard.entry(pos.condition_id.clone()).or_default();
+                        if !entry.contains(&1) { entry.push(1); }
+                        if !entry.contains(&2) { entry.push(2); }
+                        continue;
+                    }
+                };
+                let entry = standard.entry(pos.condition_id.clone()).or_default();
+                if !entry.contains(&idx_set) {
+                    entry.push(idx_set);
                 }
-            };
-            let entry = redeemable.entry(pos.condition_id.clone()).or_default();
-            if !entry.contains(&idx_set) {
-                entry.push(idx_set);
             }
         }
 
-        if redeemable.is_empty() {
+        if standard.is_empty() && neg_risk.is_empty() {
             return Ok(0);
         }
 
-        info!(
-            count = redeemable.len(),
-            "Found {} redeemable conditions, sending on-chain redemption",
-            redeemable.len()
-        );
+        let mut total_redeemed = 0u64;
 
-        // Build conditions list for the approvals module
-        let conditions: Vec<(String, Vec<u32>)> = redeemable.into_iter().collect();
-        let conditions_ref: Vec<(&str, Vec<u32>)> = conditions
-            .iter()
-            .map(|(cid, idx)| (cid.as_str(), idx.clone()))
-            .collect();
+        // Redeem standard positions via CTF
+        if !standard.is_empty() {
+            info!(
+                count = standard.len(),
+                "Redeeming {} standard conditions via CTF",
+                standard.len()
+            );
+            let conditions: Vec<(String, Vec<u32>)> = standard.into_iter().collect();
+            let conditions_ref: Vec<(&str, Vec<u32>)> = conditions
+                .iter()
+                .map(|(cid, idx)| (cid.as_str(), idx.clone()))
+                .collect();
 
-        let tx_hashes = approvals::redeem_positions(&self.wallet, rpc_url, &conditions_ref)
+            let tx_hashes = approvals::redeem_positions(&self.wallet, rpc_url, &conditions_ref)
+                .await
+                .map_err(|e| ClobError::Api {
+                    status: 0,
+                    message: format!("Standard redemption failed: {}", e),
+                })?;
+
+            info!(tx_count = tx_hashes.len(), "Standard redemption txs confirmed");
+            total_redeemed += conditions_ref.len() as u64;
+        }
+
+        // Redeem neg_risk positions via NegRiskAdapter
+        if !neg_risk.is_empty() {
+            info!(
+                count = neg_risk.len(),
+                "Redeeming {} neg_risk conditions via NegRiskAdapter",
+                neg_risk.len()
+            );
+
+            // Convert (outcome_index, size) pairs to amounts arrays.
+            // Each element amounts[i] = raw token amount for outcome slot i.
+            let scale = 10u128.pow(approvals::CTF_DECIMALS);
+            let conditions: Vec<(String, Vec<u128>)> = neg_risk
+                .into_iter()
+                .map(|(cid, slots)| {
+                    let max_idx = slots.iter().map(|(i, _)| *i).max().unwrap_or(0) as usize;
+                    let mut amounts = vec![0u128; max_idx + 1];
+                    for (idx, size) in slots {
+                        amounts[idx as usize] = (size * scale as f64).round() as u128;
+                    }
+                    (cid, amounts)
+                })
+                .collect();
+            let conditions_ref: Vec<(&str, Vec<u128>)> = conditions
+                .iter()
+                .map(|(cid, amounts)| (cid.as_str(), amounts.clone()))
+                .collect();
+
+            let tx_hashes = approvals::redeem_neg_risk_positions(
+                &self.wallet, rpc_url, &conditions_ref,
+            )
             .await
             .map_err(|e| ClobError::Api {
                 status: 0,
-                message: format!("On-chain redemption failed: {}", e),
+                message: format!("Neg risk redemption failed: {}", e),
             })?;
 
-        info!(
-            tx_count = tx_hashes.len(),
-            "Redemption transactions confirmed"
-        );
+            info!(tx_count = tx_hashes.len(), "Neg risk redemption txs confirmed");
+            total_redeemed += conditions_ref.len() as u64;
+        }
 
-        Ok(conditions_ref.len() as u64)
+        Ok(total_redeemed)
     }
 
     /// Submits an order to the CLOB.
