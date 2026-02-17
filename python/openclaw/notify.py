@@ -15,15 +15,22 @@ class MultiNotifier:
     """Send notifications to both Discord and Telegram (if configured)."""
 
     def __init__(self):
-        self.discord = None
+        self.discord_bot = None
+        self.discord_webhook = None
         self.telegram = None
+        self._bot_started = False
 
-        # Initialize Discord if webhook URL is set
-        discord_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
-        if discord_url:
+        # Initialize Discord bot if token is set (preferred - has interactive buttons)
+        discord_token = os.environ.get("DISCORD_BOT_TOKEN", "")
+        if discord_token:
+            from openclaw.discord_bot import DiscordBot
+            self.discord_bot = DiscordBot()
+            logger.info("Discord bot enabled (interactive buttons)")
+        # Fallback to webhook if no bot token
+        elif os.environ.get("DISCORD_WEBHOOK_URL"):
             from openclaw.discord_notify import DiscordNotifier
-            self.discord = DiscordNotifier(discord_url)
-            logger.info("Discord notifier enabled")
+            self.discord_webhook = DiscordNotifier()
+            logger.info("Discord webhook enabled (no buttons)")
 
         # Initialize Telegram if bot token is set
         telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -31,24 +38,36 @@ class MultiNotifier:
             self.telegram = TelegramNotifier()
             logger.info("Telegram notifier enabled")
 
-        if not self.discord and not self.telegram:
+        if not self.discord_bot and not self.discord_webhook and not self.telegram:
             logger.warning("No notification channels configured (Discord or Telegram)")
+
+    async def _ensure_bot_started(self):
+        """Start Discord bot if not already running."""
+        if self.discord_bot and not self._bot_started:
+            await self.discord_bot.start_background()
+            self._bot_started = True
 
     async def send(self, message: str) -> None:
         """Send message to all configured channels."""
+        await self._ensure_bot_started()
         tasks = []
-        if self.discord:
-            tasks.append(self.discord.send(message))
+        if self.discord_bot:
+            tasks.append(self.discord_bot.send(message))
+        elif self.discord_webhook:
+            tasks.append(self.discord_webhook.send(message))
         if self.telegram:
             tasks.append(self.telegram.send(message))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def send_recommendation(self, recommendation: dict) -> None:
-        """Send trade recommendation to all channels."""
+        """Send trade recommendation to all channels (with interactive buttons if Discord bot)."""
+        await self._ensure_bot_started()
         tasks = []
-        if self.discord:
-            tasks.append(self.discord.send_recommendation(recommendation))
+        if self.discord_bot:
+            tasks.append(self.discord_bot.send_recommendation(recommendation))
+        elif self.discord_webhook:
+            tasks.append(self.discord_webhook.send_recommendation(recommendation))
         if self.telegram:
             tasks.append(self.telegram.send_recommendation(recommendation))
         if tasks:
@@ -56,9 +75,12 @@ class MultiNotifier:
 
     async def escalate(self, workflow_name: str, step_id: str, context: dict, error: str | None = None) -> None:
         """Escalate workflow failure to all channels."""
+        await self._ensure_bot_started()
         tasks = []
-        if self.discord:
-            tasks.append(self.discord.escalate(workflow_name, step_id, context, error))
+        if self.discord_bot:
+            tasks.append(self.discord_bot.escalate(workflow_name, step_id, context, error))
+        elif self.discord_webhook:
+            tasks.append(self.discord_webhook.escalate(workflow_name, step_id, context, error))
         if self.telegram:
             tasks.append(self.telegram.escalate(workflow_name, step_id, context, error))
         if tasks:
@@ -66,9 +88,12 @@ class MultiNotifier:
 
     async def send_battle_plan(self, plan: dict) -> None:
         """Send weekly battle plan to all channels."""
+        await self._ensure_bot_started()
         tasks = []
-        if self.discord:
-            tasks.append(self.discord.send_battle_plan(plan))
+        if self.discord_bot:
+            tasks.append(self.discord_bot.send_battle_plan(plan))
+        elif self.discord_webhook:
+            tasks.append(self.discord_webhook.send_battle_plan(plan))
         if self.telegram:
             tasks.append(self.telegram.send_battle_plan(plan))
         if tasks:
