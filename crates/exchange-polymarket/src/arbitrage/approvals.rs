@@ -322,6 +322,22 @@ fn build_neg_risk_redeem_positions(condition_id: &[u8; 32], amounts: &[u128]) ->
     data
 }
 
+/// Parses a hex-encoded condition ID to a 32-byte array.
+fn parse_condition_id(hex_str: &str) -> Result<[u8; 32], TxError> {
+    let stripped = hex_str.strip_prefix("0x").unwrap_or(hex_str);
+    let bytes = hex::decode(stripped)
+        .map_err(|e| TxError::Rlp(format!("Invalid conditionId '{}': {}", hex_str, e)))?;
+    if bytes.len() != 32 {
+        return Err(TxError::Rlp(format!(
+            "conditionId wrong length: {} bytes",
+            bytes.len()
+        )));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 /// Redeems winning positions from resolved Polymarket markets.
 ///
 /// For each condition ID, calls `CTF.redeemPositions(USDCe, 0x0, conditionId, indexSets)`
@@ -356,17 +372,7 @@ pub async fn redeem_positions(
     let mut tx_hashes = Vec::new();
 
     for (condition_id_hex, index_sets) in conditions {
-        let stripped = condition_id_hex.strip_prefix("0x").unwrap_or(condition_id_hex);
-        let cid_bytes = hex::decode(stripped)
-            .map_err(|e| TxError::Rlp(format!("Invalid conditionId '{}': {}", condition_id_hex, e)))?;
-        if cid_bytes.len() != 32 {
-            return Err(TxError::Rlp(format!(
-                "conditionId wrong length: {} bytes",
-                cid_bytes.len()
-            )));
-        }
-        let mut cid = [0u8; 32];
-        cid.copy_from_slice(&cid_bytes);
+        let cid = parse_condition_id(condition_id_hex)?;
 
         let calldata = build_redeem_positions(&cid, index_sets);
 
@@ -454,17 +460,7 @@ pub async fn redeem_neg_risk_positions(
     let mut tx_hashes = Vec::new();
 
     for (condition_id_hex, amounts) in conditions {
-        let stripped = condition_id_hex.strip_prefix("0x").unwrap_or(condition_id_hex);
-        let cid_bytes = hex::decode(stripped)
-            .map_err(|e| TxError::Rlp(format!("Invalid conditionId '{}': {}", condition_id_hex, e)))?;
-        if cid_bytes.len() != 32 {
-            return Err(TxError::Rlp(format!(
-                "conditionId wrong length: {} bytes",
-                cid_bytes.len()
-            )));
-        }
-        let mut cid = [0u8; 32];
-        cid.copy_from_slice(&cid_bytes);
+        let cid = parse_condition_id(condition_id_hex)?;
 
         let calldata = build_neg_risk_redeem_positions(&cid, amounts);
 
