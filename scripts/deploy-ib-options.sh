@@ -108,12 +108,13 @@ cmd_deploy() {
         exit 1
     fi
 
-    # Build local binary first (for IB API client if needed)
-    info "Building Rust components..."
-    (
-        cd "$PROJECT_ROOT"
-        cargo build -p algo-trade-ib --release 2>&1 | tail -5 || true
-    )
+    # Skip Rust build - IB Options system is Python-based (OpenClaw)
+    # Rust components not needed for this deployment
+    # info "Building Rust components..."
+    # (
+    #     cd "$PROJECT_ROOT"
+    #     cargo build -p algo-trade-ib --release 2>&1 | tail -5 || true
+    # )
 
     # Create SSH key pair
     info "Creating SSH key pair..."
