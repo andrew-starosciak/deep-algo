@@ -7,6 +7,7 @@
 #
 # Usage:
 #   ./scripts/deploy-ib-options.sh deploy              # Provision EC2 + install all dependencies
+#   ./scripts/deploy-ib-options.sh redeploy            # Sync code + migrate + restart services
 #   ./scripts/deploy-ib-options.sh sync                # Upload latest Python code
 #   ./scripts/deploy-ib-options.sh setup-cron          # Install cron jobs for scheduled workflows
 #   ./scripts/deploy-ib-options.sh start-gateway       # Start IB Gateway container
@@ -687,6 +688,58 @@ cmd_teardown() {
 }
 
 # =============================================================================
+# redeploy — Sync code + migrate + restart services (one command deploy)
+# =============================================================================
+
+cmd_redeploy() {
+    load_state
+
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}        ${WHITE}Redeploy OpenClaw to ${PUBLIC_IP}${NC}                    ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # 1. Sync Python code
+    cmd_sync
+
+    # 2. Apply any new migrations
+    sync_and_migrate
+
+    # 3. Install/update Python deps if requirements changed
+    info "Updating Python dependencies..."
+    remote_ssh "
+        source venv/bin/activate
+        cd ~/python
+        pip install -e . 2>&1 | tail -3
+    "
+
+    # 4. Restart running services
+    info "Restarting services..."
+    remote_ssh "
+        if systemctl is-active --quiet ib-options-scheduler; then
+            sudo systemctl restart ib-options-scheduler
+            echo '  Restarted ib-options-scheduler'
+        fi
+        if systemctl is-active --quiet ib-options-manager; then
+            sudo systemctl restart ib-options-manager
+            echo '  Restarted ib-options-manager'
+        fi
+        sleep 2
+    "
+
+    # 5. Quick health check
+    info "Service status:"
+    remote_ssh "
+        systemctl is-active ib-options-scheduler 2>/dev/null && echo '  scheduler: running' || echo '  scheduler: not running'
+        systemctl is-active ib-options-manager 2>/dev/null && echo '  manager: running' || echo '  manager: not running'
+    "
+
+    echo ""
+    info "✅ Redeploy complete."
+    echo ""
+}
+
+# =============================================================================
 # Main dispatcher
 # =============================================================================
 
@@ -697,6 +750,9 @@ case "${1:-}" in
         ;;
     sync)
         cmd_sync
+        ;;
+    redeploy)
+        cmd_redeploy
         ;;
     setup-cron)
         cmd_setup_cron
@@ -737,6 +793,7 @@ case "${1:-}" in
         echo ""
         echo "Commands:"
         echo "  deploy              Provision EC2 and install all dependencies"
+        echo "  redeploy            Sync code + migrate + restart services"
         echo "  sync                Upload latest Python code"
         echo "  setup-cron          Install cron jobs for scheduled workflows"
         echo "  start-gateway       Start IB Gateway container"

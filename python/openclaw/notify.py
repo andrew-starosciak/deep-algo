@@ -41,10 +41,14 @@ class MultiNotifier:
         if not self.discord_bot and not self.discord_webhook and not self.telegram:
             logger.warning("No notification channels configured (Discord or Telegram)")
 
-    def set_context(self, db: Any = None, engine: Any = None) -> None:
-        """Pass database and engine to the Discord bot for chat commands."""
+    def set_context(self, db: Any = None, engine: Any = None, position_manager: Any = None) -> None:
+        """Pass database, engine, and position manager to the Discord bot for chat commands."""
         if self.discord_bot:
-            self.discord_bot.set_context(db=db, engine=engine)
+            self.discord_bot.set_context(db=db, engine=engine, position_manager=position_manager)
+
+    async def start(self) -> None:
+        """Start the Discord bot so it can receive messages."""
+        await self._ensure_bot_started()
 
     async def _ensure_bot_started(self):
         """Start Discord bot if not already running."""

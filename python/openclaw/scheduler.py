@@ -76,9 +76,12 @@ class WorkflowScheduler:
             db=self.db, ib_client=self.ib_client, notifier=self.notifier,
         )
 
-        # Wire DB + engine into Discord bot so chat commands work
+        # Wire DB + engine + position manager into Discord bot and start it
         if self.notifier:
-            self.notifier.set_context(db=self.db, engine=self.engine)
+            self.notifier.set_context(
+                db=self.db, engine=self.engine, position_manager=self._position_manager,
+            )
+            await self.notifier.start()
 
         # Start scheduler as async context manager before adding schedules
         async with self.scheduler:
