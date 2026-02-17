@@ -224,13 +224,16 @@ cmd_deploy() {
     wait_for_ssh
 
     # Install system dependencies
+    info "Updating package lists..."
+    remote_ssh "sudo apt-get update -y" 2>&1 | tail -3
+
     info "Installing system dependencies..."
-    remote_ssh "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    remote_ssh "sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
         postgresql postgresql-contrib \
         python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip \
         git curl build-essential libpq-dev \
-        docker.io docker-compose-plugin \
-        supervisor htop vim" 2>&1 | tail -10
+        docker.io \
+        htop vim" 2>&1 | tail -10
 
     # Add ubuntu to docker group
     remote_ssh "sudo usermod -aG docker ubuntu" 2>&1 | tail -3
