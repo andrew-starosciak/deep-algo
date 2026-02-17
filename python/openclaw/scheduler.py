@@ -68,6 +68,7 @@ class WorkflowScheduler:
 
     async def start(self) -> None:
         """Connect IB and start the scheduler."""
+        import asyncio
         from ib.position_manager import PositionManager
 
         await self.ib_client.connect()
@@ -75,13 +76,20 @@ class WorkflowScheduler:
             db=self.db, ib_client=self.ib_client, notifier=self.notifier,
         )
 
-        await self.setup()
-        logger.info("Scheduler started — waiting for triggers")
+        # Start scheduler as async context manager before adding schedules
+        async with self.scheduler:
+            await self.setup()
+            logger.info("Scheduler started — waiting for triggers")
 
-        try:
-            await self.scheduler.run_until_stopped()
-        finally:
-            await self.ib_client.disconnect()
+            try:
+                # Run scheduler in background and wait forever
+                await self.scheduler.start_in_background()
+                # Keep the process alive indefinitely
+                await asyncio.Event().wait()
+            except (KeyboardInterrupt, asyncio.CancelledError):
+                logger.info("Scheduler shutting down")
+            finally:
+                await self.ib_client.disconnect()
 
     async def _premarket_research(self) -> None:
         """Run trade-thesis workflow for each watchlist ticker."""

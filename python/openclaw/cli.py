@@ -173,7 +173,7 @@ async def _dispatch(args):
     elif args.command == "status":
         print("Status: not yet connected to database")
     elif args.command == "watchlist":
-        print("Watchlist: not yet connected to database")
+        await _cmd_watchlist(args)
     elif args.command == "scheduler":
         await _cmd_scheduler(args)
 
@@ -298,6 +298,41 @@ async def _cmd_approve(args):
         await db.approve_recommendation(args.rec_id)
         print(f"Recommendation #{args.rec_id} approved.")
         print("The position manager will pick it up on the next poll cycle.")
+    finally:
+        await db.close()
+
+
+async def _cmd_watchlist(args):
+    """Manage the options trading watchlist."""
+    db = await _init_db(args)
+
+    try:
+        if args.wl_command == "add":
+            await db.add_to_watchlist(
+                ticker=args.ticker.upper(),
+                sector=args.sector,
+                notes=None,
+            )
+            print(f"Added {args.ticker.upper()} ({args.sector}) to watchlist")
+
+        elif args.wl_command == "show":
+            watchlist = await db.get_watchlist()
+            if not watchlist:
+                print("Watchlist is empty")
+            else:
+                print(f"\nWatchlist ({len(watchlist)} tickers):")
+                print("-" * 60)
+                for item in watchlist:
+                    ticker = item["ticker"]
+                    sector = item.get("sector", "Unknown")
+                    notes = item.get("notes", "")
+                    note_str = f" — {notes}" if notes else ""
+                    print(f"  {ticker:6s} {sector:20s}{note_str}")
+                print()
+
+        else:
+            print("Usage: openclaw watchlist {add|show}")
+
     finally:
         await db.close()
 
