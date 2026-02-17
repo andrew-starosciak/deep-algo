@@ -210,9 +210,10 @@ class DiscordBot:
             except ValueError:
                 logger.warning(f"Invalid DISCORD_CHANNEL_ID: {channel_id_str}")
 
-        # Discord client with minimal intents
+        # Discord client — need guilds + message_content intents
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.members = True  # Required for guild.me to resolve
         self.client = discord.Client(intents=intents)
 
         # Track if bot is ready
@@ -244,14 +245,50 @@ class DiscordBot:
 
         if self.channel_id:
             self._channel = self.client.get_channel(self.channel_id)
-        else:
-            # Auto-detect: use first text channel bot can see
-            for guild in self.client.guilds:
-                for channel in guild.text_channels:
-                    if channel.permissions_for(guild.me).send_messages:
-                        self._channel = channel
-                        logger.info(f"Auto-detected channel: {channel.name} (ID: {channel.id})")
-                        break
+            # Fallback to fetch if cache miss
+            if self._channel is None:
+                try:
+                    self._channel = await self.client.fetch_channel(self.channel_id)
+                except Exception:
+                    logger.warning("Could not fetch channel ID %s", self.channel_id)
+
+        if not self._channel:
+            # Auto-detect: use first text channel bot can access.
+            # Try cached guilds first, then fetch from API as fallback.
+            guilds = self.client.guilds
+            if not guilds:
+                try:
+                    guilds = [g async for g in self.client.fetch_guilds()]
+                    logger.info("Fetched %d guild(s) from API", len(guilds))
+                except Exception:
+                    logger.exception("Failed to fetch guilds from API")
+                    guilds = []
+
+            for guild in guilds:
+                # Ensure we have the full guild object with channels
+                try:
+                    full_guild = self.client.get_guild(guild.id)
+                    if full_guild is None:
+                        full_guild = await self.client.fetch_guild(guild.id)
+                    channels = full_guild.text_channels
+                except Exception:
+                    logger.warning("Could not fetch guild %s, skipping", guild.id)
+                    continue
+
+                for channel in channels:
+                    # Try permission check, but fall back to just picking
+                    # the first text channel if guild.me is unavailable
+                    me = full_guild.me
+                    if me is not None:
+                        perms = channel.permissions_for(me)
+                        if not perms.send_messages:
+                            continue
+                    self._channel = channel
+                    logger.info(
+                        "Auto-detected channel: %s (ID: %s) in guild: %s",
+                        channel.name, channel.id, full_guild.name,
+                    )
+                    break
                 if self._channel:
                     break
 

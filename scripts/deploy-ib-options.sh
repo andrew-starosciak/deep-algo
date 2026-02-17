@@ -343,7 +343,7 @@ cmd_setup_cron() {
 #!/bin/bash
 set -a && source ~/.env && set +a
 cd ~/python
-~/venv/bin/python -m openclaw run trade-thesis --ticker AAPL --db-url \$DATABASE_URL
+~/venv/bin/python -m openclaw --db-url \$DATABASE_URL run trade-thesis --ticker AAPL
 SCRIPT
 chmod +x ~/scripts/run-premarket.sh"
 

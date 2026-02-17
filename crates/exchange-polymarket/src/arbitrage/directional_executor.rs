@@ -21,13 +21,16 @@ use crate::arbitrage::directional_runner::DirectionalRunnerStats;
 use crate::arbitrage::execution::{
     ExecutionError, OrderParams, OrderStatus, PolymarketExecutor,
 };
+use crate::models::Coin;
 use crate::GammaClient;
+use algo_trade_data::chainlink::ChainlinkWindowTracker;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::VecDeque;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -340,6 +343,10 @@ pub struct DirectionalExecutor<E: PolymarketExecutor> {
     pending_settlements: Vec<DirectionalTradeRecord>,
     /// Gamma client for settlement resolution checks.
     gamma_client: GammaClient,
+    /// HTTP client for CLOB price checks (fast-settle path).
+    http_client: reqwest::Client,
+    /// Chainlink oracle tracker for fallback settlement.
+    chainlink_tracker: Arc<RwLock<ChainlinkWindowTracker>>,
     /// Runner stats (for dashboard — directional-auto mode).
     runner_stats: Option<Arc<RwLock<DirectionalRunnerStats>>>,
     /// CLOB timing runner stats (for dashboard — clob-timing mode).
@@ -369,6 +376,9 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
 
         let session_id = format!("dir-{}", Utc::now().format("%Y%m%d-%H%M%S"));
 
+        let rpc_url = std::env::var("POLYGON_RPC_URL")
+            .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+
         Self {
             executor,
             config,
@@ -378,6 +388,8 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             trades: VecDeque::with_capacity(100),
             pending_settlements: Vec::new(),
             gamma_client: GammaClient::new(),
+            http_client: reqwest::Client::new(),
+            chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
             runner_stats: None,
             clob_timing_stats: None,
             dashboard_title: "Directional Trading Bot".to_string(),
@@ -406,6 +418,9 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
         let session_id =
             session_id.unwrap_or_else(|| format!("dir-{}", Utc::now().format("%Y%m%d-%H%M%S")));
 
+        let rpc_url = std::env::var("POLYGON_RPC_URL")
+            .unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+
         Self {
             executor,
             config,
@@ -415,6 +430,8 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             trades: VecDeque::with_capacity(100),
             pending_settlements: Vec::new(),
             gamma_client: GammaClient::new(),
+            http_client: reqwest::Client::new(),
+            chainlink_tracker: Arc::new(RwLock::new(ChainlinkWindowTracker::new(&rpc_url))),
             runner_stats: None,
             clob_timing_stats: None,
             dashboard_title: "Directional Trading Bot".to_string(),
@@ -485,6 +502,9 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             tokio::time::interval(Duration::from_secs(self.config.settlement_interval_secs));
         let mut dashboard_tick =
             tokio::time::interval(Duration::from_secs(self.config.stats_interval_secs));
+        let mut chainlink_tick = tokio::time::interval(Duration::from_secs(10));
+        // Consume the first immediate tick
+        chainlink_tick.tick().await;
 
         loop {
             tokio::select! {
@@ -499,6 +519,12 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                             break;
                         }
                     }
+                }
+
+                // Poll Chainlink oracle prices (for fallback settlement)
+                _ = chainlink_tick.tick() => {
+                    let mut tracker = self.chainlink_tracker.write().await;
+                    tracker.poll().await;
                 }
 
                 // Check settlements
@@ -761,6 +787,11 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
     }
 
     /// Checks pending trades for settlement resolution.
+    ///
+    /// Uses a three-path cascade (matching cross_market_auto_executor):
+    /// 1. CLOB fast-settle: Check token prices ≥0.90 / ≤0.10 (30s after close)
+    /// 2. Gamma API: Official UMA resolution (2 min after close)
+    /// 3. Chainlink fallback: Oracle price comparison (10 min after close)
     async fn check_settlements(&mut self) {
         if self.pending_settlements.is_empty() {
             return;
@@ -768,103 +799,164 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
 
         let now_ms = Utc::now().timestamp_millis();
         let mut settled_indices: Vec<usize> = Vec::new();
-        // Collect settlements to persist after the mutable borrow ends
         let mut to_persist: Vec<(String, bool, Decimal)> = Vec::new();
 
         for (i, trade) in self.pending_settlements.iter_mut().enumerate() {
-            // Only check trades whose window has closed (15 min = 900_000 ms)
             let window_start = crate::arbitrage::reference_tracker::ReferenceTracker::window_start_for_time(
                 trade.signal_timestamp.timestamp_millis(),
             );
             let window_end = window_start + 15 * 60 * 1000;
+            let trade_age_ms = now_ms - window_end;
 
-            // Wait at least 2 minutes after window close for resolution
-            if now_ms < window_end + 120_000 {
+            // Window hasn't closed yet
+            if trade_age_ms < 0 {
                 continue;
             }
-
-            // Resolve via Gamma API using the trade's exact window
-            let coin = crate::models::Coin::from_slug(&trade.coin);
-            let coin = match coin {
-                Some(c) => c,
-                None => continue,
-            };
 
             let window_end_dt = match DateTime::from_timestamp_millis(window_end) {
                 Some(dt) => dt,
                 None => continue,
             };
 
-            let outcome = match self.gamma_client.get_market_outcome(coin, window_end_dt).await {
-                Ok(Some(outcome)) => outcome,
-                Ok(None) => continue, // Not yet resolved
-                Err(e) => {
-                    warn!(
-                        coin = trade.coin,
-                        error = %e,
-                        "Failed to check settlement"
+            // ── Path 1: CLOB fast-settle (30s after window close) ──
+            // Check if token price shows decisive resolution.
+            if trade_age_ms >= 30_000 {
+                if let Some(won) = Self::try_clob_settle(&trade.token_id, &self.http_client).await {
+                    let source = "CLOB";
+                    let (pnl, outcome_str) = Self::calculate_directional_pnl(
+                        won,
+                        trade.entry_price,
+                        trade.shares,
+                        trade.cost,
+                        self.config.fee_rate,
+                        &trade.direction,
                     );
+
+                    trade.settlement = Some(SettlementResult { won, pnl, settled_at: Utc::now() });
+                    info!(
+                        trade_id = trade.trade_id,
+                        coin = trade.coin,
+                        direction = %trade.direction,
+                        outcome = %outcome_str,
+                        won = won,
+                        pnl = %pnl,
+                        source = source,
+                        "SETTLED directional trade via CLOB fast-settle"
+                    );
+                    Self::apply_settlement_to_stats(
+                        won, pnl, trade.cost,
+                        &self.executor, &self.stats,
+                    ).await;
+                    to_persist.push((trade.trade_id.clone(), won, pnl));
+                    settled_indices.push(i);
                     continue;
                 }
-            };
-
-            // Determine if we won based on resolved outcome vs our direction
-            let won = match trade.direction {
-                Direction::Up => outcome == "UP",
-                Direction::Down => outcome == "DOWN",
-            };
-
-            // Calculate P&L
-            let pnl = if won {
-                // Win: receive 1.00 per share, minus entry cost and fee
-                let gross = (Decimal::ONE - trade.entry_price) * trade.shares;
-                gross * (Decimal::ONE - self.config.fee_rate)
-            } else {
-                // Loss: lose entire cost
-                -trade.cost
-            };
-
-            trade.settlement = Some(SettlementResult {
-                won,
-                pnl,
-                settled_at: Utc::now(),
-            });
-
-            info!(
-                trade_id = trade.trade_id,
-                coin = trade.coin,
-                direction = %trade.direction,
-                outcome = %outcome,
-                won = won,
-                pnl = %pnl,
-                "SETTLED directional trade"
-            );
-
-            to_persist.push((trade.trade_id.clone(), won, pnl));
-
-            // Credit balance for wins
-            if won {
-                let winnings = trade.cost + pnl;
-                let _ = self.executor.credit_balance(winnings).await;
             }
 
-            // Update stats
-            {
-                let mut stats = self.stats.write().await;
-                if won {
-                    stats.wins += 1;
-                } else {
-                    stats.losses += 1;
+            // ── Path 2: Gamma API (2 min after window close) ──
+            if trade_age_ms >= 120_000 {
+                let coin = match Coin::from_slug(&trade.coin) {
+                    Some(c) => c,
+                    None => continue,
+                };
+
+                match self.gamma_client.get_market_outcome(coin, window_end_dt).await {
+                    Ok(Some(outcome)) => {
+                        let won = match trade.direction {
+                            Direction::Up => outcome == "UP",
+                            Direction::Down => outcome == "DOWN",
+                        };
+                        let (pnl, _) = Self::calculate_directional_pnl(
+                            won,
+                            trade.entry_price,
+                            trade.shares,
+                            trade.cost,
+                            self.config.fee_rate,
+                            &trade.direction,
+                        );
+
+                        trade.settlement = Some(SettlementResult { won, pnl, settled_at: Utc::now() });
+                        info!(
+                            trade_id = trade.trade_id,
+                            coin = trade.coin,
+                            direction = %trade.direction,
+                            outcome = %outcome,
+                            won = won,
+                            pnl = %pnl,
+                            "SETTLED directional trade via Gamma API"
+                        );
+                        Self::apply_settlement_to_stats(
+                            won, pnl, trade.cost,
+                            &self.executor, &self.stats,
+                        ).await;
+                        to_persist.push((trade.trade_id.clone(), won, pnl));
+                        settled_indices.push(i);
+                        continue;
+                    }
+                    Ok(None) => {
+                        debug!(
+                            trade_id = trade.trade_id,
+                            coin = trade.coin,
+                            age_secs = trade_age_ms / 1000,
+                            "Gamma: market not yet resolved"
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            trade_id = trade.trade_id,
+                            coin = trade.coin,
+                            error = %e,
+                            "Gamma API error"
+                        );
+                    }
                 }
-                stats.realized_pnl += pnl;
-                stats.current_balance = self
-                    .executor
-                    .get_balance()
-                    .await
-                    .unwrap_or(stats.current_balance);
             }
 
-            settled_indices.push(i);
+            // ── Path 3: Chainlink fallback (10 min after window close) ──
+            if trade_age_ms >= 600_000 {
+                let tracker = self.chainlink_tracker.read().await;
+                let window_start_ts = window_start / 1000; // ms → seconds
+                if let Some(outcome) = tracker.get_outcome(&trade.coin.to_uppercase(), window_start_ts) {
+                    let won = match trade.direction {
+                        Direction::Up => outcome == "UP",
+                        Direction::Down => outcome == "DOWN",
+                    };
+                    let (pnl, _) = Self::calculate_directional_pnl(
+                        won,
+                        trade.entry_price,
+                        trade.shares,
+                        trade.cost,
+                        self.config.fee_rate,
+                        &trade.direction,
+                    );
+
+                    drop(tracker); // release read lock before writing stats
+                    trade.settlement = Some(SettlementResult { won, pnl, settled_at: Utc::now() });
+                    info!(
+                        trade_id = trade.trade_id,
+                        coin = trade.coin,
+                        direction = %trade.direction,
+                        outcome = %outcome,
+                        won = won,
+                        pnl = %pnl,
+                        "SETTLED directional trade via Chainlink fallback"
+                    );
+                    Self::apply_settlement_to_stats(
+                        won, pnl, trade.cost,
+                        &self.executor, &self.stats,
+                    ).await;
+                    to_persist.push((trade.trade_id.clone(), won, pnl));
+                    settled_indices.push(i);
+                    continue;
+                }
+
+                warn!(
+                    trade_id = trade.trade_id,
+                    coin = trade.coin,
+                    age_mins = trade_age_ms / 60_000,
+                    "All settlement paths failed (CLOB + Gamma + Chainlink), will retry"
+                );
+            }
         }
 
         // Remove settled trades (iterate in reverse to preserve indices)
@@ -872,13 +964,123 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             self.pending_settlements.remove(i);
         }
 
-        // Persist settlements to database (after mutable borrow released)
+        // Persist settlements to database
         for (trade_id, won, pnl) in to_persist {
             self.persist_settlement(&trade_id, won, pnl).await;
         }
 
         let mut stats = self.stats.write().await;
         stats.pending_settlements = self.pending_settlements.len() as u64;
+    }
+
+    /// Attempts CLOB fast-settle by checking if token price is decisive.
+    ///
+    /// Returns `Some(true)` if we won (token ≥ 0.90), `Some(false)` if we lost
+    /// (token ≤ 0.10), or `None` if not yet decisive.
+    async fn try_clob_settle(token_id: &str, http_client: &reqwest::Client) -> Option<bool> {
+        let resolved_high = dec!(0.90);
+        let resolved_low = dec!(0.10);
+
+        let url = format!(
+            "https://clob.polymarket.com/prices?token_ids={}",
+            token_id
+        );
+
+        let response = match http_client
+            .get(&url)
+            .header("Accept", "application/json")
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                debug!(status = %r.status(), "CLOB price API non-success");
+                return None;
+            }
+            Err(e) => {
+                debug!(error = %e, "CLOB price fetch failed");
+                return None;
+            }
+        };
+
+        #[derive(Deserialize)]
+        struct PriceResponse {
+            price: String,
+        }
+
+        let body = response.text().await.ok()?;
+        let prices: std::collections::HashMap<String, PriceResponse> =
+            serde_json::from_str(&body).ok()?;
+
+        let price = prices
+            .get(token_id)
+            .and_then(|p| Decimal::from_str(&p.price).ok())?;
+
+        if price >= resolved_high {
+            Some(true) // Our token won
+        } else if price <= resolved_low {
+            Some(false) // Our token lost
+        } else {
+            None // Not yet decisive
+        }
+    }
+
+    /// Calculates P&L for a directional trade given the win/loss outcome.
+    fn calculate_directional_pnl(
+        won: bool,
+        entry_price: Decimal,
+        shares: Decimal,
+        cost: Decimal,
+        fee_rate: Decimal,
+        direction: &Direction,
+    ) -> (Decimal, String) {
+        let pnl = if won {
+            let gross = (Decimal::ONE - entry_price) * shares;
+            gross * (Decimal::ONE - fee_rate)
+        } else {
+            -cost
+        };
+
+        let outcome_str = if won {
+            match direction {
+                Direction::Up => "UP",
+                Direction::Down => "DOWN",
+            }
+        } else {
+            match direction {
+                Direction::Up => "DOWN",
+                Direction::Down => "UP",
+            }
+        };
+
+        (pnl, outcome_str.to_string())
+    }
+
+    /// Credits balance and updates stats after a settlement.
+    async fn apply_settlement_to_stats(
+        won: bool,
+        pnl: Decimal,
+        cost: Decimal,
+        executor: &E,
+        stats: &Arc<RwLock<DirectionalExecutorStats>>,
+    ) {
+        if won {
+            let winnings = cost + pnl;
+            let _ = executor.credit_balance(winnings).await;
+        }
+
+        let mut stats = stats.write().await;
+        if won {
+            stats.wins += 1;
+        } else {
+            stats.losses += 1;
+        }
+        stats.realized_pnl += pnl;
+        stats.current_balance = executor
+            .get_balance()
+            .await
+            .unwrap_or(stats.current_balance);
     }
 
     // =========================================================================
