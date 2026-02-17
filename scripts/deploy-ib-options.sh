@@ -9,6 +9,8 @@
 #   ./scripts/deploy-ib-options.sh deploy              # Provision EC2 + install all dependencies
 #   ./scripts/deploy-ib-options.sh sync                # Upload latest Python code
 #   ./scripts/deploy-ib-options.sh setup-cron          # Install cron jobs for scheduled workflows
+#   ./scripts/deploy-ib-options.sh start-gateway       # Start IB Gateway container
+#   ./scripts/deploy-ib-options.sh stop-gateway        # Stop IB Gateway container
 #   ./scripts/deploy-ib-options.sh start-manager       # Start position manager daemon
 #   ./scripts/deploy-ib-options.sh start-scheduler     # Start workflow scheduler daemon
 #   ./scripts/deploy-ib-options.sh stop-all            # Stop all services
@@ -34,6 +36,10 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/ec2-common.sh"
+
+# Override state file to separate from Polymarket deployment
+STATE_FILE="$SCRIPT_DIR/.ib-options-deploy.state"
+KEY_FILE="$SCRIPT_DIR/.ib-options-deploy-key.pem"
 
 REGION="us-east-1"
 INSTANCE_TYPE="t3.small"  # Needs more resources for Python + Postgres
@@ -222,7 +228,11 @@ cmd_deploy() {
         postgresql postgresql-contrib \
         python${PYTHON_VERSION} python${PYTHON_VERSION}-venv python3-pip \
         git curl build-essential libpq-dev \
+        docker.io docker-compose-plugin \
         supervisor htop vim" 2>&1 | tail -10
+
+    # Add ubuntu to docker group
+    remote_ssh "sudo usermod -aG docker ubuntu" 2>&1 | tail -3
 
     # Setup PostgreSQL
     info "Setting up PostgreSQL..."
@@ -468,6 +478,57 @@ cmd_stop_all() {
 }
 
 # =============================================================================
+# start-gateway — Start IB Gateway container on EC2
+# =============================================================================
+
+cmd_start_gateway() {
+    load_state
+
+    info "Starting IB Gateway container on $PUBLIC_IP..."
+
+    # Ensure .env has IB credentials
+    if ! grep -q "IBKR_USERNAME" "$PROJECT_ROOT/.env" 2>/dev/null; then
+        error "IBKR_USERNAME not found in .env — see secrets/ib_credentials.env.example"
+        exit 1
+    fi
+
+    # Source credentials from .env
+    local ibkr_username ibkr_password ib_trading_mode
+    ibkr_username=$(grep "^IBKR_USERNAME=" "$PROJECT_ROOT/.env" | cut -d= -f2-)
+    ibkr_password=$(grep "^IBKR_PASSWORD=" "$PROJECT_ROOT/.env" | cut -d= -f2-)
+    ib_trading_mode=$(grep "^IB_TRADING_MODE=" "$PROJECT_ROOT/.env" | cut -d= -f2- || echo "paper")
+
+    remote_ssh "
+        docker rm -f ib-gateway 2>/dev/null || true
+        docker run -d --name ib-gateway \
+            -e TWS_USERID='${ibkr_username}' \
+            -e TWS_PASSWORD='${ibkr_password}' \
+            -e TRADING_MODE='${ib_trading_mode:-paper}' \
+            -e TIME_ZONE=America/New_York \
+            -e TWOFA_TIMEOUT_ACTION=restart \
+            -e READ_ONLY_API=no \
+            -e BYPASS_WARNING=yes \
+            -p 4001:4001 -p 4002:4002 \
+            --restart unless-stopped \
+            ghcr.io/gnzsnz/ib-gateway:latest
+    "
+
+    info "IB Gateway started. Check: ./scripts/deploy-ib-options.sh status"
+}
+
+# =============================================================================
+# stop-gateway — Stop IB Gateway container on EC2
+# =============================================================================
+
+cmd_stop_gateway() {
+    load_state
+
+    info "Stopping IB Gateway container on $PUBLIC_IP..."
+    remote_ssh "docker rm -f ib-gateway 2>/dev/null || true"
+    info "IB Gateway stopped."
+}
+
+# =============================================================================
 # logs — Tail logs
 # =============================================================================
 
@@ -515,6 +576,10 @@ cmd_status() {
     echo ""
     echo -e "  ${DIM}Instance:${NC}    $PUBLIC_IP ($INSTANCE_ID)"
     echo -e "  ${DIM}Region:${NC}      $REGION"
+    echo ""
+
+    info "IB Gateway:"
+    remote_ssh "docker ps --filter name=ib-gateway --format '  {{.Status}}  ({{.Ports}})' 2>/dev/null || echo '  Not running'"
     echo ""
 
     info "Position Manager:"
@@ -597,6 +662,12 @@ case "${1:-}" in
     setup-cron)
         cmd_setup_cron
         ;;
+    start-gateway)
+        cmd_start_gateway
+        ;;
+    stop-gateway)
+        cmd_stop_gateway
+        ;;
     start-manager)
         cmd_start_manager
         ;;
@@ -629,6 +700,8 @@ case "${1:-}" in
         echo "  deploy              Provision EC2 and install all dependencies"
         echo "  sync                Upload latest Python code"
         echo "  setup-cron          Install cron jobs for scheduled workflows"
+        echo "  start-gateway       Start IB Gateway container"
+        echo "  stop-gateway        Stop IB Gateway container"
         echo "  start-manager       Start position manager daemon"
         echo "  start-scheduler     Start workflow scheduler daemon"
         echo "  stop-all            Stop all services"
