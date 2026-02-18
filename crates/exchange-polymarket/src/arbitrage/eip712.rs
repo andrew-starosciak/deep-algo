@@ -333,14 +333,14 @@ pub fn sign_hash(hash: &[u8; 32], private_key_hex: &str) -> Result<String, Eip71
 /// - SELL: maker_amount = size (shares we give), taker_amount = size * price (USDC we receive)
 ///
 /// Matches Python SDK's ROUNDING_CONFIG for $0.01 tick markets:
-///   price=2dp (round_normal), size=2dp (round_down)
+///   price=2dp (round_normal), size=2dp (round_down), amount=4dp
 ///
-/// API precision constraints (from error messages):
-/// - BUY: maker (USDC out) max 2dp, taker (shares in) max 4dp
+/// API precision constraints:
+/// - BUY: maker (USDC out) max 4dp, taker (shares in) max 4dp
 /// - SELL: maker (shares out) max 2dp, taker (USDC in) max 4dp
 ///
-/// For BUY, maker = size * price can exceed 2dp (e.g., 5.55 * 0.30 = 1.665),
-/// so we ceil to 2dp to avoid underpaying (which would miss fills).
+/// For BUY, maker = size * price is naturally at most 4dp (2dp × 2dp).
+/// Using exact 4dp product avoids "invalid amounts" rejections.
 pub fn calculate_amounts(
     side: u8,
     price: Decimal,
@@ -367,10 +367,12 @@ pub fn calculate_amounts(
 
     let (maker_amount, taker_amount) = if side == SIDE_BUY {
         // BUY: taker = shares we receive, maker = USDC we pay.
-        // CLOB rule: BUY maker_amount max 2dp, taker_amount max 4dp.
-        // Python SDK uses floor for amounts, so floor maker to 2dp.
+        // 2dp price × 2dp size = at most 4dp product, so round to 4dp to
+        // preserve the exact amount the CLOB expects. Rounding to 2dp was
+        // too aggressive and caused "invalid amounts" rejections for prices
+        // where size * price doesn't land on 2dp (e.g. 7.09 * 0.81 = 5.7429).
         let taker_natural = size_rounded;
-        let maker_natural = round_down(taker_natural * price_tick, 2);
+        let maker_natural = round_down(taker_natural * price_tick, 4);
         let taker_raw = (taker_natural * scale).floor();
         let maker_raw = (maker_natural * scale).floor();
         (maker_raw, taker_raw)
@@ -660,13 +662,12 @@ mod tests {
         // BUY: price=0.19, size=10.752688 (from real trading scenario)
         // size_rounded = 10.75, taker = 10.75 * 10^6 = 10_750_000
         // price_tick = round_normal(0.19, 2) = 0.19
-        // maker = 10.75 * 0.19 = 2.0425
-        // BUY maker ceiled to 2dp: ceil(2.0425, 2) = 2.05
-        // maker_raw = 2.05 * 10^6 = 2_050_000
+        // maker = 10.75 * 0.19 = 2.0425 (4dp exact product)
+        // maker_raw = 2.0425 * 10^6 = 2_042_500
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.19), dec!(10.752688)).unwrap();
         assert_eq!(taker, 10_750_000); // Rounded down to 2 dp
-        assert_eq!(maker, 2_050_000); // Ceiled to 2dp: 2.0425 → 2.05
+        assert_eq!(maker, 2_042_500); // Exact 4dp product: 10.75 * 0.19 = 2.0425
     }
 
     #[test]
@@ -694,14 +695,24 @@ mod tests {
     }
 
     #[test]
-    fn calculate_amounts_buy_maker_ceiled_to_2dp() {
-        // Regression: BUY price=0.30, size=5.55 → maker = 5.55 * 0.30 = 1.665 (3dp)
-        // API rejects >2dp for BUY maker. Ceil to 2dp: 1.67.
-        // maker_raw = 1.67 * 10^6 = 1_670_000
+    fn calculate_amounts_buy_maker_exact_4dp() {
+        // BUY price=0.30, size=5.55 → maker = 5.55 * 0.30 = 1.665 (3dp)
+        // Preserved as 4dp (no rounding needed since 3dp < 4dp).
+        // maker_raw = 1.665 * 10^6 = 1_665_000
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.30), dec!(5.5555555)).unwrap();
         assert_eq!(taker, 5_550_000); // size_rounded = 5.55
-        assert_eq!(maker, 1_670_000); // ceil(1.665, 2) = 1.67
+        assert_eq!(maker, 1_665_000); // Exact product: 5.55 * 0.30 = 1.665
+    }
+
+    #[test]
+    fn calculate_amounts_buy_fak_retry_price() {
+        // Regression: FAK retry at $0.81 for 7.09 shares.
+        // 7.09 * 0.81 = 5.7429 — CLOB expects exact 4dp product, not 2dp truncated 5.74.
+        let (maker, taker) =
+            calculate_amounts(SIDE_BUY, dec!(0.81), dec!(7.09)).unwrap();
+        assert_eq!(taker, 7_090_000);  // size = 7.09
+        assert_eq!(maker, 5_742_900);  // 7.09 * 0.81 = 5.7429 (exact 4dp)
     }
 
     #[test]
