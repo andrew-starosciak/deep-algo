@@ -124,11 +124,16 @@ class Database:
     # --- Recommendations ---
 
     async def save_recommendation(self, thesis_id: int, run_id: int, rec: dict) -> int:
+        import datetime as _dt
+
         contract = rec["contract"]
+        expiry = contract["expiry"]
+        if isinstance(expiry, str):
+            expiry = _dt.date.fromisoformat(expiry)
         return await self.pool.fetchval(
             """
             INSERT INTO trade_recommendations
-                (thesis_id, run_id, ticker, right, strike, expiry,
+                (thesis_id, run_id, ticker, "right", strike, expiry,
                  entry_price_low, entry_price_high, position_size_pct,
                  position_size_usd, exit_targets, stop_loss, max_hold_days,
                  risk_verification, status)
@@ -140,7 +145,7 @@ class Database:
             contract["ticker"],
             contract["right"],
             float(contract["strike"]),
-            contract["expiry"],
+            expiry,
             float(contract["entry_price_low"]),
             float(contract["entry_price_high"]),
             float(rec["position_size_pct"]),
@@ -167,7 +172,7 @@ class Database:
         return await self.pool.fetchval(
             """
             INSERT INTO options_positions
-                (recommendation_id, ticker, right, strike, expiry,
+                (recommendation_id, ticker, "right", strike, expiry,
                  quantity, avg_fill_price, current_price, cost_basis,
                  unrealized_pnl, ib_con_id, status, opened_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'open', NOW())
@@ -346,6 +351,19 @@ class Database:
             """
         )
         return [dict(r) for r in rows]
+
+    async def get_total_realized_pnl(self) -> Decimal:
+        """Sum realized P&L across all closed positions."""
+        val = await self.pool.fetchval(
+            "SELECT COALESCE(SUM(realized_pnl), 0) FROM options_positions WHERE status = 'closed'"
+        )
+        return Decimal(str(val))
+
+    async def get_closed_positions_count(self) -> int:
+        val = await self.pool.fetchval(
+            "SELECT COUNT(*) FROM options_positions WHERE status = 'closed'"
+        )
+        return int(val)
 
     # --- Recent workflow runs ---
 

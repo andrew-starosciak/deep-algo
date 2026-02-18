@@ -8,6 +8,8 @@ Runs three types of jobs:
 
 from __future__ import annotations
 
+import asyncio
+import datetime as _dt
 import logging
 from decimal import Decimal
 from typing import Any
@@ -67,36 +69,72 @@ class WorkflowScheduler:
         logger.info("Scheduled weekly_deep_dive: 10:00 AM ET Saturday")
 
     async def start(self) -> None:
-        """Connect IB and start the scheduler."""
-        import asyncio
+        """Start Discord, connect IB, then run scheduler + position loop."""
         from ib.position_manager import PositionManager
+
+        # Start Discord bot FIRST — ib_async conflicts with discord.py
+        # if IB connects before the Discord event loop is running.
+        if self.notifier:
+            self.notifier.set_context(db=self.db, engine=self.engine)
+            await self.notifier.start()
+            logger.info("Discord bot started, now connecting to IB...")
 
         await self.ib_client.connect()
         self._position_manager = PositionManager(
             db=self.db, ib_client=self.ib_client, notifier=self.notifier,
         )
 
-        # Wire DB + engine + position manager into Discord bot and start it
+        # Wire position manager into Discord bot (after IB is connected)
         if self.notifier:
-            self.notifier.set_context(
-                db=self.db, engine=self.engine, position_manager=self._position_manager,
-            )
-            await self.notifier.start()
+            self.notifier.set_context(position_manager=self._position_manager)
 
         # Start scheduler as async context manager before adding schedules
         async with self.scheduler:
             await self.setup()
-            logger.info("Scheduler started — waiting for triggers")
+
+            # Run position manager tick loop as a background task
+            tick_task = asyncio.create_task(self._position_tick_loop())
+            logger.info("Scheduler + position manager started — waiting for triggers")
 
             try:
-                # Run scheduler in background and wait forever
                 await self.scheduler.start_in_background()
-                # Keep the process alive indefinitely
                 await asyncio.Event().wait()
             except (KeyboardInterrupt, asyncio.CancelledError):
                 logger.info("Scheduler shutting down")
             finally:
+                tick_task.cancel()
                 await self.ib_client.disconnect()
+
+    async def _position_tick_loop(self) -> None:
+        """Continuous position monitoring during market hours (every 60s)."""
+        import zoneinfo
+
+        et = zoneinfo.ZoneInfo("America/New_York")
+        poll_interval = self._position_manager.config.poll_interval_secs
+
+        logger.info("Position tick loop started (every %ds during market hours)", poll_interval)
+
+        while True:
+            try:
+                now = _dt.datetime.now(et)
+                market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+                market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+                is_weekday = now.weekday() < 5
+
+                if is_weekday and market_open <= now <= market_close:
+                    await self._position_manager._tick()
+                elif is_weekday and now < market_open:
+                    # Sleep until market open
+                    wait_secs = (market_open - now).total_seconds()
+                    logger.info("Pre-market — next tick at 9:30 AM ET (%.0fm)", wait_secs / 60)
+                    await asyncio.sleep(min(wait_secs, 300))
+                    continue
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Position tick loop error")
+
+            await asyncio.sleep(poll_interval)
 
     async def _premarket_research(self) -> None:
         """Run trade-thesis workflow for each watchlist ticker."""

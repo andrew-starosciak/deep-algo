@@ -8,11 +8,18 @@
 #
 # Usage:
 #   ./scripts/run_clob_timing.sh [options]           # Run locally
+#   ./scripts/run_clob_timing.sh settle [options]    # Settle unsettled trades from previous sessions
 #   ./scripts/run_clob_timing.sh redeploy            # Build + upload binary + migrate on EC2
 #   ./scripts/run_clob_timing.sh start [options]     # Start on EC2 (background)
 #   ./scripts/run_clob_timing.sh stop                # Stop on EC2
 #   ./scripts/run_clob_timing.sh logs                # Tail remote logs
 #   ./scripts/run_clob_timing.sh ssh                 # SSH into EC2 instance
+#
+# Settle options:
+#   --coin <coin>              Filter by coin (e.g., BTC)
+#   --session <id>             Filter by session ID
+#   --max-age-hours <hours>    Only trades newer than this
+#   --dry-run                  Show pending trades without settling
 #
 # Local options:
 #   --mode paper|live           Trading mode (default: paper)
@@ -37,6 +44,9 @@
 #   ./scripts/run_clob_timing.sh                                          # Paper, 4h, BTC+ETH
 #   ./scripts/run_clob_timing.sh --mode live --bet-size 10                # Live, $10 bets
 #   ./scripts/run_clob_timing.sh --min-displacement 0.20 --coins btc     # BTC only, 20c threshold
+#   ./scripts/run_clob_timing.sh settle                                   # Settle all pending trades
+#   ./scripts/run_clob_timing.sh settle --dry-run                         # Show pending without settling
+#   ./scripts/run_clob_timing.sh settle --coin BTC --max-age-hours 24     # Settle recent BTC trades
 #
 
 set -euo pipefail
@@ -66,7 +76,7 @@ _CT_PROCESS_PATTERN="algo-trade clob-timing"
 _CT_CLI_CMD="clob-timing"
 
 _ct_build_remote_args() {
-    local args="--mode paper --duration 4h --coins btc,eth --min-displacement 0.15 --verbose --persist"
+    local args="--mode live --duration 24h --coins btc,eth,sol,xrp --min-displacement 0.15 --bet-size 5 --exclude-hours 4,9,14 --max-position 20 --max-trades-per-window 4 --verbose --persist"
     [[ $# -gt 0 ]] && args="$*"
     echo "$args"
 }
@@ -77,23 +87,77 @@ if ec2_dispatch "$_CT_BOT_NAME" "$_CT_PID_FILE" "$_CT_LOG_FILE" \
 fi
 
 # =============================================================================
+# Settle subcommand
+# =============================================================================
+
+if [[ "${1:-}" == "settle" ]]; then
+    shift
+
+    load_state
+
+    echo -e "${CYAN}+==================================================================+${NC}"
+    echo -e "${CYAN}|${NC}        ${WHITE}Directional Trade Settlement (EC2: ${PUBLIC_IP})${NC}"
+    echo -e "${CYAN}+==================================================================+${NC}"
+    echo ""
+
+    # Build remote args string
+    SETTLE_ARGS=""
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --dry-run)
+                SETTLE_ARGS+=" --dry-run"
+                shift
+                ;;
+            --coin)
+                SETTLE_ARGS+=" --coin $2"
+                shift 2
+                ;;
+            --session)
+                SETTLE_ARGS+=" --session $2"
+                shift 2
+                ;;
+            --max-age-hours)
+                SETTLE_ARGS+=" --max-age-hours $2"
+                shift 2
+                ;;
+            --no-redeem)
+                SETTLE_ARGS+=" --no-redeem"
+                shift
+                ;;
+            --verbose|-v)
+                SETTLE_ARGS+=" --verbose"
+                shift
+                ;;
+            *)
+                echo "Unknown settle option: $1"
+                exit 1
+                ;;
+        esac
+    done
+
+    info "Running settlement on EC2..."
+    remote_ssh "bash -c 'set -a && source ~/.env && set +a && RUST_LOG=info ~/algo-trade directional-settle${SETTLE_ARGS}'"
+    exit $?
+fi
+
+# =============================================================================
 # Default configuration
 # =============================================================================
 
 MODE="paper"
 DURATION="4h"
-COINS="btc,eth"
-BET_SIZE=""
+COINS="btc,eth,sol,xrp"
+BET_SIZE="5"
 KELLY_FRACTION="0.25"
 MIN_DISPLACEMENT="0.15"
 MAX_ENTRY_PRICE="0.85"
 OBSERVATION_DELAY="150"
 OBSERVATION_END="300"
 MIN_EDGE="0.05"
-MAX_POSITION="10"
+MAX_POSITION="20"
 MAX_TRADES_PER_WINDOW="1"
 PAPER_BALANCE="1000"
-EXCLUDE_HOURS="4,9,21,22,23"
+EXCLUDE_HOURS="4,9,14"
 VERBOSE=""
 PERSIST=""
 SESSION_ID=""
@@ -293,6 +357,20 @@ if [[ "$MODE" == "live" ]]; then
         exit 1
     fi
     echo ""
+fi
+
+# =============================================================================
+# Settle outstanding trades before starting
+# =============================================================================
+
+if [[ -n "$PERSIST" && -n "${DATABASE_URL:-}" ]]; then
+    echo -e "${WHITE}Settling outstanding trades from previous sessions...${NC}"
+    if cargo run -p algo-trade-cli -- directional-settle 2>&1 | tail -20; then
+        echo ""
+    else
+        echo -e "${YELLOW}Settlement check completed (some may have failed)${NC}"
+        echo ""
+    fi
 fi
 
 # =============================================================================

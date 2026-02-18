@@ -40,6 +40,31 @@ class PaperClient:
         """No real portfolio in sim mode."""
         return []
 
+    async def get_stock_price(self, ticker: str) -> Decimal:
+        """Return a simulated stock price."""
+        # Rough lookup for common tickers; fallback to $150
+        prices = {
+            "AAPL": 230, "MSFT": 420, "GOOG": 175, "AMZN": 195,
+            "META": 580, "TSLA": 340, "NVDA": 130, "SPY": 595,
+        }
+        price = prices.get(ticker.upper(), 150)
+        return Decimal(str(price))
+
+    async def get_option_expirations(self, ticker: str) -> list[_dt.date]:
+        """Return simulated option expiration dates (monthly, next 3 months)."""
+        import calendar
+        today = _dt.date.today()
+        expirations = []
+        for month_offset in range(1, 4):
+            m = (today.month + month_offset - 1) % 12 + 1
+            y = today.year + (today.month + month_offset - 1) // 12
+            # Third Friday of the month
+            cal = calendar.monthcalendar(y, m)
+            fridays = [week[calendar.FRIDAY] for week in cal if week[calendar.FRIDAY] != 0]
+            third_friday = _dt.date(y, m, fridays[2])
+            expirations.append(third_friday)
+        return expirations
+
     async def get_option_quote(self, contract: ContractSpec) -> OptionQuote:
         """Return a quote using the contract's entry price range."""
         mid = (contract.entry_price_low + contract.entry_price_high) / 2

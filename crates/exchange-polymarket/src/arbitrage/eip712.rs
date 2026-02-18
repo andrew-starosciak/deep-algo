@@ -366,19 +366,18 @@ pub fn calculate_amounts(
     let size_rounded = round_down(size, 2);
 
     let (maker_amount, taker_amount) = if side == SIDE_BUY {
-        // BUY: taker = shares we receive, maker = USDC we pay
+        // BUY: taker = shares we receive, maker = USDC we pay.
+        // CLOB rule: BUY maker_amount max 2dp, taker_amount max 4dp.
+        // Python SDK uses floor for amounts, so floor maker to 2dp.
         let taker_natural = size_rounded;
-        let maker_natural = taker_natural * price_tick;
-        // API requires BUY maker (USDC) to have max 2dp.
-        // Ceil so we don't underpay (effective price slightly above limit = still fills).
-        let maker_2dp = round_up(maker_natural, 2);
+        let maker_natural = round_down(taker_natural * price_tick, 2);
         let taker_raw = (taker_natural * scale).floor();
-        let maker_raw = (maker_2dp * scale).floor();
+        let maker_raw = (maker_natural * scale).floor();
         (maker_raw, taker_raw)
     } else {
-        // SELL: maker = shares we give (already 2dp), taker = USDC we receive
+        // SELL: maker = shares we give (already 2dp), taker = USDC we receive.
+        // CLOB rule: SELL taker_amount max 4dp (2dp × 2dp = 4dp naturally).
         let maker_natural = size_rounded;
-        // Full precision: 2dp × 2dp = 4dp max (API allows 4dp for SELL taker)
         let taker_natural = maker_natural * price_tick;
         let maker_raw = (maker_natural * scale).floor();
         let taker_raw = (taker_natural * scale).floor();
@@ -395,12 +394,6 @@ pub fn calculate_amounts(
 fn round_down(value: Decimal, dp: u32) -> Decimal {
     let factor = Decimal::from(10u64.pow(dp));
     (value * factor).floor() / factor
-}
-
-/// Rounds a Decimal up (ceil) to the given number of decimal places.
-fn round_up(value: Decimal, dp: u32) -> Decimal {
-    let factor = Decimal::from(10u64.pow(dp));
-    (value * factor).ceil() / factor
 }
 
 /// Rounds a Decimal to nearest (half-up) to the given number of decimal places.

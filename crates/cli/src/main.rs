@@ -10,9 +10,9 @@ use commands::{
     BackfillSignalsArgs, BinaryBacktestArgs, CalculateReturnsArgs, CheckDepthArgs, ClobTimingArgs,
     CollectPolymarketArgs, CollectSignalsArgs, CrossArbitrageArgs, CrossMarketAutoArgs,
     CrossMarketBacktestArgs, CrossMarketScannerArgs, CrossMarketSettleArgs, DataStatusArgs,
-    DirectionalAutoArgs, EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs,
+    DirectionalAutoArgs, DirectionalSettleArgs, EntryStrategySimArgs, GabagoolAutoArgs, GabagoolMonitorArgs,
     LatencyMonitorArgs, Phase1ArbitrageArgs, PolymarketPaperTradeArgs, PreflightArgs,
-    RedeemPositionsArgs, ValidateSignalsArgs,
+    RedeemPositionsArgs, TestOrderArgs, ValidateSignalsArgs,
 };
 
 #[derive(Parser)]
@@ -158,6 +158,8 @@ enum Commands {
     CheckDepth(CheckDepthArgs),
     /// Preflight validation before going live (wallet, balance, API connectivity)
     Preflight(PreflightArgs),
+    /// Submit a micro test order to verify EIP-712 signing works
+    TestOrder(TestOrderArgs),
     /// Set Polymarket exchange contract allowances (required once before live trading)
     ApproveAllowances(ApproveAllowancesArgs),
     /// Redeem winning positions from resolved Polymarket markets
@@ -166,6 +168,8 @@ enum Commands {
     DirectionalAuto(DirectionalAutoArgs),
     /// Run CLOB first-move timing strategy (displacement from midpoint)
     ClobTiming(ClobTimingArgs),
+    /// Settle unsettled directional trades (CLOB → Gamma → Chainlink)
+    DirectionalSettle(DirectionalSettleArgs),
 }
 
 #[tokio::main]
@@ -370,6 +374,9 @@ async fn main() -> anyhow::Result<()> {
         Commands::Preflight(args) => {
             commands::run_preflight(args).await?;
         }
+        Commands::TestOrder(args) => {
+            commands::run_test_order(args).await?;
+        }
         Commands::ApproveAllowances(args) => {
             commands::run_approve_allowances(args).await?;
         }
@@ -381,6 +388,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::ClobTiming(args) => {
             commands::run_clob_timing(args).await?;
+        }
+        Commands::DirectionalSettle(args) => {
+            commands::run_directional_settle(args).await?;
         }
     }
 

@@ -115,10 +115,15 @@ class WorkflowEngine:
             else:
                 # Step failed after all retries
                 if step.on_fail == OnFail.ESCALATE and self.notifier:
+                    # Include both the step output (why it failed) and
+                    # the input context (what was being evaluated)
+                    escalation_context = context.model_dump()
+                    if result.output is not None:
+                        escalation_context["_step_output"] = result.output.model_dump()
                     await self.notifier.escalate(
                         workflow_name=workflow.name,
                         step_id=step.id,
-                        context=context.model_dump(),
+                        context=escalation_context,
                         error=result.error,
                     )
                 await self.db.complete_workflow_run(run_id, status="failed")
@@ -160,6 +165,13 @@ class WorkflowEngine:
                     output_schema=step.output_schema,
                 )
                 passed = step.validate(output)
+                if not passed and output is not None:
+                    # Surface why the gate rejected this output
+                    dump = output.model_dump()
+                    if reason := dump.get("rejection_reason"):
+                        error = reason
+                    else:
+                        error = f"Gate failed: {dump}"
             except Exception as e:
                 output = None
                 passed = False

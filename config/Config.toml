@@ -10,6 +10,9 @@ max_connections = 10
 api_url = "https://api.hyperliquid.xyz"
 ws_url = "wss://api.hyperliquid.xyz/ws"
 
+[build]
+incremental = false
+
 [backtest_scheduler]
 enabled = true
 cron_schedule = "0 0 3 * * *"  # Daily at 3am UTC

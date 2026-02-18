@@ -73,9 +73,18 @@ class IBClient:
                 # Wait for nextValidId callback (confirms handshake complete)
                 await asyncio.sleep(1)
 
-                # Subscribe to account updates so portfolio() has data
-                # Pass empty string '' to subscribe to all accounts
-                await self._ib.reqAccountUpdatesAsync(account='')
+                # Subscribe to account updates so portfolio() has data.
+                # Use a timeout — reqAccountUpdatesAsync can hang with empty account.
+                try:
+                    accounts = self._ib.managedAccounts()
+                    acct = accounts[0] if accounts else ''
+                    logger.info("Subscribing to account updates for: %s", acct or '(all)')
+                    await asyncio.wait_for(
+                        self._ib.reqAccountUpdatesAsync(account=acct),
+                        timeout=10.0,
+                    )
+                except (asyncio.TimeoutError, Exception) as e:
+                    logger.warning("reqAccountUpdatesAsync timed out or failed: %s (continuing)", e)
 
                 logger.info(
                     "Successfully connected to IB at %s:%d (client_id=%d)",
@@ -158,10 +167,86 @@ class IBClient:
             ))
         return result
 
+    async def get_stock_price(self, ticker: str) -> Decimal:
+        """Get the current market price for a stock (works after hours too)."""
+        import math
+
+        self._require_connected()
+        from ib_async import Stock
+
+        stock = Stock(ticker, "SMART", "USD")
+        await self._ib.qualifyContractsAsync(stock)
+        self._ib.reqMktData(stock, genericTickList="", snapshot=True)
+        tickers = await self._ib.reqTickersAsync(stock)
+        t = tickers[0] if tickers else None
+
+        if t is None:
+            raise ValueError(f"No price data for {ticker}")
+
+        def _valid(v):
+            return v is not None and not math.isnan(v) and v > 0
+
+        # Try: market price → last → close → bid/ask midpoint
+        price = t.marketPrice()
+        if not _valid(price):
+            price = t.last
+        if not _valid(price):
+            price = t.close
+        if not _valid(price) and _valid(t.bid) and _valid(t.ask):
+            price = (t.bid + t.ask) / 2
+        if not _valid(price):
+            # Last resort: use reqHistoricalData for most recent close
+            bars = await self._ib.reqHistoricalDataAsync(
+                stock, endDateTime="", durationStr="1 D",
+                barSizeSetting="1 day", whatToShow="TRADES",
+                useRTH=True, formatDate=1,
+            )
+            if bars:
+                price = bars[-1].close
+        if not _valid(price):
+            raise ValueError(f"No valid price for {ticker} (market may be closed)")
+
+        return Decimal(str(price))
+
+    async def get_option_expirations(self, ticker: str) -> list[_dt.date]:
+        """Get available option expiration dates for a ticker."""
+        self._require_connected()
+        from ib_async import Stock
+
+        stock = Stock(ticker, "SMART", "USD")
+        await self._ib.qualifyContractsAsync(stock)
+        chains = await self._ib.reqSecDefOptParamsAsync(
+            stock.symbol, "", stock.secType, stock.conId
+        )
+        if not chains:
+            raise ValueError(f"No option chains for {ticker}")
+
+        # Merge expirations from all exchanges, parse to dates
+        all_expirations: set[_dt.date] = set()
+        for chain in chains:
+            for exp_str in chain.expirations:
+                try:
+                    all_expirations.add(_dt.datetime.strptime(exp_str, "%Y%m%d").date())
+                except ValueError:
+                    continue
+
+        return sorted(all_expirations)
+
     async def get_option_quote(self, contract: ContractSpec) -> OptionQuote:
-        """Get a live quote for an options contract."""
+        """Get a quote for an options contract (falls back to delayed data)."""
+        import math
+
         self._require_connected()
         from ib_async import Option
+
+        def _valid(v):
+            return v is not None and not math.isnan(v) and v > 0
+
+        def _safe_float(v, default=0.0):
+            return v if v is not None and not math.isnan(v) else default
+
+        # Request delayed data if real-time isn't available (paper accounts)
+        self._ib.reqMarketDataType(4)  # 4 = delayed-frozen
 
         ib_contract = Option(
             symbol=contract.ticker,
@@ -172,16 +257,25 @@ class IBClient:
         )
         await self._ib.qualifyContractsAsync(ib_contract)
         self._ib.reqMktData(ib_contract, genericTickList="", snapshot=True)
-        ticker = await self._ib.reqTickersAsync(ib_contract)
-        t = ticker[0] if ticker else None
+        tickers = await self._ib.reqTickersAsync(ib_contract)
+        t = tickers[0] if tickers else None
 
         if t is None:
             raise ValueError(f"No quote for {contract.ticker} {contract.strike}{contract.right}")
 
-        bid = Decimal(str(t.bid)) if t.bid and t.bid > 0 else Decimal("0")
-        ask = Decimal(str(t.ask)) if t.ask and t.ask > 0 else Decimal("0")
-        last = Decimal(str(t.last)) if t.last and t.last > 0 else Decimal("0")
-        mid = (bid + ask) / 2 if bid > 0 and ask > 0 else last
+        bid = Decimal(str(t.bid)) if _valid(t.bid) else Decimal("0")
+        ask = Decimal(str(t.ask)) if _valid(t.ask) else Decimal("0")
+        last = Decimal(str(t.last)) if _valid(t.last) else Decimal("0")
+        close = Decimal(str(t.close)) if _valid(t.close) else Decimal("0")
+
+        if bid > 0 and ask > 0:
+            mid = (bid + ask) / 2
+        elif last > 0:
+            mid = last
+        elif close > 0:
+            mid = close
+        else:
+            mid = Decimal("0")
 
         greeks = t.modelGreeks or t.lastGreeks
         return OptionQuote(
@@ -189,13 +283,13 @@ class IBClient:
             ask=ask,
             last=last,
             mid=mid,
-            volume=int(t.volume or 0),
+            volume=int(_safe_float(t.volume, 0)),
             open_interest=0,
-            iv=greeks.impliedVol if greeks else 0.0,
-            delta=greeks.delta if greeks else 0.0,
-            gamma=greeks.gamma if greeks else 0.0,
-            theta=greeks.theta if greeks else 0.0,
-            vega=greeks.vega if greeks else 0.0,
+            iv=_safe_float(greeks.impliedVol if greeks else 0.0),
+            delta=_safe_float(greeks.delta if greeks else 0.0),
+            gamma=_safe_float(greeks.gamma if greeks else 0.0),
+            theta=_safe_float(greeks.theta if greeks else 0.0),
+            vega=_safe_float(greeks.vega if greeks else 0.0),
         )
 
     async def place_order(
@@ -206,7 +300,13 @@ class IBClient:
         order_type: str = "LMT",
         limit_price: Decimal | None = None,
     ) -> Fill:
-        """Place an order and wait for fill."""
+        """Place an order and wait for fill.
+
+        For after-hours limit orders, IB accepts them as PreSubmitted and they
+        fill at market open. We return the order details immediately rather than
+        blocking for 2 minutes.
+        """
+        import asyncio
         import datetime as _dt
 
         self._require_connected()
@@ -228,11 +328,39 @@ class IBClient:
 
         trade = self._ib.placeOrder(ib_contract, order)
 
-        # Wait for fill with timeout
+        # Wait for fill with timeout.
+        # Use asyncio.sleep instead of waitOnUpdate to avoid
+        # "event loop already running" error in async contexts.
         elapsed = 0
         while not trade.isDone():
-            await self._ib.waitOnUpdate(timeout=5)
-            elapsed += 5
+            await asyncio.sleep(2)
+            elapsed += 2
+
+            status = trade.orderStatus.status
+            logger.info(
+                "Order %d status: %s (elapsed %ds)",
+                trade.order.orderId, status, elapsed,
+            )
+
+            # PreSubmitted = accepted by IB but waiting for market open.
+            # Return immediately with the order details.
+            if status == "PreSubmitted":
+                logger.info(
+                    "Order %d PreSubmitted (after-hours) — will fill at market open",
+                    trade.order.orderId,
+                )
+                fill_price = limit_price or Decimal("0")
+                return Fill(
+                    order_id=trade.order.orderId,
+                    symbol=contract.ticker,
+                    side=side,
+                    quantity=quantity,
+                    avg_fill_price=fill_price,
+                    commission=Decimal("0"),
+                    filled_at=_dt.datetime.now(_dt.UTC),
+                    con_id=ib_contract.conId if ib_contract.conId else None,
+                )
+
             if elapsed >= _ORDER_FILL_TIMEOUT_SECS:
                 self._ib.cancelOrder(trade.order)
                 raise TimeoutError(

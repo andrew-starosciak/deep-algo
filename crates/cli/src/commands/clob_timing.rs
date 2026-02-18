@@ -20,9 +20,11 @@ use algo_trade_polymarket::arbitrage::directional_executor::{
     DirectionalExecutor, DirectionalExecutorConfig,
 };
 use algo_trade_polymarket::arbitrage::{
-    LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig, PolymarketExecutor,
+    HardLimits, LiveExecutor, LiveExecutorConfig, PaperExecutor, PaperExecutorConfig,
+    PolymarketExecutor,
 };
 use algo_trade_polymarket::models::Coin;
+use algo_trade_polymarket::GammaClient;
 use anyhow::Result;
 use clap::Args;
 use rust_decimal::Decimal;
@@ -207,7 +209,7 @@ pub async fn run(args: ClobTimingArgs) -> Result<()> {
             .unwrap_or(dec!(10)),
         max_trades_per_window: args.max_trades_per_window,
         observe_mode: false,
-        fee_rate: dec!(0.02),
+        fee_rate: dec!(0.10),
         stats_interval_secs: 5,
         settlement_interval_secs: 30,
         buy_slippage: dec!(0.05),
@@ -242,9 +244,25 @@ pub async fn run(args: ClobTimingArgs) -> Result<()> {
             .await
         }
         ExecutionMode::Live => {
-            let live_config = LiveExecutorConfig::mainnet();
+            let mut live_config = LiveExecutorConfig::mainnet();
+            live_config.hard_limits = HardLimits::micro_testing();
+            // 15-min crypto markets have feesEnabled=true with 10% taker fee.
+            // neg_risk is false for these markets (standard CTF exchange).
+            live_config.clob_config.taker_fee_bps = 1000;
             let mut live_executor = LiveExecutor::new(live_config).await?;
             live_executor.authenticate().await?;
+
+            // Try to query the taker fee rate from the CLOB API to confirm.
+            // If it fails, we already have the correct defaults above.
+            let gamma = GammaClient::new();
+            let probe_markets = gamma.get_15min_markets_for_coins(&coins).await;
+            if let Some(token) = probe_markets.first().and_then(|m| m.up_token()) {
+                if let Err(e) = live_executor.configure_fee_rate(&token.token_id).await {
+                    info!("Fee rate API unavailable, using default 1000 bps for 15-min crypto");
+                    tracing::debug!(error = %e, "Fee rate query detail");
+                }
+            }
+
             run_with_executor(
                 live_executor,
                 executor_config,

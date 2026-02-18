@@ -633,6 +633,31 @@ impl LiveExecutor {
             .map_err(|e| e.into_execution_error())
     }
 
+    /// Queries and sets the taker fee rate for a given token.
+    ///
+    /// Call this once at startup with any token from the markets you'll trade.
+    /// Fee-enabled markets (15-min crypto) return 1000 bps (10%).
+    ///
+    /// If the API returns 0 but a non-zero fee was already configured,
+    /// the pre-configured value is kept (the API endpoint may not exist).
+    pub async fn configure_fee_rate(&mut self, token_id: &str) -> Result<(), ExecutionError> {
+        let bps = self
+            .client
+            .get_fee_rate_bps(token_id)
+            .await
+            .map_err(|e| e.into_execution_error())?;
+        let current = self.client.config().taker_fee_bps;
+        if bps > 0 {
+            self.client.set_taker_fee_bps(bps);
+            tracing::info!(fee_rate_bps = bps, token_id = %token_id, "Configured taker fee rate from API");
+        } else if current > 0 {
+            tracing::info!(fee_rate_bps = current, token_id = %token_id, "API returned 0, keeping pre-configured fee rate");
+        } else {
+            tracing::warn!(token_id = %token_id, "API returned fee_rate_bps=0 and no default configured");
+        }
+        Ok(())
+    }
+
     /// Returns true if the client is authenticated.
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
