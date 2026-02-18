@@ -289,7 +289,16 @@ pub async fn broadcast_tx(
             .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("unknown error");
-        return Err(TxError::Rejected(msg.to_string()));
+        let code = error
+            .get("code")
+            .and_then(|c| c.as_i64())
+            .map(|c| format!(" (code: {})", c))
+            .unwrap_or_default();
+        let data = error
+            .get("data")
+            .map(|d| format!(" data: {}", d))
+            .unwrap_or_default();
+        return Err(TxError::Rejected(format!("{}{}{}", msg, code, data)));
     }
 
     resp.get("result")

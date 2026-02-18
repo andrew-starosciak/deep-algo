@@ -372,7 +372,13 @@ pub async fn redeem_positions(
     let mut tx_hashes = Vec::new();
 
     for (condition_id_hex, index_sets) in conditions {
-        let cid = parse_condition_id(condition_id_hex)?;
+        let cid = match parse_condition_id(condition_id_hex) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(condition_id = %condition_id_hex, error = %e, "Skipping: bad condition ID");
+                continue;
+            }
+        };
 
         let calldata = build_redeem_positions(&cid, index_sets);
 
@@ -386,15 +392,27 @@ pub async fn redeem_positions(
         };
 
         let signed = polygon_tx::sign_legacy_tx(&tx, POLYGON_CHAIN_ID, wallet.expose_private_key())?;
-        let hash = polygon_tx::broadcast_tx(&http, rpc_url, &signed).await?;
-        info!(
-            tx_hash = %hash,
-            condition_id = %condition_id_hex,
-            index_sets = ?index_sets,
-            "Redemption tx sent"
-        );
-        tx_hashes.push(hash);
-        nonce += 1;
+        match polygon_tx::broadcast_tx(&http, rpc_url, &signed).await {
+            Ok(hash) => {
+                info!(
+                    tx_hash = %hash,
+                    condition_id = %condition_id_hex,
+                    index_sets = ?index_sets,
+                    "Redemption tx sent"
+                );
+                tx_hashes.push(hash);
+                nonce += 1;
+            }
+            Err(e) => {
+                warn!(
+                    condition_id = %condition_id_hex,
+                    index_sets = ?index_sets,
+                    error = %e,
+                    "Redemption broadcast failed, skipping to next"
+                );
+                // Don't increment nonce — tx was never sent
+            }
+        }
     }
 
     // Wait for receipts

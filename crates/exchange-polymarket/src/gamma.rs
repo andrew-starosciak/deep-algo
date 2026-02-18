@@ -7,6 +7,7 @@ use crate::models::{Coin, GammaEvent, Market};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use governor::{Quota, RateLimiter};
 use nonzero_ext::nonzero;
 use reqwest::Client;
@@ -296,6 +297,65 @@ impl GammaClient {
 
         // Market exists but not yet resolved
         tracing::debug!(slug = %slug, "Market not yet resolved");
+        Ok(None)
+    }
+
+    /// Gets market outcome using relaxed thresholds for stuck settlements.
+    ///
+    /// Accepts outcomePrices where one side is >= 0.90 and the other is <= 0.10,
+    /// rather than requiring exact 1.0/0.0. This handles cases where the Gamma API
+    /// reports near-resolved prices (e.g. "0.95"/"0.05") for some time before
+    /// switching to the final "1"/"0".
+    pub async fn get_market_outcome_relaxed(
+        &self,
+        coin: Coin,
+        window_end: DateTime<Utc>,
+    ) -> Result<Option<String>> {
+        let window_timestamp =
+            Self::calculate_window_timestamp(window_end - chrono::Duration::minutes(15));
+        let slug = Self::generate_event_slug(coin, window_timestamp);
+        let path = format!("/events?slug={}", slug);
+
+        let events: Vec<GammaEvent> = match self.get(&path).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(error = %e, "Failed to fetch event for relaxed outcome");
+                return Ok(None);
+            }
+        };
+
+        let event = match events.into_iter().next() {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        let threshold_high = dec!(0.90);
+        let threshold_low = dec!(0.10);
+
+        for gamma_market in &event.markets {
+            if let Some((up_price, down_price)) = gamma_market.parse_outcome_prices() {
+                if up_price >= threshold_high && down_price <= threshold_low {
+                    tracing::info!(
+                        coin = coin.slug_prefix(),
+                        outcome = "UP",
+                        up_price = %up_price,
+                        down_price = %down_price,
+                        "Got market outcome from Gamma API (relaxed threshold)"
+                    );
+                    return Ok(Some("UP".to_string()));
+                } else if down_price >= threshold_high && up_price <= threshold_low {
+                    tracing::info!(
+                        coin = coin.slug_prefix(),
+                        outcome = "DOWN",
+                        up_price = %up_price,
+                        down_price = %down_price,
+                        "Got market outcome from Gamma API (relaxed threshold)"
+                    );
+                    return Ok(Some("DOWN".to_string()));
+                }
+            }
+        }
+
         Ok(None)
     }
 

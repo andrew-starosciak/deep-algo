@@ -226,6 +226,16 @@ impl ClobClientConfig {
         self.funder = Some(funder.to_string());
         self
     }
+
+    /// Sets the taker fee rate in basis points.
+    ///
+    /// Fee-enabled markets (15-min crypto, 5-min crypto, NCAAB, Serie A)
+    /// require `1000` bps. Non-fee markets use `0`.
+    #[must_use]
+    pub fn with_taker_fee_bps(mut self, bps: u16) -> Self {
+        self.taker_fee_bps = bps;
+        self
+    }
 }
 
 // =============================================================================
@@ -792,6 +802,25 @@ impl ClobClient {
 
         let positions = self.get_positions().await?;
 
+        let redeemable_count = positions.iter().filter(|p| p.redeemable && p.size > 0.0).count();
+        let total_count = positions.len();
+        info!(
+            total = total_count,
+            redeemable = redeemable_count,
+            "Fetched positions for redemption check"
+        );
+        for pos in positions.iter().filter(|p| p.redeemable && p.size > 0.0) {
+            info!(
+                title = %pos.title,
+                outcome = %pos.outcome,
+                size = pos.size,
+                condition_id = %pos.condition_id,
+                neg_risk = pos.negative_risk,
+                outcome_index = ?pos.outcome_index,
+                "Found redeemable position"
+            );
+        }
+
         // Separate redeemable positions into standard CTF vs neg_risk paths.
         // Standard markets: redeem via CTF.redeemPositions(collateral, parent, cid, indexSets)
         // Neg risk markets: redeem via NegRiskAdapter.redeemPositions(cid, amounts)
@@ -1179,6 +1208,59 @@ impl ClobClient {
         Ok(book)
     }
 
+    /// Queries the taker fee rate for a token from the CLOB API.
+    ///
+    /// Returns the fee rate in basis points (e.g. 1000 = 10%).
+    /// Fee-enabled markets (15-min crypto, 5-min crypto) return 1000;
+    /// non-fee markets return 0.
+    ///
+    /// Public endpoint — no authentication required.
+    pub async fn get_fee_rate_bps(&self, token_id: &str) -> Result<u16, ClobError> {
+        let url = format!("{}/fee-rate?token_id={}", self.config.base_url, token_id);
+
+        let response = self
+            .http
+            .get(&url)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ClobError::Api {
+                status,
+                message: body,
+            });
+        }
+
+        #[derive(Deserialize)]
+        struct FeeRateResponse {
+            #[serde(default)]
+            fee_rate_bps: Option<String>,
+            #[serde(default, rename = "feeRateBps")]
+            fee_rate_bps_alt: Option<String>,
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        let parsed: FeeRateResponse = serde_json::from_str(&body)
+            .map_err(|e| ClobError::Parse(format!("Failed to parse fee-rate response: {} - body: {}", e, body)))?;
+
+        let bps_str = parsed
+            .fee_rate_bps
+            .or(parsed.fee_rate_bps_alt)
+            .unwrap_or_else(|| "0".to_string());
+
+        bps_str.parse::<u16>().map_err(|e| {
+            ClobError::Parse(format!("Invalid fee_rate_bps '{}': {}", bps_str, e))
+        })
+    }
+
+    /// Updates the taker fee rate used for order signing.
+    pub fn set_taker_fee_bps(&mut self, bps: u16) {
+        self.config.taker_fee_bps = bps;
+    }
+
     // =========================================================================
     // Private Helpers
     // =========================================================================
@@ -1214,17 +1296,9 @@ impl ClobClient {
         // Nonce: "0" for on-chain cancellation (salt provides uniqueness)
         let nonce: u64 = 0;
 
-        // Expiration: "0" for FOK (fill-or-kill doesn't need expiration)
-        let expiration_secs: u64 = match params.order_type {
-            OrderType::Fok | OrderType::Fak => 0,
-            OrderType::Gtc => {
-                // GTC: 10 minutes from now
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs() + 600)
-                    .unwrap_or(0)
-            }
-        };
+        // Expiration: CLOB requires 0 for FOK, FAK, and GTC orders.
+        // Only GTD (Good-til-Date) orders use a non-zero expiration.
+        let expiration_secs: u64 = 0;
 
         // Convert side to EIP-712 format
         let eip712_side = match params.side {

@@ -498,13 +498,31 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
         self.create_session_record().await;
         self.load_unsettled_trades().await;
 
+        // Immediately settle any loaded trades from previous sessions
+        if !self.pending_settlements.is_empty() {
+            info!(
+                count = self.pending_settlements.len(),
+                "Running immediate settlement for loaded trades"
+            );
+            self.check_settlements().await;
+        }
+
         let mut settlement_tick =
             tokio::time::interval(Duration::from_secs(self.config.settlement_interval_secs));
         let mut dashboard_tick =
             tokio::time::interval(Duration::from_secs(self.config.stats_interval_secs));
         let mut chainlink_tick = tokio::time::interval(Duration::from_secs(10));
-        // Consume the first immediate tick
+        let mut redeem_tick = tokio::time::interval(Duration::from_secs(120));
+        // Consume the first immediate ticks
         chainlink_tick.tick().await;
+        redeem_tick.tick().await;
+
+        // Redeem any resolved positions on startup
+        match self.executor.redeem_resolved_positions().await {
+            Ok(0) => info!("No redeemable positions found on startup"),
+            Ok(n) => info!(redeemed = n, "Redeemed {} resolved positions on startup", n),
+            Err(e) => warn!(error = %e, "Startup redeem check FAILED"),
+        }
 
         loop {
             tokio::select! {
@@ -527,9 +545,26 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                     tracker.poll().await;
                 }
 
-                // Check settlements
+                // Check settlements (DB accounting)
                 _ = settlement_tick.tick() => {
                     self.check_settlements().await;
+                }
+
+                // Redeem resolved positions on-chain (converts winning tokens → USDC)
+                _ = redeem_tick.tick() => {
+                    match self.executor.redeem_resolved_positions().await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
+                            let mut stats = self.stats.write().await;
+                            stats.current_balance = self
+                                .executor
+                                .get_balance()
+                                .await
+                                .unwrap_or(stats.current_balance);
+                        }
+                        Err(e) => warn!(error = %e, "Auto-redeem check FAILED"),
+                    }
                 }
 
                 // Render dashboard
@@ -813,16 +848,10 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                 continue;
             }
 
-            let window_end_dt = match DateTime::from_timestamp_millis(window_end) {
-                Some(dt) => dt,
-                None => continue,
-            };
-
             // ── Path 1: CLOB fast-settle (30s after window close) ──
             // Check if token price shows decisive resolution.
             if trade_age_ms >= 30_000 {
                 if let Some(won) = Self::try_clob_settle(&trade.token_id, &self.http_client).await {
-                    let source = "CLOB";
                     let (pnl, outcome_str) = Self::calculate_directional_pnl(
                         won,
                         trade.entry_price,
@@ -840,7 +869,6 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                         outcome = %outcome_str,
                         won = won,
                         pnl = %pnl,
-                        source = source,
                         "SETTLED directional trade via CLOB fast-settle"
                     );
                     Self::apply_settlement_to_stats(
@@ -855,59 +883,59 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
 
             // ── Path 2: Gamma API (2 min after window close) ──
             if trade_age_ms >= 120_000 {
-                let coin = match Coin::from_slug(&trade.coin) {
-                    Some(c) => c,
-                    None => continue,
-                };
+                let window_end_dt = DateTime::from_timestamp_millis(window_end);
+                let coin = Coin::from_slug(&trade.coin);
 
-                match self.gamma_client.get_market_outcome(coin, window_end_dt).await {
-                    Ok(Some(outcome)) => {
-                        let won = match trade.direction {
-                            Direction::Up => outcome == "UP",
-                            Direction::Down => outcome == "DOWN",
-                        };
-                        let (pnl, _) = Self::calculate_directional_pnl(
-                            won,
-                            trade.entry_price,
-                            trade.shares,
-                            trade.cost,
-                            self.config.fee_rate,
-                            &trade.direction,
-                        );
+                if let (Some(window_dt), Some(coin)) = (window_end_dt, coin) {
+                    match self.gamma_client.get_market_outcome(coin, window_dt).await {
+                        Ok(Some(outcome)) => {
+                            let won = match trade.direction {
+                                Direction::Up => outcome == "UP",
+                                Direction::Down => outcome == "DOWN",
+                            };
+                            let (pnl, _) = Self::calculate_directional_pnl(
+                                won,
+                                trade.entry_price,
+                                trade.shares,
+                                trade.cost,
+                                self.config.fee_rate,
+                                &trade.direction,
+                            );
 
-                        trade.settlement = Some(SettlementResult { won, pnl, settled_at: Utc::now() });
-                        info!(
-                            trade_id = trade.trade_id,
-                            coin = trade.coin,
-                            direction = %trade.direction,
-                            outcome = %outcome,
-                            won = won,
-                            pnl = %pnl,
-                            "SETTLED directional trade via Gamma API"
-                        );
-                        Self::apply_settlement_to_stats(
-                            won, pnl, trade.cost,
-                            &self.executor, &self.stats,
-                        ).await;
-                        to_persist.push((trade.trade_id.clone(), won, pnl));
-                        settled_indices.push(i);
-                        continue;
-                    }
-                    Ok(None) => {
-                        debug!(
-                            trade_id = trade.trade_id,
-                            coin = trade.coin,
-                            age_secs = trade_age_ms / 1000,
-                            "Gamma: market not yet resolved"
-                        );
-                    }
-                    Err(e) => {
-                        debug!(
-                            trade_id = trade.trade_id,
-                            coin = trade.coin,
-                            error = %e,
-                            "Gamma API error"
-                        );
+                            trade.settlement = Some(SettlementResult { won, pnl, settled_at: Utc::now() });
+                            info!(
+                                trade_id = trade.trade_id,
+                                coin = trade.coin,
+                                direction = %trade.direction,
+                                outcome = %outcome,
+                                won = won,
+                                pnl = %pnl,
+                                "SETTLED directional trade via Gamma API"
+                            );
+                            Self::apply_settlement_to_stats(
+                                won, pnl, trade.cost,
+                                &self.executor, &self.stats,
+                            ).await;
+                            to_persist.push((trade.trade_id.clone(), won, pnl));
+                            settled_indices.push(i);
+                            continue;
+                        }
+                        Ok(None) => {
+                            debug!(
+                                trade_id = trade.trade_id,
+                                coin = trade.coin,
+                                age_secs = trade_age_ms / 1000,
+                                "Gamma: market not yet resolved"
+                            );
+                        }
+                        Err(e) => {
+                            debug!(
+                                trade_id = trade.trade_id,
+                                coin = trade.coin,
+                                error = %e,
+                                "Gamma API error"
+                            );
+                        }
                     }
                 }
             }
@@ -916,7 +944,10 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             if trade_age_ms >= 600_000 {
                 let tracker = self.chainlink_tracker.read().await;
                 let window_start_ts = window_start / 1000; // ms → seconds
-                if let Some(outcome) = tracker.get_outcome(&trade.coin.to_uppercase(), window_start_ts) {
+                let outcome = tracker.get_outcome(&trade.coin.to_uppercase(), window_start_ts);
+                drop(tracker); // release read lock before writing stats
+
+                if let Some(outcome) = outcome {
                     let won = match trade.direction {
                         Direction::Up => outcome == "UP",
                         Direction::Down => outcome == "DOWN",
@@ -930,7 +961,6 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                         &trade.direction,
                     );
 
-                    drop(tracker); // release read lock before writing stats
                     trade.settlement = Some(SettlementResult { won, pnl, settled_at: Utc::now() });
                     info!(
                         trade_id = trade.trade_id,
@@ -940,6 +970,86 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                         won = won,
                         pnl = %pnl,
                         "SETTLED directional trade via Chainlink fallback"
+                    );
+                    Self::apply_settlement_to_stats(
+                        won, pnl, trade.cost,
+                        &self.executor, &self.stats,
+                    ).await;
+                    to_persist.push((trade.trade_id.clone(), won, pnl));
+                    settled_indices.push(i);
+                    continue;
+                }
+
+                // ── Path 4: Gamma relaxed thresholds (30 min after window close) ──
+                // Accept outcomePrices >= 0.90 rather than exact 1.0/0.0
+                if trade_age_ms >= 1_800_000 {
+                    let window_end_dt = DateTime::from_timestamp_millis(window_end);
+                    let coin = Coin::from_slug(&trade.coin);
+
+                    if let (Some(window_dt), Some(coin)) = (window_end_dt, coin) {
+                        if let Ok(Some(outcome)) =
+                            self.gamma_client.get_market_outcome_relaxed(coin, window_dt).await
+                        {
+                            let won = match trade.direction {
+                                Direction::Up => outcome == "UP",
+                                Direction::Down => outcome == "DOWN",
+                            };
+                            let (pnl, _) = Self::calculate_directional_pnl(
+                                won,
+                                trade.entry_price,
+                                trade.shares,
+                                trade.cost,
+                                self.config.fee_rate,
+                                &trade.direction,
+                            );
+
+                            trade.settlement =
+                                Some(SettlementResult { won, pnl, settled_at: Utc::now() });
+                            info!(
+                                trade_id = trade.trade_id,
+                                coin = trade.coin,
+                                direction = %trade.direction,
+                                outcome = %outcome,
+                                won = won,
+                                pnl = %pnl,
+                                "SETTLED directional trade via Gamma relaxed threshold"
+                            );
+                            Self::apply_settlement_to_stats(
+                                won, pnl, trade.cost,
+                                &self.executor, &self.stats,
+                            ).await;
+                            to_persist.push((trade.trade_id.clone(), won, pnl));
+                            settled_indices.push(i);
+                            continue;
+                        }
+                    }
+                }
+
+                // ── Path 5: Hard timeout (2h after window close) ──
+                // Assume loss to prevent trades stuck forever. The auto-redeem
+                // mechanism will still recover any USDC if the position actually won.
+                if trade_age_ms >= 7_200_000 {
+                    let won = false;
+                    let (pnl, _) = Self::calculate_directional_pnl(
+                        won,
+                        trade.entry_price,
+                        trade.shares,
+                        trade.cost,
+                        self.config.fee_rate,
+                        &trade.direction,
+                    );
+
+                    trade.settlement =
+                        Some(SettlementResult { won, pnl, settled_at: Utc::now() });
+                    error!(
+                        trade_id = trade.trade_id,
+                        coin = trade.coin,
+                        direction = %trade.direction,
+                        age_mins = trade_age_ms / 60_000,
+                        pnl = %pnl,
+                        "FORCE-SETTLED trade as LOSS after 2h timeout \
+                         (all settlement paths exhausted). \
+                         Auto-redeem will recover USDC if position actually won."
                     );
                     Self::apply_settlement_to_stats(
                         won, pnl, trade.cost,
@@ -964,9 +1074,18 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             self.pending_settlements.remove(i);
         }
 
-        // Persist settlements to database
+        // Persist settlements to database and update dashboard display
         for (trade_id, won, pnl) in to_persist {
             self.persist_settlement(&trade_id, won, pnl).await;
+
+            // Sync settlement result back to the display trades VecDeque
+            if let Some(display_trade) = self.trades.iter_mut().find(|t| t.trade_id == trade_id) {
+                display_trade.settlement = Some(SettlementResult {
+                    won,
+                    pnl,
+                    settled_at: Utc::now(),
+                });
+            }
         }
 
         let mut stats = self.stats.write().await;
@@ -1159,13 +1278,11 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                 pnl = $2,
                 settled_at = NOW()
             WHERE trade_id = $3
-              AND session_id = $4
             "#,
         )
         .bind(won)
         .bind(pnl)
         .bind(trade_id)
-        .bind(&self.session_id)
         .execute(pool)
         .await;
 
@@ -1318,7 +1435,8 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                         settlement: None,
                     };
 
-                    self.pending_settlements.push(trade);
+                    self.pending_settlements.push(trade.clone());
+                    self.trades.push_back(trade);
                 }
 
                 if count > 0 {
