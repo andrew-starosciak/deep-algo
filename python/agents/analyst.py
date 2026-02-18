@@ -14,8 +14,8 @@ class AnalystAgent(BaseAgent):
             "options trading analyst who scores trade theses on five dimensions: "
             "information edge, volatility pricing, technical alignment, catalyst clarity, "
             "and risk/reward ratio. You only recommend trades scoring 7.0+ overall. "
-            "For contract selection, you prefer 2x catalyst timeline for expiry, "
-            "slightly OTM strikes, and check liquidity (bid-ask < 10%, OI > 500)."
+            "You estimate expected stock moves and catalyst timelines so the system "
+            "can programmatically select the best contract from real market data."
         )
 
     @property

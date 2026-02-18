@@ -210,6 +210,15 @@ class IBClient:
 
     async def get_option_expirations(self, ticker: str) -> list[_dt.date]:
         """Get available option expiration dates for a ticker."""
+        chain = await self.get_option_chain(ticker)
+        return chain["expirations"]
+
+    async def get_option_chain(self, ticker: str) -> dict:
+        """Get available option expirations and strikes for a ticker.
+
+        Returns:
+            {"expirations": [date, ...], "strikes": [float, ...]}
+        """
         self._require_connected()
         from ib_async import Stock
 
@@ -221,19 +230,29 @@ class IBClient:
         if not chains:
             raise ValueError(f"No option chains for {ticker}")
 
-        # Merge expirations from all exchanges, parse to dates
+        # Merge expirations and strikes from all exchanges
         all_expirations: set[_dt.date] = set()
+        all_strikes: set[float] = set()
         for chain in chains:
             for exp_str in chain.expirations:
                 try:
                     all_expirations.add(_dt.datetime.strptime(exp_str, "%Y%m%d").date())
                 except ValueError:
                     continue
+            all_strikes.update(chain.strikes)
 
-        return sorted(all_expirations)
+        return {
+            "expirations": sorted(all_expirations),
+            "strikes": sorted(all_strikes),
+        }
 
     async def get_option_quote(self, contract: ContractSpec) -> OptionQuote:
-        """Get a quote for an options contract (falls back to delayed data)."""
+        """Get a quote for an options contract (falls back to delayed data).
+
+        Uses streaming mode instead of snapshot so delayed data ticks have
+        time to arrive (paper accounts don't get real-time options data).
+        """
+        import asyncio
         import math
 
         self._require_connected()
@@ -255,23 +274,49 @@ class IBClient:
             right=contract.right[0].upper(),  # "call" -> "C", "put" -> "P"
             exchange="SMART",
         )
-        await self._ib.qualifyContractsAsync(ib_contract)
-        self._ib.reqMktData(ib_contract, genericTickList="", snapshot=True)
-        tickers = await self._ib.reqTickersAsync(ib_contract)
-        t = tickers[0] if tickers else None
+        qualified = await self._ib.qualifyContractsAsync(ib_contract)
+        if not qualified or not ib_contract.conId:
+            raise ValueError(
+                f"Contract not found: {contract.ticker} {contract.strike}"
+                f"{contract.right[0].upper()} exp {contract.expiry}. "
+                f"Strike may not exist or market data unavailable."
+            )
 
-        if t is None:
-            raise ValueError(f"No quote for {contract.ticker} {contract.strike}{contract.right}")
+        # Use streaming mode — snapshot returns before delayed ticks arrive
+        self._ib.reqMktData(ib_contract, genericTickList="", snapshot=False)
+        t = self._ib.ticker(ib_contract)
+
+        # Wait up to 8s for any price data to arrive
+        for i in range(16):
+            await asyncio.sleep(0.5)
+            if _valid(t.bid) or _valid(t.ask) or _valid(t.last) or _valid(t.close):
+                # Give one more beat for bid+ask pair to both arrive
+                await asyncio.sleep(0.5)
+                break
+
+        # Cancel streaming subscription
+        self._ib.cancelMktData(ib_contract)
+
+        logger.info(
+            "Option quote %s %s%s exp %s: bid=%s ask=%s last=%s close=%s",
+            contract.ticker, contract.strike, contract.right[0].upper(),
+            contract.expiry, t.bid, t.ask, t.last, t.close,
+        )
 
         bid = Decimal(str(t.bid)) if _valid(t.bid) else Decimal("0")
         ask = Decimal(str(t.ask)) if _valid(t.ask) else Decimal("0")
         last = Decimal(str(t.last)) if _valid(t.last) else Decimal("0")
         close = Decimal(str(t.close)) if _valid(t.close) else Decimal("0")
 
+        # Also try marketPrice() which aggregates various price sources
+        mp = t.marketPrice()
+
         if bid > 0 and ask > 0:
             mid = (bid + ask) / 2
         elif last > 0:
             mid = last
+        elif _valid(mp):
+            mid = Decimal(str(mp))
         elif close > 0:
             mid = close
         else:
@@ -319,7 +364,12 @@ class IBClient:
             right=contract.right[0].upper(),
             exchange="SMART",
         )
-        await self._ib.qualifyContractsAsync(ib_contract)
+        qualified = await self._ib.qualifyContractsAsync(ib_contract)
+        if not qualified or not ib_contract.conId:
+            raise ValueError(
+                f"Contract not found: {contract.ticker} {contract.strike}"
+                f"{contract.right[0].upper()} exp {contract.expiry}"
+            )
 
         if order_type == "LMT" and limit_price is not None:
             order = LimitOrder(side, quantity, float(limit_price))

@@ -26,11 +26,19 @@ TIMEZONE = "America/New_York"
 class WorkflowScheduler:
     """Schedule and run workflows + position management on cron triggers."""
 
-    def __init__(self, engine: Any, db: Any, ib_client: Any, notifier: Any = None):
+    def __init__(
+        self,
+        engine: Any,
+        db: Any,
+        ib_client: Any,
+        notifier: Any = None,
+        auto_approve: bool = False,
+    ):
         self.engine = engine
         self.db = db
         self.ib_client = ib_client
         self.notifier = notifier
+        self.auto_approve = auto_approve
         self.scheduler = AsyncScheduler()
         self._position_manager = None
 
@@ -75,7 +83,9 @@ class WorkflowScheduler:
         # Start Discord bot FIRST — ib_async conflicts with discord.py
         # if IB connects before the Discord event loop is running.
         if self.notifier:
-            self.notifier.set_context(db=self.db, engine=self.engine)
+            self.notifier.set_context(
+                db=self.db, engine=self.engine, auto_approve=self.auto_approve,
+            )
             await self.notifier.start()
             logger.info("Discord bot started, now connecting to IB...")
 
@@ -181,10 +191,24 @@ class WorkflowScheduler:
             not isinstance(thesis, Thesis)
             or not isinstance(verification, RiskVerification)
             or not verification.approved
-            or thesis.recommended_contract is None
         ):
             logger.info("No actionable recommendation for %s", ticker)
             return
+
+        # Programmatic contract selection using real IB data
+        if thesis.recommended_contract is None:
+            try:
+                from ib.contract_selector import ContractSelector
+
+                selector = ContractSelector(self.ib_client)
+                selected = await selector.select(thesis)
+                if not selected:
+                    logger.info("No suitable contract for %s", ticker)
+                    return
+                thesis.recommended_contract = selected
+            except Exception as e:
+                logger.warning("Contract selection failed for %s: %s", ticker, e)
+                return
 
         try:
             # Get equity from IB for accurate sizing
@@ -219,8 +243,33 @@ class WorkflowScheduler:
                     "overall_score": thesis.scores.overall,
                 })
 
+            # Auto-approve: skip human gate, approve immediately for execution
+            if self.auto_approve:
+                await self._auto_approve_recommendation(rec_id, ticker)
+
         except Exception:
             logger.exception("Failed to save recommendation for %s", ticker)
+
+    async def _auto_approve_recommendation(self, rec_id: int, ticker: str) -> None:
+        """Auto-approve a recommendation and trigger immediate execution."""
+        try:
+            await self.db.approve_recommendation(rec_id)
+            logger.info("Auto-approved recommendation #%d for %s", rec_id, ticker)
+
+            if self.notifier:
+                await self.notifier.send(
+                    f"Auto-approved recommendation #{rec_id} for **{ticker}** — "
+                    f"executing on next position manager tick."
+                )
+
+            # Trigger immediate execution instead of waiting for next tick
+            if self._position_manager:
+                rec = await self.db.get_recommendation(rec_id)
+                if rec:
+                    await self._position_manager._execute_recommendation(rec)
+
+        except Exception:
+            logger.exception("Failed to auto-approve recommendation #%d", rec_id)
 
     async def _position_tick(self) -> None:
         """Run one position manager tick: update prices, check rules."""

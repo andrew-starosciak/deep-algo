@@ -181,13 +181,23 @@ class PositionManager:
 
             # Get quote and calculate quantity
             quote = await self.ib.get_option_quote(contract)
-            price_per_contract = quote.mid * 100  # Options are 100 shares
-            if price_per_contract <= 0:
-                await self.db.update_recommendation_status(
-                    rec_id, "failed", "Zero or negative quote"
-                )
-                return
+            limit_price = quote.mid
+            if limit_price <= 0:
+                # Fallback: use thesis entry price for limit order
+                entry_mid = (contract.entry_price_low + contract.entry_price_high) / 2
+                if entry_mid > 0:
+                    logger.warning(
+                        "Quote returned $0 for rec %d — using thesis entry $%s as limit",
+                        rec_id, entry_mid,
+                    )
+                    limit_price = entry_mid
+                else:
+                    await self.db.update_recommendation_status(
+                        rec_id, "failed", "Zero or negative quote"
+                    )
+                    return
 
+            price_per_contract = limit_price * 100  # Options are 100 shares
             quantity = max(1, int(position_usd / price_per_contract))
 
             # Place order
@@ -196,7 +206,7 @@ class PositionManager:
                 side="BUY",
                 quantity=quantity,
                 order_type="LMT",
-                limit_price=quote.mid,
+                limit_price=limit_price,
             )
 
             # Record position in DB — keep Decimal throughout

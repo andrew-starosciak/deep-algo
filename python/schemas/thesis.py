@@ -65,4 +65,12 @@ class Thesis(BaseModel):
     scores: ThesisScore
     supporting_evidence: list[str] = Field(default_factory=list)
     risks: list[str] = Field(default_factory=list)
+    expected_move_pct: float = Field(
+        default=10.0,
+        description="Expected stock move if thesis plays out (%)",
+    )
+    catalyst_timeline_days: int = Field(
+        default=30,
+        description="Days until catalyst fires",
+    )
     recommended_contract: Optional[ContractSpec] = None

@@ -52,10 +52,20 @@ class PaperClient:
 
     async def get_option_expirations(self, ticker: str) -> list[_dt.date]:
         """Return simulated option expiration dates (monthly, next 3 months)."""
+        chain = await self.get_option_chain(ticker)
+        return chain["expirations"]
+
+    async def get_option_chain(self, ticker: str) -> dict:
+        """Return simulated option chain with expirations and strikes.
+
+        Returns:
+            {"expirations": [date, ...], "strikes": [float, ...]}
+        """
         import calendar
+
         today = _dt.date.today()
         expirations = []
-        for month_offset in range(1, 4):
+        for month_offset in range(1, 6):
             m = (today.month + month_offset - 1) % 12 + 1
             y = today.year + (today.month + month_offset - 1) // 12
             # Third Friday of the month
@@ -63,7 +73,16 @@ class PaperClient:
             fridays = [week[calendar.FRIDAY] for week in cal if week[calendar.FRIDAY] != 0]
             third_friday = _dt.date(y, m, fridays[2])
             expirations.append(third_friday)
-        return expirations
+
+        price = float(await self.get_stock_price(ticker))
+        # Generate strikes at $5 intervals around current price
+        strikes = sorted(
+            round(price + i * 5, 0)
+            for i in range(-10, 11)
+            if price + i * 5 > 0
+        )
+
+        return {"expirations": expirations, "strikes": strikes}
 
     async def get_option_quote(self, contract: ContractSpec) -> OptionQuote:
         """Return a quote using the contract's entry price range."""

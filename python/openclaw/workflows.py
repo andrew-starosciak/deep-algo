@@ -28,7 +28,7 @@ def trade_thesis_workflow() -> WorkflowDef:
                 agent="analyst",
                 input_schema=ResearchSummary,
                 output_schema=Thesis,
-                validate=lambda t: t.scores.overall >= 7.0,
+                validate=lambda t: t.scores.overall >= 6.0,
                 max_retries=1,
                 on_fail=OnFail.ABORT,  # Doesn't meet threshold
             ),

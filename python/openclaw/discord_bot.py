@@ -245,6 +245,7 @@ class DiscordBot:
         self._db = None
         self._engine = None
         self._position_manager = None
+        self._auto_approve = False
 
         # Register event handlers
         @self.client.event
@@ -280,7 +281,13 @@ class DiscordBot:
                     logger.exception("Command %s failed", cmd)
                     await message.channel.send(f"Error running `{cmd}`: {e}")
 
-    def set_context(self, db: Any = None, engine: Any = None, position_manager: Any = None) -> None:
+    def set_context(
+        self,
+        db: Any = None,
+        engine: Any = None,
+        position_manager: Any = None,
+        auto_approve: bool | None = None,
+    ) -> None:
         """Wire in database, workflow engine, and position manager after init."""
         if db is not None:
             self._db = db
@@ -288,6 +295,8 @@ class DiscordBot:
             self._engine = engine
         if position_manager is not None:
             self._position_manager = position_manager
+        if auto_approve is not None:
+            self._auto_approve = auto_approve
 
     async def start_background(self):
         """Start the Discord bot in the background."""
@@ -642,8 +651,12 @@ class DiscordBot:
 
     async def _run_analyze(self, channel, ticker: str) -> None:
         try:
+            from decimal import Decimal
+
             from openclaw.workflows import get_workflow
             from schemas.research import ResearchRequest
+            from schemas.risk import RiskVerification
+            from schemas.thesis import Thesis
 
             workflow = get_workflow("trade-thesis")
             result = await self._engine.run(workflow, ResearchRequest(ticker=ticker))
@@ -653,33 +666,136 @@ class DiscordBot:
                 return
 
             thesis = result.step_outputs.get("evaluate")
-            if thesis is None:
+            if not isinstance(thesis, Thesis):
                 await channel.send(f"Analysis for **{ticker}** — did not pass evaluation gate.")
                 return
 
-            embed = discord.Embed(
-                title=f"Analysis: {ticker}",
-                color=(
-                    discord.Color.green() if getattr(thesis, "direction", "") == "bullish"
-                    else discord.Color.red() if getattr(thesis, "direction", "") == "bearish"
-                    else discord.Color.gold()
-                ),
+            verification = result.step_outputs.get("verify")
+
+            # Programmatic contract selection using real IB data
+            if (
+                isinstance(verification, RiskVerification)
+                and verification.approved
+                and self._position_manager
+                and thesis.recommended_contract is None
+            ):
+                try:
+                    from ib.contract_selector import ContractSelector
+
+                    selector = ContractSelector(self._position_manager.ib)
+                    selected = await selector.select(thesis)
+                    if selected:
+                        thesis.recommended_contract = selected
+                    else:
+                        logger.info("ContractSelector found no suitable contract for %s", ticker)
+                except Exception as e:
+                    logger.warning("Contract selection failed for %s: %s", ticker, e)
+
+            # Show analysis embed
+            color = (
+                discord.Color.green() if thesis.direction == "bullish"
+                else discord.Color.red() if thesis.direction == "bearish"
+                else discord.Color.gold()
             )
-            embed.add_field(name="Direction", value=getattr(thesis, "direction", "N/A").capitalize(), inline=True)
-            scores = getattr(thesis, "scores", None)
-            if scores:
-                embed.add_field(name="Score", value=f"{getattr(scores, 'overall', '?')}/10", inline=True)
-            contract = getattr(thesis, "recommended_contract", None)
-            if contract:
-                embed.add_field(name="Contract", value=str(contract), inline=False)
-            thesis_text = getattr(thesis, "thesis_text", "")
-            if thesis_text:
-                embed.add_field(name="Thesis", value=thesis_text[:1024], inline=False)
+            embed = discord.Embed(title=f"Analysis: {ticker}", color=color)
+            embed.add_field(name="Direction", value=thesis.direction.capitalize(), inline=True)
+            embed.add_field(name="Score", value=f"{thesis.scores.overall}/10", inline=True)
+            if thesis.recommended_contract:
+                embed.add_field(name="Contract", value=str(thesis.recommended_contract), inline=False)
+            if thesis.thesis_text:
+                embed.add_field(name="Thesis", value=thesis.thesis_text[:1024], inline=False)
             await channel.send(embed=embed)
+
+            # Save recommendation if all gates passed
+            if (
+                not isinstance(verification, RiskVerification)
+                or not verification.approved
+                or thesis.recommended_contract is None
+            ):
+                return
+
+            rec_id = await self._save_recommendation(
+                result, thesis, verification, ticker
+            )
+            if rec_id is None:
+                return
+
+            # Auto-approve or show buttons
+            if self._auto_approve:
+                await self._auto_approve_rec(channel, rec_id, ticker)
+            else:
+                await self.send_recommendation({
+                    "id": rec_id,
+                    "ticker": ticker,
+                    "direction": thesis.direction,
+                    "contract": str(thesis.recommended_contract),
+                    "position_size_usd": str(
+                        verification.position_size_pct * Decimal("2000")
+                    ),
+                    "overall_score": thesis.scores.overall,
+                })
 
         except Exception as e:
             logger.exception("!analyze failed for %s", ticker)
             await channel.send(f"Analysis for **{ticker}** failed: {e}")
+
+    async def _save_recommendation(
+        self, result, thesis, verification, ticker: str
+    ) -> int | None:
+        """Save a recommendation to DB. Returns rec_id or None on failure."""
+        from decimal import Decimal
+
+        try:
+            # Contract already validated by ContractSelector — no pre-validation needed
+
+            # Get equity from IB if position manager is available
+            equity = Decimal("200000")
+            if self._position_manager:
+                try:
+                    import asyncio
+                    account = await asyncio.wait_for(
+                        self._position_manager.ib.account_summary(), timeout=10.0
+                    )
+                    equity = account.net_liquidation
+                except Exception as e:
+                    logger.warning("IB account_summary failed, using default: %s", e)
+
+            position_size_usd = verification.position_size_pct * equity / Decimal("100")
+
+            thesis_id = await self._db.save_thesis(result.run_id, thesis.model_dump())
+            rec_data = {
+                "contract": thesis.recommended_contract.model_dump(),
+                "position_size_pct": str(verification.position_size_pct),
+                "position_size_usd": str(position_size_usd),
+                "exit_targets": ["+50% sell half", "+100% close"],
+                "stop_loss": "-50% hard stop",
+                "max_hold_days": 30,
+                "risk_verification": verification.model_dump(),
+            }
+            rec_id = await self._db.save_recommendation(thesis_id, result.run_id, rec_data)
+            logger.info("Recommendation #%d saved for %s (size: $%s)", rec_id, ticker, position_size_usd)
+            return rec_id
+        except Exception:
+            logger.exception("Failed to save recommendation for %s", ticker)
+            return None
+
+    async def _auto_approve_rec(self, channel, rec_id: int, ticker: str) -> None:
+        """Auto-approve a recommendation and trigger execution."""
+        try:
+            await self._db.approve_recommendation(rec_id)
+            logger.info("Auto-approved recommendation #%d for %s", rec_id, ticker)
+            await channel.send(
+                f"Auto-approved recommendation **#{rec_id}** for **{ticker}** — executing now..."
+            )
+
+            if self._position_manager:
+                rec = await self._db.get_recommendation(rec_id)
+                if rec:
+                    await self._position_manager._execute_recommendation(rec)
+                    await channel.send(f"Recommendation **#{rec_id}** executed.")
+        except Exception as e:
+            logger.exception("Failed to auto-approve recommendation #%d", rec_id)
+            await channel.send(f"Auto-approve failed for #{rec_id}: {e}")
 
     async def _cmd_portfolio(self, channel, args: list[str]) -> None:
         if not self._db:

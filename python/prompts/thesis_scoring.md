@@ -42,16 +42,19 @@ Score each dimension 1-10:
 - Minimum acceptable: 2:1
 - Prefer 3:1+
 
-## Contract Selection (if overall >= 7.0)
+## Expected Move & Timeline (REQUIRED)
 
-If the thesis scores 7.0+, recommend a specific contract:
+Provide your estimates for programmatic contract selection:
 
-1. **Expiry**: At least 2x the catalyst timeline. Catalyst in 2 weeks → minimum 4-week expiry.
-2. **Strike**: Slightly OTM for leverage, or ATM for higher probability.
-3. **Strategy**: If IV rank > 50, consider debit spread. If IV rank < 50, naked option.
-4. **Liquidity**: Bid-ask < 10% of mid price. OI > 500.
+1. **expected_move_pct**: How much the stock should move if thesis plays out (in %).
+   Be realistic: most catalyst moves are 5-15%. Earnings surprises 10-30%.
+2. **catalyst_timeline_days**: Days until the catalyst fires. Be specific.
+
+Do NOT recommend a specific options contract — set `recommended_contract` to null.
+The system selects contracts automatically using real IB market data (strikes, expirations, bid/ask).
 
 ## Output
 
-Produce a complete Thesis with scores, evidence, risks, and contract recommendation.
+Produce a complete Thesis with scores, evidence, risks, expected_move_pct, and catalyst_timeline_days.
+Set recommended_contract to null — the system handles contract selection.
 Be decisive — don't give every dimension a 5. Take a stance.

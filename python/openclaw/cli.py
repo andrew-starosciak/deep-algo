@@ -96,6 +96,10 @@ def main():
         "--model", default="claude-sonnet-4-5-20250929",
         help="Claude model to use for workflows",
     )
+    sched_parser.add_argument(
+        "--auto-approve", action="store_true",
+        help="Auto-approve recommendations (skip human review gate)",
+    )
 
     args = parser.parse_args()
 
@@ -244,7 +248,13 @@ async def _maybe_save_recommendation(engine, result, args):
 
     if not isinstance(thesis, Thesis) or not isinstance(verification, RiskVerification):
         return
-    if not verification.approved or thesis.recommended_contract is None:
+    if not verification.approved:
+        return
+    if thesis.recommended_contract is None:
+        print(
+            "\nNo contract selected (CLI mode has no IB connection for contract selection).\n"
+            "Use the scheduler or Discord bot with IB connected for automatic contract selection."
+        )
         return
 
     # Check if we have a real DB (not in-memory)
@@ -406,8 +416,10 @@ async def _cmd_scheduler(args):
     engine = await _init_engine(args, ib_client=ib_client)
     notifier = MultiNotifier()
 
+    auto_approve = getattr(args, "auto_approve", False)
     scheduler = WorkflowScheduler(
         engine=engine, db=db, ib_client=ib_client, notifier=notifier,
+        auto_approve=auto_approve,
     )
 
     print("Registered schedules:")
@@ -415,6 +427,8 @@ async def _cmd_scheduler(args):
     print("  - 12:30 PM ET Mon-Fri: Midday position check")
     print("  - 4:30 PM ET Mon-Fri: Post-market position check")
     print("  - 10:00 AM ET Saturday: Weekly deep dive")
+    if auto_approve:
+        print("  AUTO-APPROVE: ON — recommendations will be executed without human review")
     print()
 
     try:
