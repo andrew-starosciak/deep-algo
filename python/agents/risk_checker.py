@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+from collections import Counter
+from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel
@@ -9,12 +12,15 @@ from pydantic import BaseModel
 from agents.base import BaseAgent
 from openclaw.llm import LLMClient
 
+logger = logging.getLogger(__name__)
+
 
 class RiskCheckerAgent(BaseAgent):
     """Independently verifies risk parameters. Does NOT trust the analyst's assessment."""
 
-    def __init__(self, llm: LLMClient, db: Any = None):
+    def __init__(self, llm: LLMClient, db: Any = None, ib_client: Any = None):
         super().__init__(llm, db)
+        self.ib_client = ib_client
 
     @property
     def role(self) -> str:
@@ -31,14 +37,59 @@ class RiskCheckerAgent(BaseAgent):
         return "risk_verification.md"
 
     async def gather_context(self, input_data: BaseModel) -> dict:
-        """Pull current portfolio state from DB for risk checks."""
+        """Pull current portfolio state from DB + IB for risk checks."""
         if self.db is None:
             return {"portfolio_state": "Database not connected. Use conservative defaults."}
 
-        # TODO: Query current options positions, HL positions, PM positions
-        # Return portfolio state for the LLM to evaluate against
-        return {
-            "portfolio_state": "Portfolio query not yet implemented.",
-            "open_positions_count": 0,
-            "total_exposure_pct": "0.0",
-        }
+        # 1. Account equity from IB (or fallback default)
+        account_equity = Decimal("200000")
+        if self.ib_client:
+            try:
+                summary = await self.ib_client.account_summary()
+                account_equity = summary.net_liquidation
+            except Exception as e:
+                logger.warning("IB account_summary failed, using default $200k: %s", e)
+
+        # 2. Open positions from DB
+        positions = await self.db.get_open_positions()
+        total_exposure = await self.db.get_total_options_exposure()
+
+        # 3. Sector map from watchlist for correlation counting
+        watchlist = await self.db.get_watchlist()
+        sector_map = {w["ticker"]: w.get("sector", "unknown") for w in watchlist}
+
+        # 4. Build human-readable summary for the LLM
+        exposure_pct = (
+            (total_exposure / account_equity * 100) if account_equity > 0 else Decimal("0")
+        )
+
+        lines = [
+            f"Account equity: ${account_equity:,.0f}",
+            f"Open positions: {len(positions)}",
+            f"Total options exposure: ${total_exposure:,.0f} ({exposure_pct:.1f}%)",
+        ]
+
+        if positions:
+            lines.append("\nCurrent positions:")
+            sector_counts: Counter = Counter()
+            for p in positions:
+                ticker = p.get("ticker", "?")
+                right = p.get("right", "?")
+                strike = p.get("strike", "?")
+                expiry = p.get("expiry", "?")
+                cost = p.get("cost_basis", Decimal("0"))
+                pnl = p.get("unrealized_pnl", Decimal("0"))
+                sector = sector_map.get(ticker, "unknown")
+                sector_counts[sector] += 1
+                lines.append(
+                    f"  - {ticker} {strike}{right} exp {expiry} | "
+                    f"cost ${cost:,.0f} | P&L ${pnl:+,.0f} | sector: {sector}"
+                )
+
+            lines.append("\nSector concentration:")
+            for sector, count in sector_counts.most_common():
+                lines.append(f"  - {sector}: {count} position(s)")
+        else:
+            lines.append("\nNo open positions.")
+
+        return {"portfolio_state": "\n".join(lines)}

@@ -115,7 +115,7 @@ def main():
     asyncio.run(_dispatch(args))
 
 
-async def _init_engine(args):
+async def _init_engine(args, ib_client=None):
     """Initialize the workflow engine with agents and DB."""
     from agents.analyst import AnalystAgent
     from agents.researcher import ResearcherAgent
@@ -144,7 +144,7 @@ async def _init_engine(args):
     # Register all agents
     engine.register_agent("researcher", ResearcherAgent(llm=llm, db=db))
     engine.register_agent("analyst", AnalystAgent(llm=llm, db=db))
-    engine.register_agent("risk_checker", RiskCheckerAgent(llm=llm, db=db))
+    engine.register_agent("risk_checker", RiskCheckerAgent(llm=llm, db=db, ib_client=ib_client))
     engine.register_agent("reviewer", ReviewerAgent(llm=llm, db=db))
 
     return engine
@@ -402,9 +402,9 @@ async def _cmd_scheduler(args):
     from openclaw.scheduler import WorkflowScheduler
 
     db = await _init_db(args)
-    engine = await _init_engine(args)
-    notifier = MultiNotifier()
     ib_client = _build_ib_client(args)
+    engine = await _init_engine(args, ib_client=ib_client)
+    notifier = MultiNotifier()
 
     scheduler = WorkflowScheduler(
         engine=engine, db=db, ib_client=ib_client, notifier=notifier,
