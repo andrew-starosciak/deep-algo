@@ -43,6 +43,17 @@ class ContractSpec(BaseModel):
     entry_price_low: Decimal
     entry_price_high: Decimal
 
+    def __str__(self) -> str:
+        side = self.right[0].upper()
+        base = (
+            f"{self.ticker} {self.strike}{side} "
+            f"{self.expiry.strftime('%b %d')} "
+            f"${self.entry_price_low}-${self.entry_price_high}"
+        )
+        if self.strategy != "naked":
+            base += f" ({self.strategy.replace('_', ' ')})"
+        return base
+
 
 class Thesis(BaseModel):
     """A scored trade thesis with optional contract recommendation."""
