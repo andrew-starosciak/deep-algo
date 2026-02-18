@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+from decimal import Decimal
 from typing import Any
 
 import discord
@@ -18,14 +19,15 @@ logger = logging.getLogger(__name__)
 class ApprovalView(View):
     """Interactive buttons for trade recommendation approval."""
 
-    def __init__(self, rec_id: int, db_url: str):
+    def __init__(self, rec_id: int, db_url: str, position_manager: Any = None):
         super().__init__(timeout=None)  # Buttons never expire
         self.rec_id = rec_id
         self.db_url = db_url
+        self.position_manager = position_manager
 
     @discord.ui.button(label="Approve", style=ButtonStyle.success, emoji="✅")
     async def approve_button(self, interaction: Interaction, button: Button):
-        """Handle approve button click."""
+        """Handle approve button click — approve and execute immediately."""
         await interaction.response.defer()
 
         try:
@@ -35,6 +37,7 @@ class ApprovalView(View):
             db = await Database.connect(self.db_url)
             try:
                 await db.approve_recommendation(self.rec_id)
+                rec = await db.get_recommendation(self.rec_id)
             finally:
                 await db.close()
 
@@ -52,11 +55,29 @@ class ApprovalView(View):
                 child.disabled = True
 
             await interaction.message.edit(embed=embed, view=self)
-            await interaction.followup.send(
-                f"✅ Recommendation #{self.rec_id} approved! "
-                f"Position manager will execute on next poll cycle.",
-                ephemeral=True,
-            )
+
+            # Execute immediately via position manager
+            if self.position_manager and rec:
+                await interaction.followup.send(
+                    f"✅ Recommendation #{self.rec_id} approved! Executing now...",
+                    ephemeral=True,
+                )
+                try:
+                    await self.position_manager._execute_recommendation(rec)
+                    await interaction.channel.send(
+                        f"✅ Recommendation #{self.rec_id} executed."
+                    )
+                except Exception as e:
+                    logger.exception("Immediate execution failed for rec %d", self.rec_id)
+                    await interaction.channel.send(
+                        f"⚠️ Recommendation #{self.rec_id} approved but execution failed: {e}"
+                    )
+            else:
+                await interaction.followup.send(
+                    f"✅ Recommendation #{self.rec_id} approved! "
+                    f"Position manager will execute on next tick.",
+                    ephemeral=True,
+                )
 
         except Exception as e:
             logger.exception("Failed to approve recommendation")
@@ -248,6 +269,7 @@ class DiscordBot:
                 "!analyze": self._cmd_analyze,
                 "!portfolio": self._cmd_portfolio,
                 "!tick": self._cmd_tick,
+                "!test-trade": self._cmd_test_trade,
                 "!help": self._cmd_help,
             }
             handler = handlers.get(cmd)
@@ -365,12 +387,15 @@ class DiscordBot:
 
         try:
             channel = await self.get_channel()
-            embed = discord.Embed(title=title, description=description, color=color)
+            embed = discord.Embed(title=title, description=description[:4096] if description else description, color=color)
 
             for field in fields:
+                value = field["value"]
+                if len(value) > 1024:
+                    value = value[:1021] + "..."
                 embed.add_field(
-                    name=field["name"],
-                    value=field["value"],
+                    name=field["name"][:256],
+                    value=value,
                     inline=field.get("inline", False),
                 )
 
@@ -404,8 +429,8 @@ class DiscordBot:
             {"name": "Position Size", "value": f"${size_usd}", "inline": True},
         ]
 
-        # Create interactive buttons
-        view = ApprovalView(rec_id=rec_id, db_url=self.db_url)
+        # Create interactive buttons (pass position manager for immediate execution)
+        view = ApprovalView(rec_id=rec_id, db_url=self.db_url, position_manager=self._position_manager)
 
         await self.send_embed(
             title="🎯 New Trade Recommendation",
@@ -505,6 +530,7 @@ class DiscordBot:
             ("`!analyze <TICKER>`", "Run on-demand trade thesis (~2 min)"),
             ("`!portfolio`", "Account summary, exposure, recent P&L"),
             ("`!tick`", "Force a position manager tick now"),
+            ("`!test-trade <TICKER>`", "Insert a mock recommendation for E2E testing"),
             ("`!help`", "Show this message"),
         ]:
             embed.add_field(name=name, value=desc, inline=False)
@@ -662,14 +688,63 @@ class DiscordBot:
 
         positions = await self._db.get_open_positions()
         exposure = await self._db.get_total_options_exposure()
+        realized_pnl = await self._db.get_total_realized_pnl()
+        closed_count = await self._db.get_closed_positions_count()
 
         embed = discord.Embed(title="Portfolio Summary", color=discord.Color.blue())
-        embed.add_field(name="Total Exposure", value=f"${exposure:,.2f}", inline=True)
+
+        # IB account data (if position manager is connected)
+        if self._position_manager:
+            try:
+                account = await self._position_manager.ib.account_summary()
+                embed.add_field(
+                    name="Net Liquidation",
+                    value=f"${account.net_liquidation:,.2f}",
+                    inline=True,
+                )
+                embed.add_field(
+                    name="Buying Power",
+                    value=f"${account.buying_power:,.2f}",
+                    inline=True,
+                )
+                embed.add_field(
+                    name="Available Funds",
+                    value=f"${account.available_funds:,.2f}",
+                    inline=True,
+                )
+            except Exception as e:
+                logger.warning("Failed to fetch IB account summary: %s", e)
+                embed.add_field(
+                    name="IB Account", value="Unavailable", inline=False,
+                )
+
+        embed.add_field(name="Options Exposure", value=f"${exposure:,.2f}", inline=True)
         embed.add_field(name="Open Positions", value=str(len(positions)), inline=True)
 
-        total_pnl = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
-        pnl_prefix = "+" if total_pnl >= 0 else ""
-        embed.add_field(name="Unrealized P&L", value=f"{pnl_prefix}${total_pnl:,.2f}", inline=True)
+        total_unrealized = sum(float(p.get("unrealized_pnl", 0) or 0) for p in positions)
+        ur_prefix = "+" if total_unrealized >= 0 else ""
+        embed.add_field(
+            name="Unrealized P&L",
+            value=f"{ur_prefix}${total_unrealized:,.2f}",
+            inline=True,
+        )
+
+        r_prefix = "+" if realized_pnl >= 0 else ""
+        embed.add_field(
+            name="Realized P&L",
+            value=f"{r_prefix}${realized_pnl:,.2f} ({closed_count} closed)",
+            inline=True,
+        )
+
+        total_pnl = total_unrealized + float(realized_pnl)
+        t_prefix = "+" if total_pnl >= 0 else ""
+        color = discord.Color.green() if total_pnl >= 0 else discord.Color.red()
+        embed.color = color
+        embed.add_field(
+            name="Total P&L",
+            value=f"**{t_prefix}${total_pnl:,.2f}**",
+            inline=True,
+        )
 
         if positions:
             lines = []
@@ -698,6 +773,116 @@ class DiscordBot:
         except Exception as e:
             logger.exception("!tick failed")
             await channel.send(f"Position tick failed: {e}")
+
+    async def _cmd_test_trade(self, channel, args: list[str]) -> None:
+        """Insert a recommendation using real market data for E2E testing."""
+        if not self._db:
+            await channel.send("Database not connected.")
+            return
+        if not self._position_manager:
+            await channel.send("Position manager not connected — cannot query market data.")
+            return
+
+        import datetime as dt
+        from schemas.thesis import ContractSpec
+
+        ticker = args[0].upper() if args else "AAPL"
+        ib = self._position_manager.ib
+
+        await channel.send(f"Fetching live market data for **{ticker}**...")
+
+        try:
+            # 1. Get current stock price
+            stock_price = await ib.get_stock_price(ticker)
+
+            # 2. Find option expiry ~30 days out
+            expirations = await ib.get_option_expirations(ticker)
+            target_date = dt.date.today() + dt.timedelta(days=30)
+            expiry = min(expirations, key=lambda d: abs((d - target_date).days))
+
+            # 3. Pick ATM strike (round to nearest $5)
+            strike = round(float(stock_price) / 5) * 5
+            strike_dec = Decimal(str(strike))
+
+            # 4. Get real option quote
+            spec = ContractSpec(
+                ticker=ticker,
+                right="call",
+                strike=strike_dec,
+                expiry=expiry,
+                entry_price_low=Decimal("0"),
+                entry_price_high=Decimal("999"),
+            )
+            quote = await ib.get_option_quote(spec)
+
+            entry_low = quote.bid if quote.bid > 0 else quote.mid * Decimal("0.95")
+            entry_high = quote.ask if quote.ask > 0 else quote.mid * Decimal("1.05")
+
+            price_per_contract = quote.mid * 100  # Options multiplier
+
+            await channel.send(
+                f"**{ticker}** stock @ ${stock_price:.2f} | "
+                f"C{strike} exp {expiry} — "
+                f"bid ${quote.bid:.2f} / ask ${quote.ask:.2f} / mid ${quote.mid:.2f} | "
+                f"IV {quote.iv:.1%} delta {quote.delta:.2f}\n"
+                f"**1 contract = ${price_per_contract:.2f}**"
+            )
+
+            # 5. Size: 1 contract for test trades (paper accounts have inflated equity)
+            position_size_usd = price_per_contract
+
+            # 6. Create workflow run + thesis + recommendation with real data
+            run_id = await self._db.create_workflow_run(
+                "test-trade", "manual", {"ticker": ticker}
+            )
+
+            thesis_id = await self._db.save_thesis(run_id, {
+                "ticker": ticker,
+                "direction": "bullish",
+                "thesis_text": f"E2E test trade for {ticker} @ ${stock_price:.2f}",
+                "catalyst": json.dumps({"type": "other", "description": "Manual E2E test"}),
+                "scores": {"overall": 7, "information_edge": 7, "volatility_pricing": 7,
+                           "technical_alignment": 7, "catalyst_clarity": 7, "risk_reward_ratio": 2.0},
+                "supporting_evidence": [f"Stock price: ${stock_price:.2f}"],
+                "risks": ["This is a test trade"],
+            })
+
+            rec_data = {
+                "contract": {
+                    "ticker": ticker,
+                    "right": "call",
+                    "strike": str(strike),
+                    "expiry": expiry.isoformat(),
+                    "entry_price_low": str(entry_low),
+                    "entry_price_high": str(entry_high),
+                },
+                "position_size_pct": "2.0",
+                "position_size_usd": str(position_size_usd),
+                "exit_targets": ["+50% sell half", "+100% close"],
+                "stop_loss": "-50% hard stop",
+                "max_hold_days": 30,
+                "risk_verification": {"approved": True, "position_size_pct": 2.0,
+                                      "max_loss_usd": float(position_size_usd)},
+            }
+            rec_id = await self._db.save_recommendation(thesis_id, run_id, rec_data)
+
+            # 7. Send approval embed
+            await self.send_recommendation({
+                "id": rec_id,
+                "ticker": ticker,
+                "direction": "bullish",
+                "contract": f"{ticker} C{strike} {expiry}",
+                "position_size_usd": str(position_size_usd),
+                "overall_score": 7,
+            })
+
+            await channel.send(
+                "Click **Approve** above to execute immediately via IB Gateway."
+            )
+
+        except Exception as e:
+            logger.exception("!test-trade failed")
+            await channel.send(f"Failed to create test trade: {e}")
 
     async def close(self):
         """Shutdown the Discord bot."""

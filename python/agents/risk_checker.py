@@ -42,10 +42,15 @@ class RiskCheckerAgent(BaseAgent):
             return {"portfolio_state": "Database not connected. Use conservative defaults."}
 
         # 1. Account equity from IB (or fallback default)
+        #    Timeout required: accountSummaryAsync can deadlock when the position
+        #    manager tick loop is competing for the same ib_async connection.
         account_equity = Decimal("200000")
         if self.ib_client:
             try:
-                summary = await self.ib_client.account_summary()
+                import asyncio
+                summary = await asyncio.wait_for(
+                    self.ib_client.account_summary(), timeout=10.0
+                )
                 account_equity = summary.net_liquidation
             except Exception as e:
                 logger.warning("IB account_summary failed, using default $200k: %s", e)
