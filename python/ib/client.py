@@ -372,7 +372,16 @@ class IBClient:
             )
 
         if order_type == "LMT" and limit_price is not None:
-            order = LimitOrder(side, quantity, float(limit_price))
+            # Options tick rules: $0.05 increments for premiums >= $3, else $0.01.
+            # Round BUY up and SELL down to the nearest valid tick to improve fill odds.
+            tick = Decimal("0.05") if limit_price >= 3 else Decimal("0.01")
+            if side.upper() == "BUY":
+                rounded = (limit_price / tick).to_integral_value(rounding="ROUND_CEILING") * tick
+            else:
+                rounded = (limit_price / tick).to_integral_value(rounding="ROUND_FLOOR") * tick
+            if rounded != limit_price:
+                logger.info("Rounded limit %s → %s (tick=%s)", limit_price, rounded, tick)
+            order = LimitOrder(side, quantity, float(rounded))
         else:
             order = MarketOrder(side, quantity)
 
@@ -382,7 +391,7 @@ class IBClient:
         # Use asyncio.sleep instead of waitOnUpdate to avoid
         # "event loop already running" error in async contexts.
         elapsed = 0
-        while not trade.isDone():
+        while True:
             await asyncio.sleep(2)
             elapsed += 2
 
@@ -392,14 +401,19 @@ class IBClient:
                 trade.order.orderId, status, elapsed,
             )
 
+            if status == "Filled":
+                break
+
             # PreSubmitted = accepted by IB but waiting for market open.
-            # Return immediately with the order details.
-            if status == "PreSubmitted":
+            # Submitted = live order working in the market (after-hours or during market).
+            # Return immediately with pending=True — the position will appear in
+            # IB's portfolio once the order fills and _sync_positions will pick it up.
+            if status in ("PreSubmitted", "Submitted"):
                 logger.info(
-                    "Order %d PreSubmitted (after-hours) — will fill at market open",
-                    trade.order.orderId,
+                    "Order %d %s — accepted by IB (pending fill)",
+                    trade.order.orderId, status,
                 )
-                fill_price = limit_price or Decimal("0")
+                fill_price = rounded if order_type == "LMT" and limit_price is not None else (limit_price or Decimal("0"))
                 return Fill(
                     order_id=trade.order.orderId,
                     symbol=contract.ticker,
@@ -409,6 +423,24 @@ class IBClient:
                     commission=Decimal("0"),
                     filled_at=_dt.datetime.now(_dt.UTC),
                     con_id=ib_contract.conId if ib_contract.conId else None,
+                    pending=True,
+                )
+
+            # Error 10349 = IB changed TIF to DAY due to preset. The order is still
+            # live — IB sends Cancelled then Submitted. Wait for the real status.
+            if status == "Cancelled":
+                has_tif_warning = any(
+                    e.errorCode == 10349 for e in trade.log
+                )
+                if has_tif_warning and elapsed < 10:
+                    logger.info(
+                        "Order %d Cancelled with TIF preset warning (10349) — "
+                        "waiting for real status", trade.order.orderId,
+                    )
+                    continue
+                raise RuntimeError(
+                    f"Order not filled: {trade.orderStatus.status} — "
+                    f"{trade.orderStatus.whyHeld}"
                 )
 
             if elapsed >= _ORDER_FILL_TIMEOUT_SECS:
@@ -416,11 +448,6 @@ class IBClient:
                 raise TimeoutError(
                     f"Order not filled within {_ORDER_FILL_TIMEOUT_SECS}s — cancelled"
                 )
-
-        if trade.orderStatus.status != "Filled":
-            raise RuntimeError(
-                f"Order not filled: {trade.orderStatus.status} — {trade.orderStatus.whyHeld}"
-            )
 
         avg_price = Decimal(str(trade.orderStatus.avgFillPrice))
         commission = sum(Decimal(str(f.commission)) for f in trade.fills if f.commission)

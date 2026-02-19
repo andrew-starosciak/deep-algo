@@ -38,6 +38,7 @@ class Fill(BaseModel):
     commission: Decimal
     filled_at: _dt.datetime
     con_id: int | None = None
+    pending: bool = False  # True when order is Submitted but not yet Filled
 
 
 class IBPortfolioItem(BaseModel):

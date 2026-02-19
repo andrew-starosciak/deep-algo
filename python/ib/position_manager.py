@@ -117,7 +117,11 @@ class PositionManager:
                 )
             else:
                 # New position not in our DB — insert as external
-                cost_basis = ib_item.avg_cost * abs(ib_item.position) * 100
+                # IB avgCost for options includes the 100x multiplier
+                # (e.g. avgCost=790.59 means $7.91/share × 100)
+                qty = abs(ib_item.position)
+                per_share = ib_item.avg_cost / 100 if ib_item.sec_type == "OPT" else ib_item.avg_cost
+                cost_basis = ib_item.avg_cost * qty  # avg_cost already has multiplier
                 pos_id = await self.db.insert_position({
                     "recommendation_id": None,
                     "ib_con_id": ib_item.con_id,
@@ -125,8 +129,8 @@ class PositionManager:
                     "right": ib_item.right,
                     "strike": ib_item.strike,
                     "expiry": ib_item.expiry,
-                    "quantity": abs(ib_item.position),
-                    "avg_fill_price": ib_item.avg_cost,
+                    "quantity": qty,
+                    "avg_fill_price": per_share,
                     "current_price": ib_item.market_price,
                     "cost_basis": cost_basis,
                     "unrealized_pnl": ib_item.unrealized_pnl,
@@ -220,33 +224,45 @@ class PositionManager:
                 limit_price=limit_price,
             )
 
-            # Record position in DB — keep Decimal throughout
-            cost_basis = fill.avg_fill_price * fill.quantity * 100
-            await self.db.insert_position({
-                "recommendation_id": rec_id,
-                "ib_con_id": fill.con_id,
-                "ticker": ticker,
-                "right": rec["right"],
-                "strike": Decimal(str(rec["strike"])),
-                "expiry": rec["expiry"],
-                "quantity": fill.quantity,
-                "avg_fill_price": fill.avg_fill_price,
-                "current_price": fill.avg_fill_price,
-                "cost_basis": cost_basis,
-                "unrealized_pnl": Decimal("0"),
-                "status": "open",
-            })
+            if fill.pending:
+                # Order accepted but not yet filled (after-hours / working order).
+                # Don't insert a position — _sync_positions will create it when the
+                # order fills and appears in IB's portfolio with correct avg cost.
+                await self.db.update_recommendation_status(rec_id, "submitted")
+                logger.info(
+                    "Submitted rec %d: BUY %d %s %s %s @ %s (pending fill)",
+                    rec_id, fill.quantity, ticker,
+                    rec["right"], rec["strike"], fill.avg_fill_price,
+                )
+            else:
+                # Immediately filled — record position in DB
+                cost_basis = fill.avg_fill_price * fill.quantity * 100
+                await self.db.insert_position({
+                    "recommendation_id": rec_id,
+                    "ib_con_id": fill.con_id,
+                    "ticker": ticker,
+                    "right": rec["right"],
+                    "strike": Decimal(str(rec["strike"])),
+                    "expiry": rec["expiry"],
+                    "quantity": fill.quantity,
+                    "avg_fill_price": fill.avg_fill_price,
+                    "current_price": fill.avg_fill_price,
+                    "cost_basis": cost_basis,
+                    "unrealized_pnl": Decimal("0"),
+                    "status": "open",
+                })
 
-            await self.db.update_recommendation_status(rec_id, "filled")
-            logger.info(
-                "Executed rec %d: BUY %d %s %s %s @ %s",
-                rec_id, fill.quantity, ticker,
-                rec["right"], rec["strike"], fill.avg_fill_price,
-            )
+                await self.db.update_recommendation_status(rec_id, "filled")
+                logger.info(
+                    "Executed rec %d: BUY %d %s %s %s @ %s",
+                    rec_id, fill.quantity, ticker,
+                    rec["right"], rec["strike"], fill.avg_fill_price,
+                )
 
             if self.notifier:
+                label = "*Submitted*" if fill.pending else "*Filled*"
                 await self.notifier.send(
-                    f"*Filled* rec #{rec_id}: {fill.quantity}x {ticker} "
+                    f"{label} rec #{rec_id}: {fill.quantity}x {ticker} "
                     f"{rec['right']} {rec['strike']} @ ${fill.avg_fill_price}"
                 )
 
