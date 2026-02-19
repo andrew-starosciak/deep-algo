@@ -335,14 +335,11 @@ pub fn sign_hash(hash: &[u8; 32], private_key_hex: &str) -> Result<String, Eip71
 /// Matches Python SDK's ROUNDING_CONFIG for $0.01 tick markets:
 ///   price=2dp (round_normal), size=2dp (round_down), amount=4dp
 ///
-/// API precision constraints differ by order type:
-/// - FOK BUY: maker (USDC out) max 2dp, taker (shares in) max 4dp
-/// - FAK/GTC BUY: maker (USDC out) must be exact product (up to 4dp)
+/// API precision constraints:
+/// - BUY: maker (USDC out) max 2dp for ALL order types, taker (shares in) max 4dp
 /// - SELL: maker (shares out) max 2dp, taker (USDC in) max 4dp
 ///
-/// The `maker_amount_dp` parameter controls BUY maker rounding:
-/// - 2 for FOK (CLOB enforces max 2dp for market buy maker)
-/// - 4 for FAK/GTC (CLOB expects exact size * price product)
+/// The `maker_amount_dp` parameter controls BUY maker rounding (always 2).
 pub fn calculate_amounts(
     side: u8,
     price: Decimal,
@@ -370,8 +367,7 @@ pub fn calculate_amounts(
 
     let (maker_amount, taker_amount) = if side == SIDE_BUY {
         // BUY: taker = shares we receive, maker = USDC we pay.
-        // FOK (maker_amount_dp=2): CLOB enforces max 2dp for market buy maker.
-        // FAK/GTC (maker_amount_dp=4): CLOB expects exact product (2dp × 2dp = 4dp).
+        // CLOB enforces max 2dp for BUY maker on all order types (FOK, FAK, GTC).
         let taker_natural = size_rounded;
         let maker_natural = round_down(taker_natural * price_tick, maker_amount_dp);
         let taker_raw = (taker_natural * scale).floor();
@@ -541,9 +537,7 @@ pub struct BuildOrderParams<'a> {
     pub nonce: u64,
     /// Fee rate in basis points (e.g., 100 = 1%).
     pub fee_rate_bps: u16,
-    /// Decimal places for BUY maker_amount rounding.
-    /// FOK orders: 2 (CLOB enforces max 2dp for market buy maker).
-    /// FAK/GTC orders: 4 (CLOB expects exact product).
+    /// Decimal places for BUY maker_amount rounding (always 2 — CLOB enforces).
     pub maker_amount_dp: u32,
 }
 
@@ -662,22 +656,14 @@ mod tests {
     }
 
     #[test]
-    fn calculate_amounts_fok_rounds_to_2dp() {
-        // FOK BUY: price=0.19, size=10.752688
+    fn calculate_amounts_buy_rounds_maker_to_2dp() {
+        // BUY: price=0.19, size=10.752688
         // size_rounded = 10.75, maker = 10.75 * 0.19 = 2.0425 → round_down 2dp = 2.04
+        // CLOB enforces max 2dp for BUY maker on all order types.
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.19), dec!(10.752688), 2).unwrap();
         assert_eq!(taker, 10_750_000);
-        assert_eq!(maker, 2_040_000); // FOK: round_down(2.0425, 2) = 2.04
-    }
-
-    #[test]
-    fn calculate_amounts_fak_keeps_exact_4dp() {
-        // FAK BUY: same price/size but 4dp precision preserves exact product
-        let (maker, taker) =
-            calculate_amounts(SIDE_BUY, dec!(0.19), dec!(10.752688), 4).unwrap();
-        assert_eq!(taker, 10_750_000);
-        assert_eq!(maker, 2_042_500); // FAK: exact 10.75 * 0.19 = 2.0425
+        assert_eq!(maker, 2_040_000); // round_down(2.0425, 2) = 2.04
     }
 
     #[test]
@@ -699,31 +685,33 @@ mod tests {
     }
 
     #[test]
-    fn calculate_amounts_fok_buy_rounds_3dp_to_2dp() {
-        // FOK BUY: price=0.30, size=5.55 → maker = 1.665 (3dp) → round_down 2dp = 1.66
+    fn calculate_amounts_buy_rounds_3dp_to_2dp() {
+        // BUY: price=0.30, size=5.55 → maker = 1.665 (3dp) → round_down 2dp = 1.66
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.30), dec!(5.5555555), 2).unwrap();
         assert_eq!(taker, 5_550_000);
-        assert_eq!(maker, 1_660_000); // FOK: round_down(1.665, 2) = 1.66
+        assert_eq!(maker, 1_660_000); // round_down(1.665, 2) = 1.66
     }
 
     #[test]
-    fn calculate_amounts_fak_buy_keeps_3dp_as_4dp() {
-        // FAK BUY: same as above but 4dp → 1.665 preserved
+    fn calculate_amounts_fak_retry_at_077() {
+        // Regression: FAK retry at $0.77 for 7.52 shares.
+        // 7.52 * 0.77 = 5.7904 → round_down 2dp = 5.79
+        // CLOB enforces 2dp for ALL order types including FAK.
         let (maker, taker) =
-            calculate_amounts(SIDE_BUY, dec!(0.30), dec!(5.5555555), 4).unwrap();
-        assert_eq!(taker, 5_550_000);
-        assert_eq!(maker, 1_665_000); // FAK: exact 5.55 * 0.30 = 1.665
+            calculate_amounts(SIDE_BUY, dec!(0.77), dec!(7.52), 2).unwrap();
+        assert_eq!(taker, 7_520_000);
+        assert_eq!(maker, 5_790_000); // round_down(5.7904, 2) = 5.79
     }
 
     #[test]
-    fn calculate_amounts_fak_retry_price() {
+    fn calculate_amounts_fak_retry_at_081() {
         // Regression: FAK retry at $0.81 for 7.09 shares.
-        // 7.09 * 0.81 = 5.7429 — CLOB expects exact 4dp product for FAK.
+        // 7.09 * 0.81 = 5.7429 → round_down 2dp = 5.74
         let (maker, taker) =
-            calculate_amounts(SIDE_BUY, dec!(0.81), dec!(7.09), 4).unwrap();
+            calculate_amounts(SIDE_BUY, dec!(0.81), dec!(7.09), 2).unwrap();
         assert_eq!(taker, 7_090_000);
-        assert_eq!(maker, 5_742_900); // FAK: exact 7.09 * 0.81 = 5.7429
+        assert_eq!(maker, 5_740_000); // round_down(5.7429, 2) = 5.74
     }
 
     #[test]
@@ -733,12 +721,12 @@ mod tests {
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.83), dec!(6.45), 2).unwrap();
         assert_eq!(taker, 6_450_000);
-        assert_eq!(maker, 5_350_000); // FOK: round_down(5.3535, 2) = 5.35
+        assert_eq!(maker, 5_350_000); // round_down(5.3535, 2) = 5.35
     }
 
     #[test]
     fn calculate_amounts_buy_exact_2dp_no_change() {
-        // When maker is already 2dp, both FOK (2dp) and FAK (4dp) give same result.
+        // When maker is already 2dp, no rounding needed.
         let (maker, taker) =
             calculate_amounts(SIDE_BUY, dec!(0.50), dec!(10), 2).unwrap();
         assert_eq!(taker, 10_000_000);

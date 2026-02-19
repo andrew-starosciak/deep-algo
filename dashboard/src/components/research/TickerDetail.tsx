@@ -84,8 +84,8 @@ export default function TickerDetail({ ticker }: Props) {
         </h2>
         {thesesData?.theses?.length ? (
           <div className="flex flex-col gap-3">
-            {thesesData.theses.map((t) => (
-              <ThesisCard key={t.id} thesis={t} />
+            {thesesData.theses.map((t, i) => (
+              <ThesisCard key={t.id} thesis={t} expanded={i === 0} />
             ))}
           </div>
         ) : (

@@ -1357,12 +1357,8 @@ impl ClobClient {
             neg_risk: self.config.neg_risk,
         };
 
-        // FOK: CLOB enforces max 2dp for BUY maker_amount.
-        // FAK/GTC: CLOB expects exact product (up to 4dp).
-        let maker_amount_dp = match params.order_type {
-            OrderType::Fok => 2,
-            OrderType::Fak | OrderType::Gtc => 4,
-        };
+        // CLOB enforces max 2dp for BUY maker_amount on all order types.
+        let maker_amount_dp = 2;
 
         let order = eip712::build_order(&eip712::BuildOrderParams {
             maker_address: self.wallet.address(),

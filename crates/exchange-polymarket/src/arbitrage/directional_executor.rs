@@ -563,12 +563,15 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
                         Ok(0) => {}
                         Ok(n) => {
                             info!(redeemed = n, "Auto-redeemed {} resolved positions", n);
+                            // Wait for CLOB API to index the on-chain redemption
+                            tokio::time::sleep(Duration::from_secs(10)).await;
                             let mut stats = self.stats.write().await;
                             stats.current_balance = self
                                 .executor
                                 .get_balance()
                                 .await
                                 .unwrap_or(stats.current_balance);
+                            info!(balance = %stats.current_balance, "Balance after redemption");
                         }
                         Err(e) => warn!(error = %e, "Auto-redeem check FAILED"),
                     }
