@@ -105,6 +105,10 @@ pub struct DirectionalExecutorConfig {
     /// Number of retry attempts with FAK at progressively aggressive prices.
     /// 0 = no retry (FOK only). Default: 1.
     pub max_retries: u32,
+
+    /// Maximum price to pay for an entry (hard cap on slippage + retries).
+    /// Orders above this price are skipped entirely.
+    pub max_entry_price: Decimal,
 }
 
 impl Default for DirectionalExecutorConfig {
@@ -123,6 +127,7 @@ impl Default for DirectionalExecutorConfig {
             settlement_interval_secs: 30,
             buy_slippage: dec!(0.05),
             max_retries: 1,
+            max_entry_price: dec!(0.85),
         }
     }
 }
@@ -695,9 +700,9 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
             return;
         }
 
-        // Apply slippage: round UP to $0.01 tick grid, cap at $0.99
+        // Apply slippage: round UP to $0.01 tick grid, cap at max_entry_price
         let aggressive_price = ((signal.entry_price + self.config.buy_slippage) * dec!(100)).ceil() / dec!(100);
-        let aggressive_price = aggressive_price.min(dec!(0.99));
+        let aggressive_price = aggressive_price.min(self.config.max_entry_price);
 
         // Submit FOK buy order at slippage-adjusted price
         let order = OrderParams::buy_fok(
@@ -737,7 +742,7 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
         if result.status == OrderStatus::Rejected && self.config.max_retries > 0 {
             for attempt in 1..=self.config.max_retries {
                 let retry_price = ((aggressive_price + self.config.buy_slippage * Decimal::from(attempt)) * dec!(100)).ceil() / dec!(100);
-                let retry_price = retry_price.min(dec!(0.99));
+                let retry_price = retry_price.min(self.config.max_entry_price);
 
                 info!(
                     coin = signal.coin,
@@ -1714,6 +1719,7 @@ mod tests {
         assert_eq!(config.fee_rate, dec!(0.02));
         assert_eq!(config.buy_slippage, dec!(0.05));
         assert_eq!(config.max_retries, 1);
+        assert_eq!(config.max_entry_price, dec!(0.85));
     }
 
     #[test]

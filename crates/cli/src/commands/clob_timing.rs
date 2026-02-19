@@ -214,6 +214,8 @@ pub async fn run(args: ClobTimingArgs) -> Result<()> {
         settlement_interval_secs: 30,
         buy_slippage: dec!(0.05),
         max_retries: 1,
+        max_entry_price: Decimal::from_str(&format!("{:.2}", args.max_entry_price))
+            .unwrap_or(dec!(0.85)),
     };
 
     // Create runner

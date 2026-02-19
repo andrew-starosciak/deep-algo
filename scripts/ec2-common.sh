@@ -47,7 +47,7 @@ STATE_FILE="${SCRIPT_DIR:?SCRIPT_DIR must be set before sourcing ec2-common.sh}/
 KEY_FILE="$SCRIPT_DIR/.aws-latency-key.pem"
 
 SSH_USER="ubuntu"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
 
 REMOTE_DB_USER="algo"
 REMOTE_DB_PASS="algo_trade_local"
