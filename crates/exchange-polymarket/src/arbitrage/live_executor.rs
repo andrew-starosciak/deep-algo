@@ -896,6 +896,14 @@ impl PolymarketExecutor for LiveExecutor {
         Ok(results)
     }
 
+    async fn cancel_all_orders(&self) -> Result<u32, ExecutionError> {
+        self.wait_for_order_cancel().await;
+        self.client
+            .cancel_all_orders()
+            .await
+            .map_err(|e| self.handle_clob_error(e, false))
+    }
+
     async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
         // Wait for rate limit
         self.wait_for_order_cancel().await;

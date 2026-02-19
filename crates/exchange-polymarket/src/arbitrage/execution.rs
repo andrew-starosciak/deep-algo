@@ -604,6 +604,9 @@ pub trait PolymarketExecutor: Send + Sync {
         timeout: Duration,
     ) -> Result<OrderResult, ExecutionError>;
 
+    /// Cancels all open orders for this wallet.
+    async fn cancel_all_orders(&self) -> Result<u32, ExecutionError>;
+
     /// Gets all current positions.
     ///
     /// # Returns

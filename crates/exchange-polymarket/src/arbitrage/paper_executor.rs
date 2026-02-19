@@ -523,6 +523,10 @@ impl PolymarketExecutor for PaperExecutor {
         Ok(results)
     }
 
+    async fn cancel_all_orders(&self) -> Result<u32, ExecutionError> {
+        Ok(0) // Paper executor has no resting orders
+    }
+
     async fn cancel_order(&self, order_id: &str) -> Result<(), ExecutionError> {
         let mut state = self.state.write();
 

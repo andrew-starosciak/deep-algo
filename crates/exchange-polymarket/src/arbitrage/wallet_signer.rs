@@ -92,6 +92,7 @@ impl OrderSigner for WalletSigner {
             expiration_secs: expiration,
             nonce: nonce_u64,
             fee_rate_bps: 0, // CLOB handles fees
+            maker_amount_dp: 2, // Pre-signed orders use FOK (2dp)
         })
         .map_err(|e: Eip712Error| PreSignedError::SigningFailed(e.to_string()))?;
 

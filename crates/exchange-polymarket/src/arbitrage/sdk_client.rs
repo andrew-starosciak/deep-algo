@@ -1155,6 +1155,51 @@ impl ClobClient {
         Ok(())
     }
 
+    /// Cancels all open orders for this wallet.
+    pub async fn cancel_all_orders(&self) -> Result<u32, ClobError> {
+        if !self.is_authenticated() {
+            return Err(ClobError::Auth("Client not authenticated".to_string()));
+        }
+
+        let l2_auth = self
+            .l2_auth
+            .as_ref()
+            .ok_or_else(|| ClobError::Auth("L2 auth not initialized".to_string()))?;
+
+        let url = format!("{}/cancel-all", self.config.base_url);
+        info!("Cancelling all open orders");
+
+        let l2_headers = l2_auth
+            .headers("DELETE", "/cancel-all", "")
+            .map_err(|e| ClobError::Auth(format!("L2 header generation failed: {}", e)))?;
+
+        let response = self
+            .wreq_http
+            .delete(&url)
+            .header("POLY_ADDRESS", &l2_headers.address)
+            .header("POLY_SIGNATURE", &l2_headers.signature)
+            .header("POLY_TIMESTAMP", &l2_headers.timestamp)
+            .header("POLY_API_KEY", &l2_headers.api_key)
+            .header("POLY_PASSPHRASE", &l2_headers.passphrase)
+            .send()
+            .await
+            .map_err(|e| ClobError::Api {
+                status: 0,
+                message: format!("wreq DELETE /cancel-all failed: {e}"),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status().as_u16();
+            let body = response.text().await.unwrap_or_default();
+            warn!(status, body = %body, "Cancel-all request failed");
+            return Ok(0);
+        }
+
+        let body = response.text().await.unwrap_or_default();
+        info!(response = %body, "Cancel-all response");
+        Ok(1)
+    }
+
     /// Fetches the L2 order book for a token from the CLOB REST API.
     ///
     /// Public endpoint — no authentication required.
@@ -1312,6 +1357,13 @@ impl ClobClient {
             neg_risk: self.config.neg_risk,
         };
 
+        // FOK: CLOB enforces max 2dp for BUY maker_amount.
+        // FAK/GTC: CLOB expects exact product (up to 4dp).
+        let maker_amount_dp = match params.order_type {
+            OrderType::Fok => 2,
+            OrderType::Fak | OrderType::Gtc => 4,
+        };
+
         let order = eip712::build_order(&eip712::BuildOrderParams {
             maker_address: self.wallet.address(),
             token_id: &params.token_id,
@@ -1321,6 +1373,7 @@ impl ClobClient {
             expiration_secs,
             nonce,
             fee_rate_bps: self.config.taker_fee_bps,
+            maker_amount_dp,
         })
         .map_err(|e| ClobError::Signing(format!("Failed to build order: {}", e)))?;
 
@@ -1341,7 +1394,7 @@ impl ClobClient {
 
         let order_type_str = match params.order_type {
             OrderType::Fok => "FOK",
-            OrderType::Fak => "IOC", // FAK maps to IOC (Immediate-Or-Cancel) for partial fills
+            OrderType::Fak => "FAK", // Fill-And-Kill (Polymarket's term for IOC)
             OrderType::Gtc => "GTC",
         };
 

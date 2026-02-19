@@ -517,6 +517,13 @@ impl<E: PolymarketExecutor> DirectionalExecutor<E> {
         chainlink_tick.tick().await;
         redeem_tick.tick().await;
 
+        // Cancel any stale open orders from previous sessions
+        match self.executor.cancel_all_orders().await {
+            Ok(0) => {}
+            Ok(n) => info!(cancelled = n, "Cancelled stale open orders on startup"),
+            Err(e) => warn!(error = %e, "Failed to cancel stale orders on startup"),
+        }
+
         // Redeem any resolved positions on startup
         match self.executor.redeem_resolved_positions().await {
             Ok(0) => info!("No redeemable positions found on startup"),
