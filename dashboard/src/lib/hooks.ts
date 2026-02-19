@@ -8,6 +8,7 @@ import type {
   Recommendation,
   WatchlistItem,
   Position,
+  WorkflowsResponse,
 } from "./types";
 
 const REFRESH_MS = 30_000;
@@ -81,5 +82,12 @@ export function useSystemStatus() {
   return useSWR<SystemStatus>("/api/status", fetcher, {
     ...defaults,
     refreshInterval: REFRESH_MS,
+  });
+}
+
+export function useWorkflows() {
+  return useSWR<WorkflowsResponse>("/api/workflows", fetcher, {
+    ...defaults,
+    refreshInterval: 60_000,
   });
 }

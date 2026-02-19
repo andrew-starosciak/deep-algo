@@ -31,3 +31,53 @@ async def watchlist(request: Request):
     db = request.app.state.db
     rows = await db.get_watchlist()
     return {"count": len(rows), "watchlist": [serialize_row(r) for r in rows]}
+
+
+@router.get("/workflows")
+async def workflows(request: Request):
+    db = request.app.state.db
+    runs = await db.get_workflow_runs_with_steps(limit=20)
+
+    total = len(runs)
+    completed = sum(1 for r in runs if r["status"] == "completed")
+    failed = sum(1 for r in runs if r["status"] == "failed")
+    durations = [r["duration_ms"] for r in runs if r["duration_ms"] is not None]
+    avg_duration = int(sum(durations) / len(durations)) if durations else 0
+
+    from datetime import date, datetime
+
+    today = date.today()
+    runs_today = sum(
+        1 for r in runs
+        if r.get("started_at") and (
+            r["started_at"].date() == today
+            if isinstance(r["started_at"], datetime)
+            else False
+        )
+    )
+
+    # Get last equity snapshot timestamp for position manager health
+    try:
+        last_tick = await db.pool.fetchval(
+            "SELECT MAX(timestamp) FROM equity_snapshots"
+        )
+    except Exception:
+        last_tick = None
+
+    serialized_runs = []
+    for r in runs:
+        sr = serialize_row(r)
+        sr["steps"] = [serialize_row(s) for s in r.get("steps", [])]
+        serialized_runs.append(sr)
+
+    return {
+        "runs": serialized_runs,
+        "stats": {
+            "total_runs": total,
+            "completed": completed,
+            "failed": failed,
+            "avg_duration_ms": avg_duration,
+            "runs_today": runs_today,
+        },
+        "last_equity_tick": last_tick.isoformat() if last_tick else None,
+    }

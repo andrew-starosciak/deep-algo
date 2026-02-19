@@ -98,3 +98,30 @@ export interface SystemStatus {
   db_connected: boolean;
   recent_workflows: WorkflowRun[];
 }
+
+export interface WorkflowStep {
+  step_id: string;
+  agent: string;
+  passed_gate: boolean;
+  duration_ms: number;
+  attempt: number;
+}
+
+export interface WorkflowRunWithSteps extends WorkflowRun {
+  duration_ms: number | null;
+  steps: WorkflowStep[];
+}
+
+export interface WorkflowStats {
+  total_runs: number;
+  completed: number;
+  failed: number;
+  avg_duration_ms: number;
+  runs_today: number;
+}
+
+export interface WorkflowsResponse {
+  runs: WorkflowRunWithSteps[];
+  stats: WorkflowStats;
+  last_equity_tick: string | null;
+}

@@ -379,6 +379,54 @@ class Database:
         )
         return [dict(r) for r in rows]
 
+    async def get_workflow_runs_with_steps(self, limit: int = 20) -> list[dict]:
+        """Fetch recent workflow runs with their step logs grouped under each run."""
+        rows = await self.pool.fetch(
+            """
+            SELECT
+                r.id, r.workflow_id, r.trigger, r.status,
+                r.started_at, r.completed_at,
+                s.step_id, s.agent, s.passed_gate, s.duration_ms AS step_duration_ms,
+                s.attempt
+            FROM workflow_runs r
+            LEFT JOIN workflow_step_logs s ON s.run_id = r.id
+            ORDER BY r.started_at DESC, s.id ASC
+            """,
+        )
+        # Group rows by run id, preserving order
+        from collections import OrderedDict
+
+        runs_map: OrderedDict[int, dict] = OrderedDict()
+        for row in rows:
+            rid = row["id"]
+            if rid not in runs_map:
+                dur = row["completed_at"] and row["started_at"] and (
+                    row["completed_at"] - row["started_at"]
+                )
+                runs_map[rid] = {
+                    "id": rid,
+                    "workflow_id": row["workflow_id"],
+                    "trigger": row["trigger"],
+                    "status": row["status"],
+                    "started_at": row["started_at"],
+                    "completed_at": row["completed_at"],
+                    "duration_ms": int(dur.total_seconds() * 1000) if dur else None,
+                    "steps": [],
+                }
+            if row["step_id"] is not None:
+                runs_map[rid]["steps"].append({
+                    "step_id": row["step_id"],
+                    "agent": row["agent"],
+                    "passed_gate": row["passed_gate"],
+                    "duration_ms": int(row["step_duration_ms"]) if row["step_duration_ms"] is not None else None,
+                    "attempt": row["attempt"],
+                })
+
+        result = list(runs_map.values())
+        if len(result) > limit:
+            result = result[:limit]
+        return result
+
     # --- Equity snapshots ---
 
     async def insert_equity_snapshot(
