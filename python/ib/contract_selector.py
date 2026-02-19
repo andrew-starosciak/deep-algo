@@ -23,6 +23,8 @@ class SelectorConfig:
 
     # Expiry: at least this multiple of catalyst_timeline_days
     expiry_multiple: float = 2.0
+    # Absolute minimum DTE to avoid steep theta decay
+    min_dte: int = 30
     # Target OTM%: fraction of expected_move_pct (e.g. 0.5 = half the expected move)
     otm_fraction: float = 0.5
     # Maximum OTM% to allow
@@ -71,7 +73,10 @@ class ContractSelector:
             return None
 
         # 3. Pick expiry: first available >= expiry_multiple * catalyst_timeline_days
-        min_dte = int(thesis.catalyst_timeline_days * self.config.expiry_multiple)
+        min_dte = max(
+            self.config.min_dte,
+            int(thesis.catalyst_timeline_days * self.config.expiry_multiple),
+        )
         target_date = _dt.date.today() + _dt.timedelta(days=min_dte)
         eligible_expiries = [d for d in expirations if d >= target_date]
         if not eligible_expiries:
@@ -96,73 +101,82 @@ class ContractSelector:
         else:
             target_strike = price_f * (1 - otm_pct / 100)
 
-        # Find nearest real strike
-        strike = min(strikes, key=lambda s: abs(s - target_strike))
-        actual_otm_pct = abs(strike - price_f) / price_f * 100
+        # Sort candidate strikes by distance from target
+        ranked_strikes = sorted(strikes, key=lambda s: abs(s - target_strike))
+        # Keep only strikes within max_otm_pct
+        candidate_strikes = [
+            s for s in ranked_strikes
+            if abs(s - price_f) / price_f * 100 <= self.config.max_otm_pct
+        ]
 
-        logger.info(
-            "Selected strike: $%.1f (target was $%.1f, stock at $%s, OTM %.1f%%)",
-            strike, target_strike, stock_price, actual_otm_pct,
-        )
-
-        if actual_otm_pct > self.config.max_otm_pct:
-            logger.warning(
-                "Strike $%.1f is %.1f%% OTM (max %.1f%%) — skipping",
-                strike, actual_otm_pct, self.config.max_otm_pct,
-            )
+        if not candidate_strikes:
+            logger.warning("No strikes within %.1f%% OTM for %s", self.config.max_otm_pct, ticker)
             return None
 
-        # 6. Build a temporary spec to get a real quote
-        strike_dec = Decimal(str(strike))
-        temp_spec = ContractSpec(
-            ticker=ticker,
-            right=right,
-            strike=strike_dec,
-            expiry=expiry,
-            entry_price_low=Decimal("0"),
-            entry_price_high=Decimal("999"),
-        )
+        # 6. Try candidate strikes × expiries until one qualifies in IB
+        #    Not every strike exists at every expiry, so we need to retry.
+        expiry_candidates = eligible_expiries[:3] if eligible_expiries else [expirations[-1]]
 
-        try:
-            quote = await self.ib.get_option_quote(temp_spec)
-        except Exception as e:
-            logger.warning("Could not get quote for %s: %s", temp_spec, e)
-            return None
+        for exp in expiry_candidates:
+            dte = (exp - _dt.date.today()).days
+            for strike in candidate_strikes[:5]:  # Try up to 5 nearest strikes
+                actual_otm_pct = abs(strike - price_f) / price_f * 100
+                strike_dec = Decimal(str(strike))
 
-        logger.info(
-            "Option quote %s %s%s: bid=$%s ask=$%s mid=$%s",
-            ticker, strike_dec, right[0].upper(),
-            quote.bid, quote.ask, quote.mid,
-        )
-
-        # 7. Validate liquidity
-        if quote.mid < self.config.min_mid_price:
-            logger.warning(
-                "Mid price $%s < minimum $%s — skipping",
-                quote.mid, self.config.min_mid_price,
-            )
-            return None
-
-        if quote.bid > 0 and quote.ask > 0 and quote.mid > 0:
-            spread_pct = float((quote.ask - quote.bid) / quote.mid)
-            if spread_pct > self.config.max_spread_pct:
-                logger.warning(
-                    "Spread %.1f%% > max %.1f%% — proceeding with caution",
-                    spread_pct * 100, self.config.max_spread_pct * 100,
+                logger.info(
+                    "Trying: %s %s%s exp %s (DTE=%d, OTM %.1f%%)",
+                    ticker, strike_dec, right[0].upper(), exp, dte, actual_otm_pct,
                 )
 
-        # 8. Build final ContractSpec with real prices
-        entry_low = quote.bid if quote.bid > 0 else quote.mid * Decimal("0.95")
-        entry_high = quote.ask if quote.ask > 0 else quote.mid * Decimal("1.05")
+                temp_spec = ContractSpec(
+                    ticker=ticker,
+                    right=right,
+                    strike=strike_dec,
+                    expiry=exp,
+                    entry_price_low=Decimal("0"),
+                    entry_price_high=Decimal("999"),
+                )
 
-        spec = ContractSpec(
-            ticker=ticker,
-            right=right,
-            strike=strike_dec,
-            expiry=expiry,
-            entry_price_low=entry_low,
-            entry_price_high=entry_high,
-        )
+                try:
+                    quote = await self.ib.get_option_quote(temp_spec)
+                except Exception as e:
+                    logger.info("  Strike $%s exp %s not available: %s", strike_dec, exp, e)
+                    continue
 
-        logger.info("Contract selected: %s", spec)
-        return spec
+                logger.info(
+                    "Option quote %s %s%s exp %s: bid=$%s ask=$%s mid=$%s",
+                    ticker, strike_dec, right[0].upper(), exp,
+                    quote.bid, quote.ask, quote.mid,
+                )
+
+                # 7. Validate liquidity
+                if quote.mid < self.config.min_mid_price:
+                    logger.info("  Mid $%s < min $%s — skip", quote.mid, self.config.min_mid_price)
+                    continue
+
+                if quote.bid > 0 and quote.ask > 0 and quote.mid > 0:
+                    spread_pct = float((quote.ask - quote.bid) / quote.mid)
+                    if spread_pct > self.config.max_spread_pct:
+                        logger.warning(
+                            "Spread %.1f%% > max %.1f%% — proceeding with caution",
+                            spread_pct * 100, self.config.max_spread_pct * 100,
+                        )
+
+                # 8. Build final ContractSpec with real prices
+                entry_low = quote.bid if quote.bid > 0 else quote.mid * Decimal("0.95")
+                entry_high = quote.ask if quote.ask > 0 else quote.mid * Decimal("1.05")
+
+                spec = ContractSpec(
+                    ticker=ticker,
+                    right=right,
+                    strike=strike_dec,
+                    expiry=exp,
+                    entry_price_low=entry_low,
+                    entry_price_high=entry_high,
+                )
+
+                logger.info("Contract selected: %s", spec)
+                return spec
+
+        logger.warning("No valid contract found for %s after trying multiple strikes/expiries", ticker)
+        return None
