@@ -22,6 +22,10 @@ pub enum Source {
     Polymarket,
     /// News events (CryptoPanic)
     News,
+    /// CLOB price snapshots (Gamma API)
+    ClobPrices,
+    /// Window settlement outcomes (Gamma API)
+    WindowSettlements,
 }
 
 impl Source {
@@ -34,6 +38,8 @@ impl Source {
             Source::TradeTicks,
             Source::Polymarket,
             Source::News,
+            Source::ClobPrices,
+            Source::WindowSettlements,
         ]
     }
 
@@ -46,6 +52,8 @@ impl Source {
             Source::TradeTicks => "tradeticks",
             Source::Polymarket => "polymarket",
             Source::News => "news",
+            Source::ClobPrices => "clobprices",
+            Source::WindowSettlements => "settlements",
         }
     }
 }
@@ -57,8 +65,8 @@ pub struct CollectSignalsArgs {
     #[arg(long, default_value = "24h")]
     pub duration: String,
 
-    /// Comma-separated sources (orderbook,funding,liquidations,polymarket,news)
-    #[arg(long, default_value = "orderbook,funding,liquidations,polymarket,news")]
+    /// Comma-separated sources (orderbook,funding,liquidations,polymarket,news,clobprices,settlements)
+    #[arg(long, default_value = "orderbook,funding,liquidations,polymarket,news,clobprices,settlements")]
     pub sources: String,
 
     /// Trading symbol (default: btcusdt)
@@ -174,9 +182,11 @@ pub fn parse_sources(s: &str) -> Result<Vec<Source>> {
             "tradeticks" => Source::TradeTicks,
             "polymarket" => Source::Polymarket,
             "news" => Source::News,
+            "clobprices" => Source::ClobPrices,
+            "settlements" => Source::WindowSettlements,
             _ => {
                 return Err(anyhow!(
-                    "Unknown source: '{}'. Valid sources: orderbook, funding, liquidations, tradeticks, polymarket, news",
+                    "Unknown source: '{}'. Valid sources: orderbook, funding, liquidations, tradeticks, polymarket, news, clobprices, settlements",
                     source_name
                 ))
             }
@@ -289,12 +299,16 @@ impl HealthStats {
 /// Returns an error if database connection fails or collectors cannot start.
 pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
     use algo_trade_data::{
-        CvdAggregateRecord, CvdRepository, FundingRateRecord, FundingRateRepository,
-        LiquidationAggregateRecord, LiquidationRecord, LiquidationRepository, NewsEventRecord,
-        NewsEventRepository, OrderBookRepository, OrderBookSnapshotRecord, PolymarketOddsRecord,
-        PolymarketOddsRepository, TradeTickRecord, TradeTickRepository,
+        ClobPriceSnapshotRecord, ClobPriceSnapshotRepository, CvdAggregateRecord, CvdRepository,
+        FundingRateRecord, FundingRateRepository, LiquidationAggregateRecord, LiquidationRecord,
+        LiquidationRepository, NewsEventRecord, NewsEventRepository, OrderBookRepository,
+        OrderBookSnapshotRecord, PolymarketOddsRecord, PolymarketOddsRepository, TradeTickRecord,
+        TradeTickRepository, WindowSettlementRecord, WindowSettlementRepository,
     };
-    use algo_trade_polymarket::{OddsCollector, OddsCollectorConfig, PolymarketClient};
+    use algo_trade_polymarket::{
+        ClobPricePerCoinCollector, GammaClient, OddsCollector, OddsCollectorConfig,
+        PolymarketClient, WindowSettlementCollector,
+    };
     use algo_trade_signals::{
         CollectorConfig, FundingCollector, LiquidationCollector, LiquidationCollectorConfig,
         NewsCollector, NewsCollectorConfig, OrderBookCollector, TradeTickCollector,
@@ -342,6 +356,8 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
     let cvd_repo = CvdRepository::new(pool.clone());
     let polymarket_repo = PolymarketOddsRepository::new(pool.clone());
     let news_repo = NewsEventRepository::new(pool.clone());
+    let clob_snapshot_repo = ClobPriceSnapshotRepository::new(pool.clone());
+    let window_settlement_repo = WindowSettlementRepository::new(pool.clone());
 
     // Shutdown signal
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -546,6 +562,55 @@ pub async fn run_collect_signals(args: CollectSignalsArgs) -> Result<()> {
 
                 tracing::info!("Started News collector");
             }
+
+            Source::ClobPrices => {
+                let (tx, rx) = mpsc::channel::<ClobPriceSnapshotRecord>(CHANNEL_SIZE);
+                let gamma = GammaClient::new();
+                let shutdown = shutdown.clone();
+                let health = health_stats.clone();
+
+                // Spawn per-coin CLOB price collector
+                let collector_coins = coins.clone();
+                let mut collector = ClobPricePerCoinCollector::new(gamma, collector_coins, tx);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = collector.run().await {
+                        tracing::error!("CLOB price collector error: {}", e);
+                    }
+                }));
+
+                // Spawn database writer
+                let repo = clob_snapshot_repo.clone();
+                handles.push(tokio::spawn(async move {
+                    run_database_writer(rx, repo, shutdown, health, Source::ClobPrices).await;
+                }));
+
+                tracing::info!("Started CLOB price collector");
+            }
+
+            Source::WindowSettlements => {
+                let (tx, rx) = mpsc::channel::<WindowSettlementRecord>(CHANNEL_SIZE);
+                let gamma = GammaClient::new();
+                let shutdown = shutdown.clone();
+                let health = health_stats.clone();
+
+                // Spawn settlement collector
+                let collector_coins = coins.clone();
+                let mut collector = WindowSettlementCollector::new(gamma, collector_coins, tx);
+                handles.push(tokio::spawn(async move {
+                    if let Err(e) = collector.run().await {
+                        tracing::error!("Window settlement collector error: {}", e);
+                    }
+                }));
+
+                // Spawn database writer
+                let repo = window_settlement_repo.clone();
+                handles.push(tokio::spawn(async move {
+                    run_database_writer(rx, repo, shutdown, health, Source::WindowSettlements)
+                        .await;
+                }));
+
+                tracing::info!("Started window settlement collector");
+            }
         }
     }
 
@@ -720,6 +785,30 @@ impl BatchInsert<algo_trade_data::TradeTickRecord> for algo_trade_data::TradeTic
 #[async_trait::async_trait]
 impl BatchInsert<algo_trade_data::CvdAggregateRecord> for algo_trade_data::CvdRepository {
     async fn insert_batch(&self, records: &[algo_trade_data::CvdAggregateRecord]) -> Result<()> {
+        self.insert_batch(records).await
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchInsert<algo_trade_data::ClobPriceSnapshotRecord>
+    for algo_trade_data::ClobPriceSnapshotRepository
+{
+    async fn insert_batch(
+        &self,
+        records: &[algo_trade_data::ClobPriceSnapshotRecord],
+    ) -> Result<()> {
+        self.insert_batch(records).await
+    }
+}
+
+#[async_trait::async_trait]
+impl BatchInsert<algo_trade_data::WindowSettlementRecord>
+    for algo_trade_data::WindowSettlementRepository
+{
+    async fn insert_batch(
+        &self,
+        records: &[algo_trade_data::WindowSettlementRecord],
+    ) -> Result<()> {
         self.insert_batch(records).await
     }
 }
@@ -923,20 +1012,20 @@ mod tests {
     #[test]
     fn test_parse_sources_all() {
         let sources =
-            parse_sources("orderbook,funding,liquidations,tradeticks,polymarket,news").unwrap();
-        assert_eq!(sources.len(), 6);
+            parse_sources("orderbook,funding,liquidations,tradeticks,polymarket,news,clobprices,settlements").unwrap();
+        assert_eq!(sources.len(), 8);
     }
 
     #[test]
     fn test_parse_sources_empty_returns_all() {
         let sources = parse_sources("").unwrap();
-        assert_eq!(sources.len(), 6);
+        assert_eq!(sources.len(), 8);
     }
 
     #[test]
     fn test_parse_sources_all_keyword() {
         let sources = parse_sources("all").unwrap();
-        assert_eq!(sources.len(), 6);
+        assert_eq!(sources.len(), 8);
     }
 
     #[test]
@@ -985,13 +1074,15 @@ mod tests {
     #[test]
     fn test_source_all() {
         let all = Source::all();
-        assert_eq!(all.len(), 6);
+        assert_eq!(all.len(), 8);
         assert!(all.contains(&Source::OrderBook));
         assert!(all.contains(&Source::Funding));
         assert!(all.contains(&Source::Liquidations));
         assert!(all.contains(&Source::TradeTicks));
         assert!(all.contains(&Source::Polymarket));
         assert!(all.contains(&Source::News));
+        assert!(all.contains(&Source::ClobPrices));
+        assert!(all.contains(&Source::WindowSettlements));
     }
 
     #[test]
@@ -1002,6 +1093,8 @@ mod tests {
         assert_eq!(Source::TradeTicks.as_str(), "tradeticks");
         assert_eq!(Source::Polymarket.as_str(), "polymarket");
         assert_eq!(Source::News.as_str(), "news");
+        assert_eq!(Source::ClobPrices.as_str(), "clobprices");
+        assert_eq!(Source::WindowSettlements.as_str(), "settlements");
     }
 
     #[test]
@@ -1068,7 +1161,8 @@ mod tests {
         // Verify default values match expected behavior
         let args = CollectSignalsArgs {
             duration: "24h".to_string(),
-            sources: "orderbook,funding,liquidations,polymarket,news".to_string(),
+            sources: "orderbook,funding,liquidations,polymarket,news,clobprices,settlements"
+                .to_string(),
             symbol: "btcusdt".to_string(),
             coins: "btc,eth,sol,xrp".to_string(),
             signals: false,
@@ -1080,7 +1174,7 @@ mod tests {
         let sources = parse_sources(&args.sources).unwrap();
 
         assert_eq!(duration, Duration::from_secs(24 * 3600));
-        assert_eq!(sources.len(), 5);
+        assert_eq!(sources.len(), 7);
         assert_eq!(args.symbol, "btcusdt");
     }
 }

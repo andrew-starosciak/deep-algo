@@ -37,10 +37,12 @@
 
 pub mod arbitrage;
 pub mod client;
+pub mod clob_price_collector;
 pub mod gamma;
 pub mod models;
 pub mod odds_collector;
 pub mod websocket;
+pub mod window_settlement_collector;
 
 // Re-export main types
 pub use client::PolymarketClient;
@@ -50,4 +52,6 @@ pub use odds_collector::{
     deduplicate_markets, filter_btc_markets, OddsCollector, OddsCollectorConfig,
     OddsCollectorEvent, OddsCollectorStats,
 };
+pub use clob_price_collector::ClobPricePerCoinCollector;
 pub use websocket::{BookEvent, PolymarketWebSocket, WebSocketConfig, WebSocketError};
+pub use window_settlement_collector::WindowSettlementCollector;

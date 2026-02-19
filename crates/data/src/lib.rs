@@ -7,12 +7,14 @@
 //! - CSV and Parquet storage utilities
 
 pub mod chainlink;
+pub mod clob_snapshot;
 pub mod csv_storage;
 pub mod database;
 pub mod models;
 pub mod parquet_storage;
 pub mod repositories;
 pub mod settlement;
+pub mod window_settlement;
 
 // Re-export commonly used types
 pub use csv_storage::CsvStorage;
@@ -35,6 +37,12 @@ pub use repositories::{
     PaperTradeStatistics, PolymarketOddsRepository, Repositories, SignalSnapshotRepository,
     TradeTickRepository, ValidationStats,
 };
+
+// Re-export CLOB snapshot types
+pub use clob_snapshot::{ClobPriceSnapshotRecord, ClobPriceSnapshotRepository};
+
+// Re-export window settlement types
+pub use window_settlement::{WindowSettlementRecord, WindowSettlementRepository};
 
 // Re-export Chainlink price feed types
 pub use chainlink::{ChainlinkPriceData, ChainlinkPriceFeed, SettlementResult, WindowPrices};
