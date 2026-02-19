@@ -378,3 +378,97 @@ class Database:
             limit,
         )
         return [dict(r) for r in rows]
+
+    # --- Equity snapshots ---
+
+    async def insert_equity_snapshot(
+        self,
+        net_liquidation: Decimal,
+        total_unrealized_pnl: Decimal,
+        total_realized_pnl: Decimal,
+        open_positions_count: int,
+        total_options_exposure: Decimal,
+    ):
+        await self.pool.execute(
+            """
+            INSERT INTO equity_snapshots
+                (timestamp, net_liquidation, total_unrealized_pnl, total_realized_pnl,
+                 open_positions_count, total_options_exposure)
+            VALUES (NOW(), $1, $2, $3, $4, $5)
+            ON CONFLICT (timestamp) DO NOTHING
+            """,
+            net_liquidation,
+            total_unrealized_pnl,
+            total_realized_pnl,
+            open_positions_count,
+            total_options_exposure,
+        )
+
+    async def get_equity_history(self, days: int = 30) -> list[dict]:
+        rows = await self.pool.fetch(
+            """
+            SELECT timestamp, net_liquidation, total_unrealized_pnl,
+                   total_realized_pnl, open_positions_count, total_options_exposure
+            FROM equity_snapshots
+            WHERE timestamp > NOW() - make_interval(days => $1)
+            ORDER BY timestamp ASC
+            """,
+            days,
+        )
+        return [dict(r) for r in rows]
+
+    # --- Dashboard queries ---
+
+    async def get_all_positions(self, status: str | None = None) -> list[dict]:
+        if status:
+            rows = await self.pool.fetch(
+                "SELECT * FROM options_positions WHERE status = $1 ORDER BY opened_at DESC",
+                status,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT * FROM options_positions ORDER BY opened_at DESC"
+            )
+        return [dict(r) for r in rows]
+
+    async def get_position_by_id(self, position_id: int) -> dict | None:
+        row = await self.pool.fetchrow(
+            "SELECT * FROM options_positions WHERE id = $1", position_id
+        )
+        return dict(row) if row else None
+
+    async def get_theses(
+        self, ticker: str | None = None, limit: int = 50
+    ) -> list[dict]:
+        if ticker:
+            rows = await self.pool.fetch(
+                """
+                SELECT * FROM theses
+                WHERE ticker = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+                """,
+                ticker.upper(),
+                limit,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT * FROM theses ORDER BY created_at DESC LIMIT $1", limit
+            )
+        return [dict(r) for r in rows]
+
+    async def get_all_recommendations(self, status: str | None = None) -> list[dict]:
+        if status and status != "all":
+            rows = await self.pool.fetch(
+                """
+                SELECT * FROM trade_recommendations
+                WHERE status = $1
+                ORDER BY created_at DESC
+                """,
+                status,
+            )
+        else:
+            rows = await self.pool.fetch(
+                "SELECT * FROM trade_recommendations ORDER BY created_at DESC"
+            )
+        return [dict(r) for r in rows]

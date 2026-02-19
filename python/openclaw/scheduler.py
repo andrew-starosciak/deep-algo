@@ -133,6 +133,7 @@ class WorkflowScheduler:
 
                 if is_weekday and market_open <= now <= market_close:
                     await self._position_manager._tick()
+                    await self._record_equity_snapshot()
                 elif is_weekday and now < market_open:
                     # Sleep until market open
                     wait_secs = (market_open - now).total_seconds()
@@ -145,6 +146,25 @@ class WorkflowScheduler:
                 logger.exception("Position tick loop error")
 
             await asyncio.sleep(poll_interval)
+
+    async def _record_equity_snapshot(self) -> None:
+        """Record an equity snapshot after each position tick."""
+        try:
+            account = await self.ib_client.account_summary()
+            positions = await self.db.get_open_positions()
+            total_unrealized = sum(Decimal(str(p.get("unrealized_pnl", 0))) for p in positions)
+            total_exposure = await self.db.get_total_options_exposure()
+            total_realized = await self.db.get_total_realized_pnl()
+
+            await self.db.insert_equity_snapshot(
+                net_liquidation=account.net_liquidation,
+                total_unrealized_pnl=total_unrealized,
+                total_realized_pnl=total_realized,
+                open_positions_count=len(positions),
+                total_options_exposure=total_exposure,
+            )
+        except Exception:
+            logger.warning("Failed to record equity snapshot", exc_info=True)
 
     async def _premarket_research(self) -> None:
         """Run trade-thesis workflow for each watchlist ticker."""

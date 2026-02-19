@@ -15,8 +15,11 @@
 #   ./scripts/deploy-ib-options.sh start-manager       # Start position manager daemon
 #   ./scripts/deploy-ib-options.sh start-scheduler     # Start workflow scheduler daemon
 #   ./scripts/deploy-ib-options.sh stop-all            # Stop all services
+#   ./scripts/deploy-ib-options.sh setup-dashboard     # Install nginx + dashboard API service
+#   ./scripts/deploy-ib-options.sh deploy-dashboard    # Build frontend, upload, restart dashboard
+#   ./scripts/deploy-ib-options.sh restart-dashboard   # Restart nginx + dashboard-api
 #   ./scripts/deploy-ib-options.sh ssh                 # SSH into instance
-#   ./scripts/deploy-ib-options.sh logs [service]      # Tail logs (manager|scheduler|premarket|weekly)
+#   ./scripts/deploy-ib-options.sh logs [service]      # Tail logs (manager|scheduler|premarket|weekly|dashboard)
 #   ./scripts/deploy-ib-options.sh status              # Show service status
 #   ./scripts/deploy-ib-options.sh teardown            # Terminate and clean up
 #
@@ -475,8 +478,10 @@ cmd_stop_all() {
     remote_ssh "
         sudo systemctl stop ib-options-manager || true
         sudo systemctl stop ib-options-scheduler || true
+        sudo systemctl stop dashboard-api || true
         sudo systemctl disable ib-options-manager || true
         sudo systemctl disable ib-options-scheduler || true
+        sudo systemctl disable dashboard-api || true
     "
 
     info "All services stopped."
@@ -591,9 +596,12 @@ cmd_logs() {
         weekly)
             log_file="~/logs/weekly.log"
             ;;
+        dashboard)
+            log_file="~/logs/dashboard-api.log"
+            ;;
         *)
             error "Unknown log type: $log_type"
-            echo "Available: manager, scheduler, premarket, weekly"
+            echo "Available: manager, scheduler, premarket, weekly, dashboard"
             exit 1
             ;;
     esac
@@ -628,6 +636,14 @@ cmd_status() {
 
     info "Workflow Scheduler:"
     remote_ssh "sudo systemctl status ib-options-scheduler --no-pager || echo 'Not running'"
+    echo ""
+
+    info "Dashboard API:"
+    remote_ssh "sudo systemctl status dashboard-api --no-pager 2>/dev/null || echo 'Not running'"
+    echo ""
+
+    info "Nginx:"
+    remote_ssh "sudo systemctl status nginx --no-pager 2>/dev/null || echo 'Not running'"
     echo ""
 
     info "Cron jobs:"
@@ -724,6 +740,10 @@ cmd_redeploy() {
             sudo systemctl restart ib-options-manager
             echo '  Restarted ib-options-manager'
         fi
+        if systemctl is-active --quiet dashboard-api; then
+            sudo systemctl restart dashboard-api
+            echo '  Restarted dashboard-api'
+        fi
         sleep 2
     "
 
@@ -732,11 +752,153 @@ cmd_redeploy() {
     remote_ssh "
         systemctl is-active ib-options-scheduler 2>/dev/null && echo '  scheduler: running' || echo '  scheduler: not running'
         systemctl is-active ib-options-manager 2>/dev/null && echo '  manager: running' || echo '  manager: not running'
+        systemctl is-active dashboard-api 2>/dev/null && echo '  dashboard-api: running' || echo '  dashboard-api: not running'
     "
 
     echo ""
     info "✅ Redeploy complete."
     echo ""
+}
+
+# =============================================================================
+# setup-dashboard — Install nginx, dashboard-api systemd service, open port 80
+# =============================================================================
+
+cmd_setup_dashboard() {
+    load_state
+
+    info "Setting up dashboard on $PUBLIC_IP..."
+
+    # Install nginx
+    remote_ssh "sudo apt-get install -y nginx 2>&1 | tail -3"
+
+    # Upload nginx config
+    remote_scp "$SCRIPT_DIR/dashboard/nginx.conf" "$SSH_USER@$PUBLIC_IP:/tmp/dashboard-nginx.conf"
+    remote_ssh "
+        sudo rm -f /etc/nginx/sites-enabled/default
+        sudo cp /tmp/dashboard-nginx.conf /etc/nginx/sites-available/dashboard
+        sudo ln -sf /etc/nginx/sites-available/dashboard /etc/nginx/sites-enabled/dashboard
+        sudo nginx -t
+        sudo systemctl enable nginx
+        sudo systemctl restart nginx
+    "
+
+    # Upload and install dashboard-api systemd service
+    remote_scp "$SCRIPT_DIR/dashboard/dashboard-api.service" "$SSH_USER@$PUBLIC_IP:/tmp/dashboard-api.service"
+    remote_ssh "
+        sudo cp /tmp/dashboard-api.service /etc/systemd/system/dashboard-api.service
+        sudo systemctl daemon-reload
+        sudo systemctl enable dashboard-api
+    "
+
+    # Create frontend directory
+    remote_ssh "mkdir -p ~/dashboard-frontend"
+
+    # Ensure DASHBOARD_TOKEN is in .env
+    remote_ssh "
+        if ! grep -q '^DASHBOARD_TOKEN=' ~/.env 2>/dev/null; then
+            TOKEN=\$(python3 -c 'import secrets; print(secrets.token_hex(32))')
+            echo \"DASHBOARD_TOKEN=\$TOKEN\" >> ~/.env
+            echo \"Generated DASHBOARD_TOKEN: \$TOKEN\"
+        else
+            echo 'DASHBOARD_TOKEN already set in .env'
+        fi
+    "
+
+    # Open port 80 in security group
+    info "Opening port 80 in security group..."
+    aws ec2 authorize-security-group-ingress \
+        --group-id "$SECURITY_GROUP_ID" \
+        --protocol tcp \
+        --port 80 \
+        --cidr 0.0.0.0/0 \
+        --region "$REGION" 2>/dev/null || info "Port 80 already open"
+
+    echo ""
+    info "Dashboard infrastructure ready."
+    info "Next: ./scripts/deploy-ib-options.sh deploy-dashboard"
+    echo ""
+}
+
+# =============================================================================
+# deploy-dashboard — Build frontend, upload, restart API
+# =============================================================================
+
+cmd_deploy_dashboard() {
+    load_state
+
+    echo -e "${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${CYAN}║${NC}        ${WHITE}Deploy Dashboard to ${PUBLIC_IP}${NC}                         ${CYAN}║${NC}"
+    echo -e "${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # Build frontend locally
+    info "Building frontend..."
+    (
+        cd "$PROJECT_ROOT/dashboard"
+        NEXT_PUBLIC_API_URL="" npm run build 2>&1 | tail -5
+    )
+
+    # Upload static files
+    info "Uploading frontend to $PUBLIC_IP..."
+    (
+        cd "$PROJECT_ROOT/dashboard"
+        tar -czf /tmp/dashboard-frontend.tar.gz -C out .
+    )
+    remote_scp /tmp/dashboard-frontend.tar.gz "$SSH_USER@$PUBLIC_IP:~/dashboard-frontend.tar.gz"
+    remote_ssh "
+        rm -rf ~/dashboard-frontend/*
+        tar -xzf ~/dashboard-frontend.tar.gz -C ~/dashboard-frontend
+        rm ~/dashboard-frontend.tar.gz
+    "
+    rm /tmp/dashboard-frontend.tar.gz
+
+    # Sync Python code (includes dashboard package)
+    cmd_sync
+
+    # Install/update Python deps
+    info "Updating Python dependencies..."
+    remote_ssh "
+        source venv/bin/activate
+        cd ~/python
+        pip install -e . 2>&1 | tail -3
+    "
+
+    # Restart dashboard API
+    info "Restarting dashboard-api..."
+    remote_ssh "
+        sudo systemctl restart dashboard-api
+        sleep 2
+        sudo systemctl status dashboard-api --no-pager | head -5
+    "
+
+    # Reload nginx
+    remote_ssh "sudo systemctl reload nginx"
+
+    echo ""
+    info "Dashboard deployed to http://$PUBLIC_IP"
+    echo ""
+}
+
+# =============================================================================
+# restart-dashboard — Restart nginx + dashboard-api
+# =============================================================================
+
+cmd_restart_dashboard() {
+    load_state
+
+    info "Restarting dashboard services on $PUBLIC_IP..."
+    remote_ssh "
+        sudo systemctl restart dashboard-api
+        sudo systemctl reload nginx
+        sleep 2
+    "
+
+    info "Dashboard services restarted."
+    remote_ssh "
+        systemctl is-active dashboard-api 2>/dev/null && echo '  dashboard-api: running' || echo '  dashboard-api: not running'
+        systemctl is-active nginx 2>/dev/null && echo '  nginx: running' || echo '  nginx: not running'
+    "
 }
 
 # =============================================================================
@@ -772,6 +934,15 @@ case "${1:-}" in
     stop-all)
         cmd_stop_all
         ;;
+    setup-dashboard)
+        cmd_setup_dashboard
+        ;;
+    deploy-dashboard)
+        cmd_deploy_dashboard
+        ;;
+    restart-dashboard)
+        cmd_restart_dashboard
+        ;;
     ssh)
         load_state
         ec2_ssh_interactive
@@ -801,8 +972,11 @@ case "${1:-}" in
         echo "  start-manager       Start position manager daemon"
         echo "  start-scheduler     Start workflow scheduler daemon"
         echo "  stop-all            Stop all services"
+        echo "  setup-dashboard     Install nginx, systemd service, open port 80"
+        echo "  deploy-dashboard    Build frontend, upload, restart dashboard API"
+        echo "  restart-dashboard   Restart nginx + dashboard-api"
         echo "  ssh                 SSH into instance"
-        echo "  logs [service]      Tail logs (manager|scheduler|premarket|weekly)"
+        echo "  logs [service]      Tail logs (manager|scheduler|premarket|weekly|dashboard)"
         echo "  status              Show service status"
         echo "  teardown            Terminate and clean up"
         echo ""
