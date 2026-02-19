@@ -78,3 +78,22 @@ class MemoryDatabase:
             "  Step [%s] agent=%s attempt=%d %s (%dms)",
             step_id, agent, attempt, status, duration_ms,
         )
+
+    async def save_research_summary(
+        self, run_id: int, ticker: str, mode: str, summary: dict, opportunity_score: int
+    ) -> int:
+        logger.debug("save_research_summary (in-memory noop) for %s", ticker)
+        return 0
+
+    async def get_thesis_history_with_outcomes(
+        self, ticker: str, limit: int = 5
+    ) -> list[dict]:
+        return []
+
+    async def get_thesis_id_for_position(self, position_id: int) -> int | None:
+        return None
+
+    async def update_thesis_outcome(
+        self, thesis_id: int, realized_pnl: Any, close_reason: str, position_id: int
+    ):
+        pass

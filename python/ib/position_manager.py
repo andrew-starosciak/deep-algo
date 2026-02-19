@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from decimal import Decimal
 
 from ib.rules import check_allocation, check_profit_targets, check_stop_rules
@@ -147,6 +148,16 @@ class PositionManager:
                     logger.info(
                         "Closed stale position %d (no longer in IB)", db_pos["id"]
                     )
+                    # Record outcome on the originating thesis
+                    try:
+                        thesis_id = await self.db.get_thesis_id_for_position(db_pos["id"])
+                        if thesis_id:
+                            await self.db.update_thesis_outcome(
+                                thesis_id, realized_pnl=Decimal("0"),
+                                close_reason="external", position_id=db_pos["id"],
+                            )
+                    except Exception:
+                        logger.warning("Failed to update thesis outcome for position %d", db_pos["id"])
 
     async def _execute_recommendation(self, rec: dict) -> None:
         """Execute an approved recommendation: place order, record position."""
@@ -258,6 +269,15 @@ class PositionManager:
         try:
             quote = await self.ib.get_option_quote(contract)
             new_price = quote.mid
+            # Guard against bad quotes (NaN, zero, negative) — do NOT update
+            # price or run rules with garbage data (would trigger false stop-loss)
+            if new_price is None or new_price <= 0 or math.isnan(float(new_price)):
+                logger.warning(
+                    "Invalid quote for %s (mid=%s) — skipping price update and rule checks",
+                    pos.ticker, new_price,
+                )
+                return
+
             unrealized = (new_price - pos.avg_fill_price) * pos.quantity * 100
             await self.db.update_position_price(pos.id, new_price, unrealized)
 
@@ -267,7 +287,8 @@ class PositionManager:
                 "unrealized_pnl": unrealized,
             })
         except Exception:
-            logger.warning("Failed to get quote for %s — skipping price update", pos.ticker)
+            logger.warning("Failed to get quote for %s — skipping price update and rule checks", pos.ticker)
+            return
 
         # Check stop rules (hard stop, time stop)
         action = check_stop_rules(pos, self.config)
@@ -304,6 +325,18 @@ class PositionManager:
 
             if action.close_all:
                 await self.db.close_position(pos.id, action.reason.value, realized)
+                # Record outcome on the originating thesis
+                # Include accumulated P&L from prior partial closes
+                try:
+                    total_realized = (pos.realized_pnl or Decimal("0")) + realized
+                    thesis_id = await self.db.get_thesis_id_for_position(pos.id)
+                    if thesis_id:
+                        await self.db.update_thesis_outcome(
+                            thesis_id, realized_pnl=total_realized,
+                            close_reason=action.reason.value, position_id=pos.id,
+                        )
+                except Exception:
+                    logger.warning("Failed to update thesis outcome for position %d", pos.id)
             else:
                 # Partial close — persist new quantity and realized P&L
                 remaining = pos.quantity - qty

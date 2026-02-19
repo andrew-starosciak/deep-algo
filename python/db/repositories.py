@@ -99,6 +99,25 @@ class Database:
             notes,
         )
 
+    # --- Research summaries ---
+
+    async def save_research_summary(
+        self, run_id: int, ticker: str, mode: str, summary: dict, opportunity_score: int
+    ) -> int:
+        """Persist a research summary to the research_summaries table."""
+        return await self.pool.fetchval(
+            """
+            INSERT INTO research_summaries (run_id, ticker, mode, summary, opportunity_score)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id
+            """,
+            run_id,
+            ticker.upper(),
+            mode,
+            json.dumps(summary, default=str),
+            opportunity_score,
+        )
+
     # --- Theses ---
 
     async def save_thesis(self, run_id: int, thesis: dict) -> int:
@@ -520,3 +539,60 @@ class Database:
                 "SELECT * FROM trade_recommendations ORDER BY created_at DESC"
             )
         return [dict(r) for r in rows]
+
+    # --- Thesis outcomes ---
+
+    async def get_thesis_history_with_outcomes(
+        self, ticker: str, limit: int = 5
+    ) -> list[dict]:
+        """Fetch recent theses for a ticker, including outcome columns from V016."""
+        rows = await self.pool.fetch(
+            """
+            SELECT id, ticker, direction, thesis_text, overall_score,
+                   outcome_realized_pnl, outcome_close_reason, outcome_closed_at,
+                   created_at
+            FROM theses
+            WHERE ticker = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            ticker.upper(),
+            limit,
+        )
+        return [dict(r) for r in rows]
+
+    async def get_thesis_id_for_position(self, position_id: int) -> int | None:
+        """Walk FK chain: positions → recommendations → theses."""
+        return await self.pool.fetchval(
+            """
+            SELECT t.id
+            FROM options_positions p
+            JOIN trade_recommendations r ON r.id = p.recommendation_id
+            JOIN theses t ON t.id = r.thesis_id
+            WHERE p.id = $1
+            """,
+            position_id,
+        )
+
+    async def update_thesis_outcome(
+        self,
+        thesis_id: int,
+        realized_pnl: Decimal,
+        close_reason: str,
+        position_id: int,
+    ):
+        """Record the outcome of a thesis when its position closes."""
+        await self.pool.execute(
+            """
+            UPDATE theses
+            SET outcome_realized_pnl = $2,
+                outcome_close_reason = $3,
+                outcome_closed_at = NOW(),
+                outcome_position_id = $4
+            WHERE id = $1
+            """,
+            thesis_id,
+            realized_pnl,
+            close_reason,
+            position_id,
+        )

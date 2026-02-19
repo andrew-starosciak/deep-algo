@@ -199,6 +199,18 @@ class WorkflowScheduler:
             logger.exception("Workflow failed for %s", ticker)
             return
 
+        # Persist research summary (valuable even if later gates fail)
+        try:
+            research_output = result.step_outputs.get("research") if result else None
+            if research_output is not None:
+                await self.db.save_research_summary(
+                    run_id=result.run_id, ticker=ticker, mode="premarket",
+                    summary=research_output.model_dump(),
+                    opportunity_score=research_output.opportunity_score,
+                )
+        except Exception:
+            logger.warning("Failed to save research summary for %s", ticker, exc_info=True)
+
         if result is None:
             logger.info("Workflow aborted for %s (did not pass gates)", ticker)
             return

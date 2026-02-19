@@ -6,6 +6,8 @@ You are evaluating a trade thesis for options trading. Score it rigorously.
 
 {input}
 
+{historical_context}
+
 ## Scoring Framework
 
 Score each dimension 1-10:

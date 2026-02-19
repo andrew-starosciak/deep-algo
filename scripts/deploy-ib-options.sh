@@ -317,13 +317,17 @@ cmd_sync() {
             .
     )
 
-    # Upload and extract
+    # Upload and extract with atomic swap (avoids stale cwd for running services)
     remote_scp /tmp/ib-options-python.tar.gz "$SSH_USER@$PUBLIC_IP:~/python.tar.gz"
     remote_ssh "
-        rm -rf ~/python
-        mkdir -p ~/python
-        tar -xzf ~/python.tar.gz -C ~/python
+        rm -rf ~/python-new
+        mkdir -p ~/python-new
+        tar -xzf ~/python.tar.gz -C ~/python-new
         rm ~/python.tar.gz
+        rm -rf ~/python-old
+        mv ~/python ~/python-old 2>/dev/null || true
+        mv ~/python-new ~/python
+        rm -rf ~/python-old
     "
 
     rm /tmp/ib-options-python.tar.gz

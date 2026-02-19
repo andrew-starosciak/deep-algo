@@ -208,6 +208,18 @@ async def _cmd_run(args):
 
     result = await engine.run(workflow, initial_input)
 
+    # Persist research summary (valuable even if later gates fail)
+    try:
+        research_output = result.step_outputs.get("research") if result else None
+        if research_output is not None:
+            await engine.db.save_research_summary(
+                run_id=result.run_id, ticker=args.ticker.upper(), mode="cli",
+                summary=research_output.model_dump(),
+                opportunity_score=research_output.opportunity_score,
+            )
+    except Exception:
+        logger.warning("Failed to save research summary", exc_info=True)
+
     if result is None:
         print("\nWorkflow did not produce a final result (aborted or escalated).")
         return
