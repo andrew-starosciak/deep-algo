@@ -17,7 +17,7 @@
 # Local options:
 #   --duration <time>   How long to collect (default: 24h)
 #   --coins <list>      Coins for signal aggregation (default: btc,eth,sol,xrp)
-#   --sources <list>    Raw data sources (default: orderbook,funding,liquidations,tradeticks,polymarket,news)
+#   --sources <list>    Raw data sources (default: all including clobprices,settlements)
 #   --no-signals        Disable composite signal computation
 #   --help              Show this help
 #
@@ -61,7 +61,7 @@ _COLLECT_CLI_CMD="collect-signals"
 _collect_build_remote_args() {
     local duration="24h"
     local coins="btc,eth,sol,xrp"
-    local sources="orderbook,funding,liquidations,tradeticks,polymarket,news"
+    local sources="orderbook,funding,liquidations,tradeticks,polymarket,news,clobprices,settlements"
     local signals="1"
 
     while [[ $# -gt 0 ]]; do
@@ -102,7 +102,7 @@ esac
 # Default configuration
 DURATION="24h"
 COINS="btc,eth,sol,xrp"
-SOURCES="orderbook,funding,liquidations,tradeticks,polymarket,news"
+SOURCES="orderbook,funding,liquidations,tradeticks,polymarket,news,clobprices,settlements"
 SIGNALS="1"
 
 # Parse arguments
