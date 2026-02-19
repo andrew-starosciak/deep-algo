@@ -12,7 +12,7 @@
 #   ./scripts/db-sync.sh --dump             # Dump to CSV instead of DB insert
 #
 # Requires:
-#   - EC2 state file from aws-latency-test.sh deploy
+#   - EC2 state file from polymarket.sh deploy
 #   - DATABASE_URL set locally (target database)
 #   - psql available on both local and remote
 #
@@ -27,6 +27,13 @@ if [[ -f "$PROJECT_ROOT/.env" ]]; then
     set -a
     source "$PROJECT_ROOT/.env"
     set +a
+fi
+
+# Use Polymarket state file (falls back to old name via ec2-common defaults)
+if [[ -f "$SCRIPT_DIR/.polymarket.state" ]]; then
+    EC2_STATE_FILE="$SCRIPT_DIR/.polymarket.state"
+    EC2_KEY_FILE="$SCRIPT_DIR/.polymarket-key.pem"
+    export EC2_STATE_FILE EC2_KEY_FILE
 fi
 
 # shellcheck disable=SC1091

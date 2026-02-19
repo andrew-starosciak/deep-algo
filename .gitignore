@@ -25,10 +25,8 @@ logs/
 .pids/
 
 # AWS/EC2 deploy state
-scripts/.aws-latency-test.state
-scripts/.aws-latency-key.pem
-scripts/.ib-options-deploy.state
-scripts/.ib-options-deploy-key.pem
+scripts/.*.state
+scripts/.*-key.pem
 
 # Claude Code settings (contains API key)
 .claude/settings.json

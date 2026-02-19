@@ -43,8 +43,9 @@ dim()   { echo -e "${DIM}    $*${NC}"; }
 # SSH / state constants
 # =============================================================================
 
-STATE_FILE="${SCRIPT_DIR:?SCRIPT_DIR must be set before sourcing ec2-common.sh}/.aws-latency-test.state"
-KEY_FILE="$SCRIPT_DIR/.aws-latency-key.pem"
+# Callers can set EC2_STATE_FILE / EC2_KEY_FILE before sourcing to override.
+STATE_FILE="${EC2_STATE_FILE:-${SCRIPT_DIR:?SCRIPT_DIR must be set before sourcing ec2-common.sh}/.aws-latency-test.state}"
+KEY_FILE="${EC2_KEY_FILE:-$SCRIPT_DIR/.aws-latency-key.pem}"
 
 SSH_USER="ubuntu"
 SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ServerAliveInterval=15 -o ServerAliveCountMax=3"
@@ -60,11 +61,38 @@ REMOTE_DATABASE_URL="postgres://${REMOTE_DB_USER}:${REMOTE_DB_PASS}@localhost/${
 
 load_state() {
     if [[ ! -f "$STATE_FILE" ]]; then
-        error "No EC2 deployment found. Run './scripts/aws-latency-test.sh deploy' first."
+        error "No EC2 deployment found. Deploy first."
         exit 1
     fi
     # shellcheck disable=SC1090
     source "$STATE_FILE"
+}
+
+save_state() {
+    cat > "$STATE_FILE" <<EOF
+INSTANCE_ID=$INSTANCE_ID
+KEY_NAME=$KEY_NAME
+SECURITY_GROUP_ID=$SECURITY_GROUP_ID
+PUBLIC_IP=$PUBLIC_IP
+ALLOCATION_ID=${ALLOCATION_ID:-}
+REGION=$REGION
+INSTANCE_MARKET=${INSTANCE_MARKET:-on-demand}
+EOF
+}
+
+wait_for_ssh() {
+    local max_attempts="${1:-30}"
+    local attempt=0
+    info "Waiting for SSH to become available..."
+    while [[ $attempt -lt $max_attempts ]]; do
+        if remote_ssh "true" 2>/dev/null; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        sleep 5
+    done
+    error "SSH not available after ${max_attempts} attempts"
+    return 1
 }
 
 remote_ssh() {
