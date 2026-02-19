@@ -97,3 +97,11 @@ class MemoryDatabase:
         self, thesis_id: int, realized_pnl: Any, close_reason: str, position_id: int
     ):
         pass
+
+    async def get_research_memory_stats(self) -> dict:
+        return {
+            "total_research": 0, "total_theses": 0, "theses_with_outcome": 0,
+            "winning_theses": 0, "losing_theses": 0, "total_outcome_pnl": 0,
+            "tickers_analyzed": 0, "total_recommendations": 0,
+            "approved_recommendations": 0, "filled_recommendations": 0,
+        }

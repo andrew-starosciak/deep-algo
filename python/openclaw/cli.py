@@ -78,6 +78,29 @@ def main():
     wl_add.add_argument("--sector", required=True)
     wl_sub.add_parser("show", help="Show current watchlist")
 
+    # run-all — run trade-thesis for all watchlist tickers
+    runall_parser = subparsers.add_parser(
+        "run-all", help="Run trade-thesis for all watchlist tickers (one-shot)"
+    )
+    runall_parser.add_argument(
+        "--mode", choices=["sim", "paper", "live"], default="paper",
+        help="IB mode for contract selection (default: paper)",
+    )
+    runall_parser.add_argument("--host", default="127.0.0.1")
+    runall_parser.add_argument("--port", type=int, default=None)
+    runall_parser.add_argument(
+        "--client-id", type=int, default=200,
+        help="IB client ID (use different from scheduler's 100, default: 200)",
+    )
+    runall_parser.add_argument(
+        "--model", default="claude-sonnet-4-5-20250929",
+        help="Claude model to use",
+    )
+    runall_parser.add_argument(
+        "--auto-approve", action="store_true",
+        help="Auto-approve recommendations for immediate execution",
+    )
+
     # scheduler
     sched_parser = subparsers.add_parser("scheduler", help="Start the cron scheduler daemon")
     sched_parser.add_argument(
@@ -178,6 +201,8 @@ async def _dispatch(args):
         print("Status: not yet connected to database")
     elif args.command == "watchlist":
         await _cmd_watchlist(args)
+    elif args.command == "run-all":
+        await _cmd_run_all(args)
     elif args.command == "scheduler":
         await _cmd_scheduler(args)
 
@@ -416,6 +441,145 @@ async def _cmd_position_manager(args):
         print("\nPosition manager stopped.")
     finally:
         await db.close()
+
+
+async def _cmd_run_all(args):
+    """Run trade-thesis workflow for all watchlist tickers (one-shot)."""
+    from decimal import Decimal
+
+    from ib.client import IBClient, IBConfig
+    from ib.contract_selector import ContractSelector
+    from openclaw.workflows import get_workflow
+    from schemas.research import ResearchRequest
+    from schemas.risk import RiskVerification
+    from schemas.thesis import Thesis
+
+    db = await _init_db(args)
+    port = _resolve_port(args)
+
+    # Connect IB with custom client_id (avoid conflict with running scheduler)
+    ib_client = IBClient(config=IBConfig(
+        host=args.host, port=port, client_id=args.client_id,
+    ))
+    engine = await _init_engine(args, ib_client=ib_client)
+
+    print(f"Connecting to IB Gateway (client_id={args.client_id})...")
+    await ib_client.connect()
+    print("Connected to IB Gateway.\n")
+
+    # Get watchlist
+    watchlist = await db.get_watchlist()
+    tickers = [row["ticker"] for row in watchlist]
+    print(f"Watchlist: {', '.join(tickers)} ({len(tickers)} tickers)\n")
+
+    workflow = get_workflow("trade-thesis")
+    results = {"passed": [], "aborted": [], "failed": []}
+
+    for i, ticker in enumerate(tickers, 1):
+        print(f"[{i}/{len(tickers)}] {ticker}")
+        print(f"  Running workflow: research → evaluate → verify")
+
+        try:
+            result = await engine.run(workflow, ResearchRequest(ticker=ticker))
+        except Exception as e:
+            print(f"  FAILED: {e}")
+            results["failed"].append(ticker)
+            continue
+
+        # Save research summary
+        try:
+            research_output = result.step_outputs.get("research") if result else None
+            if research_output is not None:
+                await db.save_research_summary(
+                    run_id=result.run_id, ticker=ticker, mode="run-all",
+                    summary=research_output.model_dump(),
+                    opportunity_score=research_output.opportunity_score,
+                )
+        except Exception:
+            pass
+
+        if result is None:
+            print(f"  ABORTED (did not pass gates)")
+            results["aborted"].append(ticker)
+            continue
+
+        thesis = result.step_outputs.get("evaluate")
+        verification = result.step_outputs.get("verify")
+
+        if (
+            not isinstance(thesis, Thesis)
+            or not isinstance(verification, RiskVerification)
+            or not verification.approved
+        ):
+            print(f"  ABORTED (risk not approved)")
+            results["aborted"].append(ticker)
+            continue
+
+        # Contract selection using real IB data
+        if thesis.recommended_contract is None:
+            try:
+                selector = ContractSelector(ib_client)
+                selected = await selector.select(thesis)
+                if not selected:
+                    print(f"  ABORTED (no suitable contract)")
+                    results["aborted"].append(ticker)
+                    continue
+                thesis.recommended_contract = selected
+            except Exception as e:
+                print(f"  FAILED contract selection: {e}")
+                results["failed"].append(ticker)
+                continue
+
+        # Save recommendation
+        try:
+            account = await ib_client.account_summary()
+            equity = account.net_liquidation
+            position_size_usd = verification.position_size_pct * equity / Decimal("100")
+
+            thesis_id = await db.save_thesis(result.run_id, thesis.model_dump())
+            rec_data = {
+                "contract": thesis.recommended_contract.model_dump(),
+                "position_size_pct": str(verification.position_size_pct),
+                "position_size_usd": str(position_size_usd),
+                "exit_targets": ["+50% sell half", "+100% close"],
+                "stop_loss": "-50% hard stop",
+                "max_hold_days": 30,
+                "risk_verification": verification.model_dump(),
+            }
+            rec_id = await db.save_recommendation(thesis_id, result.run_id, rec_data)
+
+            contract = thesis.recommended_contract
+            print(f"  PASSED: rec #{rec_id} — {contract}")
+            print(f"    Size: {verification.position_size_pct}% = ${position_size_usd:,.0f}")
+
+            if args.auto_approve:
+                await db.approve_recommendation(rec_id)
+                print(f"    Auto-approved — scheduler will execute on next tick")
+
+            results["passed"].append(ticker)
+
+        except Exception as e:
+            print(f"  FAILED saving recommendation: {e}")
+            results["failed"].append(ticker)
+
+        print()
+
+    # Disconnect IB
+    await ib_client.disconnect()
+
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"  SUMMARY")
+    print(f"{'='*60}")
+    print(f"  Passed:  {len(results['passed'])} — {', '.join(results['passed']) or 'none'}")
+    print(f"  Aborted: {len(results['aborted'])} — {', '.join(results['aborted']) or 'none'}")
+    print(f"  Failed:  {len(results['failed'])} — {', '.join(results['failed']) or 'none'}")
+    if results["passed"] and args.auto_approve:
+        print(f"\n  Auto-approved recommendations will be executed by the scheduler's")
+        print(f"  position manager on its next tick (every 30s during market hours).")
+    print()
+
+    await db.close()
 
 
 async def _cmd_scheduler(args):

@@ -9,6 +9,7 @@ import type {
   WatchlistItem,
   Position,
   WorkflowsResponse,
+  ResearchMemoryStats,
 } from "./types";
 
 const REFRESH_MS = 30_000;
@@ -87,6 +88,13 @@ export function useSystemStatus() {
 
 export function useWorkflows() {
   return useSWR<WorkflowsResponse>("/api/workflows", fetcher, {
+    ...defaults,
+    refreshInterval: 60_000,
+  });
+}
+
+export function useResearchMemory() {
+  return useSWR<ResearchMemoryStats>("/api/research-memory", fetcher, {
     ...defaults,
     refreshInterval: 60_000,
   });

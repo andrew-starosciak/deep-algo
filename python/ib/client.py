@@ -432,7 +432,7 @@ class IBClient:
                 has_tif_warning = any(
                     e.errorCode == 10349 for e in trade.log
                 )
-                if has_tif_warning and elapsed < 10:
+                if has_tif_warning and elapsed < 20:
                     logger.info(
                         "Order %d Cancelled with TIF preset warning (10349) — "
                         "waiting for real status", trade.order.orderId,

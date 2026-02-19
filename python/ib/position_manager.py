@@ -196,7 +196,9 @@ class PositionManager:
 
             # Get quote and calculate quantity
             quote = await self.ib.get_option_quote(contract)
-            limit_price = quote.mid
+            # Use ask for BUY orders — mid sits between bid/ask and won't
+            # fill on IB paper (simulator waits for last trade to cross limit).
+            limit_price = quote.ask if quote.ask > 0 else quote.mid
             if limit_price <= 0:
                 # Fallback: use thesis entry price for limit order
                 entry_mid = (contract.entry_price_low + contract.entry_price_high) / 2

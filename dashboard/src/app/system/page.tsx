@@ -1,15 +1,17 @@
 "use client";
 
-import { useWorkflows, useSystemStatus } from "@/lib/hooks";
+import { useWorkflows, useSystemStatus, useResearchMemory } from "@/lib/hooks";
 import WorkflowPipeline from "@/components/system/WorkflowPipeline";
 import ScheduleTimeline from "@/components/system/ScheduleTimeline";
 import WorkflowRuns from "@/components/system/WorkflowRuns";
 import RulesCards from "@/components/system/RulesCards";
 import ServiceStatus from "@/components/system/ServiceStatus";
+import ResearchMemory from "@/components/system/ResearchMemory";
 
 export default function SystemPage() {
   const { data: workflows, isLoading, error } = useWorkflows();
   const { data: status } = useSystemStatus();
+  const { data: memory } = useResearchMemory();
 
   if (error) {
     return (
@@ -31,6 +33,7 @@ export default function SystemPage() {
   return (
     <div className="flex flex-col gap-4">
       <WorkflowPipeline />
+      {memory && <ResearchMemory stats={memory} />}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
         <div className="lg:col-span-2">
           <WorkflowRuns runs={workflows.runs} stats={workflows.stats} />

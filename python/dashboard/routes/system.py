@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 from fastapi import APIRouter, Depends, Request
 
 from dashboard.auth import verify_token
@@ -31,6 +33,21 @@ async def watchlist(request: Request):
     db = request.app.state.db
     rows = await db.get_watchlist()
     return {"count": len(rows), "watchlist": [serialize_row(r) for r in rows]}
+
+
+@router.get("/research-memory")
+async def research_memory(request: Request):
+    db = request.app.state.db
+    try:
+        stats = await db.get_research_memory_stats()
+        return {k: str(v) if isinstance(v, Decimal) else v for k, v in stats.items()}
+    except Exception:
+        return {
+            "total_research": 0, "total_theses": 0, "theses_with_outcome": 0,
+            "winning_theses": 0, "losing_theses": 0, "total_outcome_pnl": "0",
+            "tickers_analyzed": 0, "total_recommendations": 0,
+            "approved_recommendations": 0, "filled_recommendations": 0,
+        }
 
 
 @router.get("/workflows")

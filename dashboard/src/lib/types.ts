@@ -125,3 +125,16 @@ export interface WorkflowsResponse {
   stats: WorkflowStats;
   last_equity_tick: string | null;
 }
+
+export interface ResearchMemoryStats {
+  total_research: number;
+  total_theses: number;
+  theses_with_outcome: number;
+  winning_theses: number;
+  losing_theses: number;
+  total_outcome_pnl: string;
+  tickers_analyzed: number;
+  total_recommendations: number;
+  approved_recommendations: number;
+  filled_recommendations: number;
+}

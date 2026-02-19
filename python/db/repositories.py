@@ -596,3 +596,22 @@ class Database:
             close_reason,
             position_id,
         )
+
+    async def get_research_memory_stats(self) -> dict:
+        """Get aggregate stats about the research memory / feedback loop."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM research_summaries) AS total_research,
+                (SELECT COUNT(*) FROM theses) AS total_theses,
+                (SELECT COUNT(*) FROM theses WHERE outcome_realized_pnl IS NOT NULL) AS theses_with_outcome,
+                (SELECT COUNT(*) FROM theses WHERE outcome_realized_pnl > 0) AS winning_theses,
+                (SELECT COUNT(*) FROM theses WHERE outcome_realized_pnl <= 0) AS losing_theses,
+                (SELECT COALESCE(SUM(outcome_realized_pnl), 0) FROM theses WHERE outcome_realized_pnl IS NOT NULL) AS total_outcome_pnl,
+                (SELECT COUNT(DISTINCT ticker) FROM theses) AS tickers_analyzed,
+                (SELECT COUNT(*) FROM trade_recommendations) AS total_recommendations,
+                (SELECT COUNT(*) FROM trade_recommendations WHERE status = 'approved') AS approved_recommendations,
+                (SELECT COUNT(*) FROM trade_recommendations WHERE status = 'filled') AS filled_recommendations
+            """
+        )
+        return dict(row) if row else {}
