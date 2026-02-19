@@ -20,9 +20,15 @@ secrets/
 # Docker volumes (if using bind mounts)
 docker-data/
 
-# AWS latency test state
+# Runtime state
+logs/
+.pids/
+
+# AWS/EC2 deploy state
 scripts/.aws-latency-test.state
 scripts/.aws-latency-key.pem
+scripts/.ib-options-deploy.state
+scripts/.ib-options-deploy-key.pem
 
 # Claude Code settings (contains API key)
 .claude/settings.json
