@@ -45,3 +45,8 @@ Based on your critique, output the **complete Thesis** with adjusted scores:
 
 Return the complete Thesis object with your adjustments. Same schema, adjusted values.
 Set `recommended_contract` to null (unchanged from input).
+
+**IMPORTANT**: Fill in `critic_reasoning` with your counter-case and why you adjusted
+(or didn't adjust) each score. This reasoning is saved for post-trade review.
+Write 3-5 sentences covering the strongest argument against, key blind spots identified,
+and your overall verdict on the thesis quality. Preserve the original `analyst_reasoning` as-is.

@@ -73,4 +73,12 @@ class Thesis(BaseModel):
         default=30,
         description="Days until catalyst fires",
     )
+    analyst_reasoning: Optional[str] = Field(
+        default=None,
+        description="Analyst's bull/bear debate and scoring rationale",
+    )
+    critic_reasoning: Optional[str] = Field(
+        default=None,
+        description="Critic's counter-case and score adjustment rationale",
+    )
     recommended_contract: Optional[ContractSpec] = None

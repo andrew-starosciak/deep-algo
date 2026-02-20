@@ -125,8 +125,9 @@ class Database:
             """
             INSERT INTO theses
                 (run_id, ticker, direction, thesis_text, catalyst, scores,
-                 supporting_evidence, risks, overall_score)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 supporting_evidence, risks, overall_score,
+                 analyst_reasoning, critic_reasoning)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             RETURNING id
             """,
             run_id,
@@ -138,6 +139,8 @@ class Database:
             json.dumps(thesis.get("supporting_evidence", []), default=str),
             json.dumps(thesis.get("risks", []), default=str),
             thesis["scores"]["overall"],
+            thesis.get("analyst_reasoning"),
+            thesis.get("critic_reasoning"),
         )
 
     # --- Recommendations ---

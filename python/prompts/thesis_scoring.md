@@ -74,3 +74,7 @@ The system selects contracts automatically using real IB market data (strikes, e
 Produce a complete Thesis with scores, evidence, risks, expected_move_pct, and catalyst_timeline_days.
 Set recommended_contract to null — the system handles contract selection.
 Be decisive — don't give every dimension a 5. Take a stance.
+
+**IMPORTANT**: Fill in `analyst_reasoning` with your bull/bear debate and why you scored each
+dimension the way you did. This reasoning is saved and used for post-trade review.
+Write 3-5 sentences covering the key bull case, key bear case, and what tipped your decision.

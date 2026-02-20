@@ -55,6 +55,8 @@ export interface Thesis {
   supporting_evidence: unknown;
   risks: unknown;
   overall_score: number;
+  analyst_reasoning: string | null;
+  critic_reasoning: string | null;
   created_at: string;
 }
 

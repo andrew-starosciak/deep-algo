@@ -137,6 +137,32 @@ export default function ThesisCard({ thesis, expanded = false }: Props) {
           )}
         </div>
       )}
+
+      {/* Analyst & Critic Reasoning */}
+      {expanded && (thesis.analyst_reasoning || thesis.critic_reasoning) && (
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3 pt-3 border-t border-border/50">
+          {thesis.analyst_reasoning && (
+            <div>
+              <div className="text-xs font-medium text-accent mb-1">
+                Analyst Reasoning
+              </div>
+              <p className="text-xs text-text-secondary">
+                {thesis.analyst_reasoning}
+              </p>
+            </div>
+          )}
+          {thesis.critic_reasoning && (
+            <div>
+              <div className="text-xs font-medium text-yellow-500 mb-1">
+                Critic Counter-Case
+              </div>
+              <p className="text-xs text-text-secondary">
+                {thesis.critic_reasoning}
+              </p>
+            </div>
+          )}
+        </div>
+      )}
     </Card>
   );
 }
