@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from openclaw.engine import OnFail, StepDef, WorkflowDef
 from schemas.research import ResearchRequest, ResearchSummary
+from schemas.review import PositionReview
 from schemas.risk import RiskVerification
 from schemas.thesis import Thesis
 
@@ -45,8 +46,37 @@ def trade_thesis_workflow() -> WorkflowDef:
     )
 
 
+def position_review_workflow() -> WorkflowDef:
+    """Research fresh data → Review position against thesis."""
+    return WorkflowDef(
+        id="position-review",
+        name="Position Review",
+        steps=[
+            StepDef(
+                id="research",
+                agent="researcher",
+                input_schema=ResearchRequest,
+                output_schema=ResearchSummary,
+                validate=lambda r: True,  # Always pass — we want fresh data regardless
+                max_retries=1,
+                on_fail=OnFail.ABORT,
+            ),
+            StepDef(
+                id="review",
+                agent="reviewer",
+                input_schema=ResearchSummary,
+                output_schema=PositionReview,
+                validate=lambda r: True,  # Always record the review
+                max_retries=1,
+                on_fail=OnFail.ESCALATE,
+            ),
+        ],
+    )
+
+
 WORKFLOWS: dict[str, WorkflowDef] = {
     "trade-thesis": trade_thesis_workflow(),
+    "position-review": position_review_workflow(),
 }
 
 

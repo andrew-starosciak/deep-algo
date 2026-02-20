@@ -183,7 +183,22 @@ class WorkflowScheduler:
             await self._run_thesis_for_ticker(ticker)
 
     async def _run_thesis_for_ticker(self, ticker: str) -> None:
-        """Run the trade-thesis workflow for a single ticker and save recommendation."""
+        """Run trade-thesis or position-review depending on open positions."""
+        # Check for open positions — route to position-review if found
+        try:
+            open_positions = await self.db.get_open_positions_for_ticker(ticker)
+        except Exception:
+            logger.warning("Failed to check positions for %s, falling back to trade-thesis", ticker)
+            open_positions = []
+
+        if open_positions:
+            logger.info(
+                "Found %d open position(s) for %s — running position-review",
+                len(open_positions), ticker,
+            )
+            await self._run_position_review(ticker, open_positions)
+            return
+
         from openclaw.workflows import get_workflow
         from schemas.research import ResearchRequest
         from schemas.risk import RiskVerification
@@ -302,6 +317,91 @@ class WorkflowScheduler:
 
         except Exception:
             logger.exception("Failed to auto-approve recommendation #%d", rec_id)
+
+    async def _run_position_review(self, ticker: str, positions: list[dict]) -> None:
+        """Run position-review workflow for each open position on this ticker."""
+        from agents.reviewer import ReviewerAgent
+        from openclaw.workflows import get_workflow
+        from schemas.research import ResearchRequest
+        from schemas.review import PositionReview
+
+        workflow = get_workflow("position-review")
+
+        for pos in positions:
+            position_id = pos.get("id")
+            logger.info("Running position-review for %s (position #%s)", ticker, position_id)
+
+            # Create a fresh reviewer per position to avoid shared mutable state
+            reviewer = ReviewerAgent(llm=self.engine.llm, db=self.db)
+            reviewer.set_review_context(pos)
+            original_reviewer = self.engine.agents.get("reviewer")
+            self.engine.agents["reviewer"] = reviewer
+
+            initial_input = ResearchRequest(ticker=ticker, mode="premarket")
+
+            try:
+                result = await self.engine.run(workflow, initial_input)
+            except Exception:
+                logger.exception("Position-review workflow failed for %s #%s", ticker, position_id)
+                continue
+            finally:
+                # Restore the original reviewer agent
+                if original_reviewer is not None:
+                    self.engine.agents["reviewer"] = original_reviewer
+
+            if result is None:
+                logger.info("Position-review aborted for %s #%s", ticker, position_id)
+                continue
+
+            # Save research summary (valuable even if review step fails)
+            try:
+                research_output = result.step_outputs.get("research")
+                if research_output is not None:
+                    await self.db.save_research_summary(
+                        run_id=result.run_id, ticker=ticker, mode="position_review",
+                        summary=research_output.model_dump(),
+                        opportunity_score=research_output.opportunity_score,
+                    )
+            except Exception:
+                logger.warning("Failed to save research summary for %s review", ticker, exc_info=True)
+
+            # Save review to position_reviews table
+            review_output = result.step_outputs.get("review")
+            if not isinstance(review_output, PositionReview):
+                logger.info("No review output for %s #%s", ticker, position_id)
+                continue
+
+            try:
+                review_id = await self.db.save_position_review(
+                    run_id=result.run_id,
+                    position_id=position_id,
+                    review_type="premarket",
+                    review_data=review_output.model_dump(),
+                )
+                logger.info(
+                    "Position review #%d saved for %s #%s: %s",
+                    review_id, ticker, position_id, review_output.recommended_action,
+                )
+            except Exception:
+                logger.exception("Failed to save position review for %s #%s", ticker, position_id)
+                continue
+
+            # Notify Discord
+            if self.notifier:
+                action = review_output.recommended_action
+                urgent = action in ("close", "reduce")
+                prefix = "URGENT " if urgent else ""
+                msg = (
+                    f"{prefix}**Position Review: {ticker}** (#{position_id})\n"
+                    f"Action: **{action}**\n"
+                    f"Thesis valid: {review_output.thesis_still_valid}\n"
+                    f"P&L: {review_output.pnl_pct:+.1f}%\n"
+                    f"Reasoning: {review_output.reasoning[:300]}"
+                )
+                try:
+                    await self.notifier.send(msg)
+                except Exception:
+                    logger.warning("Failed to send review notification", exc_info=True)
 
     async def _position_tick(self) -> None:
         """Run one position manager tick: update prices, check rules."""

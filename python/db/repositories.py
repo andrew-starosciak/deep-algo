@@ -597,6 +597,70 @@ class Database:
             position_id,
         )
 
+    async def get_open_positions_for_ticker(self, ticker: str) -> list[dict]:
+        """Get all open positions for a specific ticker."""
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM options_positions
+            WHERE ticker = $1 AND status = 'open'
+            ORDER BY opened_at ASC
+            """,
+            ticker.upper(),
+        )
+        return [dict(r) for r in rows]
+
+    async def save_position_review(
+        self,
+        run_id: int,
+        position_id: int,
+        review_type: str,
+        review_data: dict,
+    ) -> int:
+        """Persist a position review to the position_reviews table."""
+        return await self.pool.fetchval(
+            """
+            INSERT INTO position_reviews
+                (run_id, position_id, review_type, thesis_still_valid,
+                 recommended_action, reasoning)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+            """,
+            run_id,
+            position_id,
+            review_type,
+            review_data.get("thesis_still_valid"),
+            review_data.get("recommended_action"),
+            review_data.get("reasoning"),
+        )
+
+    async def get_thesis_for_position(self, position_id: int) -> dict | None:
+        """Walk FK chain: positions → recommendations → theses. Returns full thesis row."""
+        row = await self.pool.fetchrow(
+            """
+            SELECT t.*
+            FROM options_positions p
+            JOIN trade_recommendations r ON r.id = p.recommendation_id
+            JOIN theses t ON t.id = r.thesis_id
+            WHERE p.id = $1
+            """,
+            position_id,
+        )
+        return dict(row) if row else None
+
+    async def get_recent_reviews(self, position_id: int, limit: int = 5) -> list[dict]:
+        """Get recent position reviews for trend tracking."""
+        rows = await self.pool.fetch(
+            """
+            SELECT * FROM position_reviews
+            WHERE position_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            position_id,
+            limit,
+        )
+        return [dict(r) for r in rows]
+
     async def get_research_memory_stats(self) -> dict:
         """Get aggregate stats about the research memory / feedback loop."""
         row = await self.pool.fetchrow(

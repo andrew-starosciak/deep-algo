@@ -1,10 +1,18 @@
 # Position Review Prompt
 
-You are reviewing open options positions in a midday/post-market check.
+You are reviewing an open options position as part of pre-market research.
 
-## Current Positions
+## Current Position
 
 {positions}
+
+## Original Thesis
+
+{original_thesis}
+
+## Previous Reviews
+
+{previous_reviews}
 
 ## Recent News & Price Action
 
@@ -12,7 +20,7 @@ You are reviewing open options positions in a midday/post-market check.
 
 ## Review Framework
 
-For each open position, evaluate:
+Evaluate this position against the fresh research data above:
 
 1. **Thesis Status**: Is the original thesis still intact? Has any new information changed it?
    - New positive information → thesis strengthened
@@ -32,7 +40,8 @@ For each open position, evaluate:
 
 ## Summary
 
-After reviewing all positions, provide:
-- Overall portfolio assessment
-- Any urgent actions needed
-- Any emerging cross-position themes or concerns
+Provide:
+- Whether the thesis is still valid (true/false)
+- Your recommended action (hold/add/reduce/close/roll)
+- Clear reasoning for your recommendation
+- Any urgent concerns
