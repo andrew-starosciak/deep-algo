@@ -33,18 +33,28 @@ class AnalystAgent(BaseAgent):
         """Fetch previous thesis history with outcomes for this ticker."""
         ticker = getattr(input_data, "ticker", None)
         if not ticker or not self.db:
-            return {"historical_context": ""}
+            return {"historical_context": "", "system_feedback": ""}
+
+        ctx: dict[str, str] = {"historical_context": "", "system_feedback": ""}
 
         try:
             history = await self.db.get_thesis_history_with_outcomes(ticker, limit=5)
+            if history:
+                ctx["historical_context"] = self._format_history(history)
         except Exception:
             logger.debug("Could not fetch thesis history for %s (V016 may not be applied)", ticker)
-            return {"historical_context": ""}
 
-        if not history:
-            return {"historical_context": ""}
+        # Cross-ticker feedback
+        if hasattr(self.db, "pool"):
+            try:
+                from db.feedback import FeedbackAggregator
 
-        return {"historical_context": self._format_history(history)}
+                aggregator = FeedbackAggregator(self.db.pool)
+                ctx["system_feedback"] = await aggregator.build_analyst_feedback()
+            except Exception:
+                logger.debug("Could not fetch system feedback", exc_info=True)
+
+        return ctx
 
     @staticmethod
     def _format_history(history: list[dict]) -> str:

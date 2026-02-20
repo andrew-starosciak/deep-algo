@@ -145,6 +145,7 @@ def main():
 async def _init_engine(args, ib_client=None):
     """Initialize the workflow engine with agents and DB."""
     from agents.analyst import AnalystAgent
+    from agents.critic import CriticAgent
     from agents.researcher import ResearcherAgent
     from agents.reviewer import ReviewerAgent
     from agents.risk_checker import RiskCheckerAgent
@@ -171,6 +172,7 @@ async def _init_engine(args, ib_client=None):
     # Register all agents
     engine.register_agent("researcher", ResearcherAgent(llm=llm, db=db))
     engine.register_agent("analyst", AnalystAgent(llm=llm, db=db))
+    engine.register_agent("critic", CriticAgent(llm=llm, db=db))
     engine.register_agent("risk_checker", RiskCheckerAgent(llm=llm, db=db, ib_client=ib_client))
     engine.register_agent("reviewer", ReviewerAgent(llm=llm, db=db))
 
@@ -280,7 +282,8 @@ async def _maybe_save_recommendation(engine, result, args):
     from schemas.thesis import Thesis
 
     # Need both the thesis (with contract) and the risk verification (approved)
-    thesis = result.step_outputs.get("evaluate")
+    # Prefer critic-adjusted thesis over raw analyst thesis
+    thesis = result.step_outputs.get("critique") or result.step_outputs.get("evaluate")
     verification = result.step_outputs.get("verify")
 
     if not isinstance(thesis, Thesis) or not isinstance(verification, RiskVerification):
@@ -503,7 +506,8 @@ async def _cmd_run_all(args):
             results["aborted"].append(ticker)
             continue
 
-        thesis = result.step_outputs.get("evaluate")
+        # Prefer critic-adjusted thesis over raw analyst thesis
+        thesis = result.step_outputs.get("critique") or result.step_outputs.get("evaluate")
         verification = result.step_outputs.get("verify")
 
         if (

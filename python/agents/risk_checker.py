@@ -97,4 +97,16 @@ class RiskCheckerAgent(BaseAgent):
         else:
             lines.append("\nNo open positions.")
 
-        return {"portfolio_state": "\n".join(lines)}
+        ctx = {"portfolio_state": "\n".join(lines), "risk_feedback": ""}
+
+        # Cross-ticker risk feedback
+        if hasattr(self.db, "pool"):
+            try:
+                from db.feedback import FeedbackAggregator
+
+                aggregator = FeedbackAggregator(self.db.pool)
+                ctx["risk_feedback"] = await aggregator.build_risk_feedback()
+            except Exception:
+                logger.debug("Could not fetch risk feedback", exc_info=True)
+
+        return ctx

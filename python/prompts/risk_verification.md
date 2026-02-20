@@ -25,6 +25,8 @@ Your job is to evaluate the thesis quality, direction, and position sizing — n
 3. **Max 3 correlated positions.** No more than 3 positions in the same sector/theme.
 4. **Cross-platform check**: If we're long BTC on HyperLiquid and this is a crypto-correlated equity (MSTR, COIN, etc.), flag the correlation. If we have Fed-related Polymarket positions and this is rate-sensitive, flag it.
 
+{risk_feedback}
+
 ## Your Job
 
 1. Verify position sizing is within limits

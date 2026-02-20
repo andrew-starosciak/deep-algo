@@ -34,6 +34,15 @@ def trade_thesis_workflow() -> WorkflowDef:
                 on_fail=OnFail.ABORT,  # Doesn't meet threshold
             ),
             StepDef(
+                id="critique",
+                agent="critic",
+                input_schema=Thesis,
+                output_schema=Thesis,
+                validate=lambda t: t.scores.overall >= 6.0,
+                max_retries=0,
+                on_fail=OnFail.ABORT,  # Critic killed the thesis
+            ),
+            StepDef(
                 id="verify",
                 agent="risk_checker",
                 input_schema=Thesis,

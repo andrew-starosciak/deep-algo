@@ -231,7 +231,8 @@ class WorkflowScheduler:
             return
 
         # Save recommendation if thesis passed risk verification
-        thesis = result.step_outputs.get("evaluate")
+        # Prefer critic-adjusted thesis over raw analyst thesis
+        thesis = result.step_outputs.get("critique") or result.step_outputs.get("evaluate")
         verification = result.step_outputs.get("verify")
 
         if (

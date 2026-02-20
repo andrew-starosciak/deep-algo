@@ -8,7 +8,21 @@ You are evaluating a trade thesis for options trading. Score it rigorously.
 
 {historical_context}
 
+{system_feedback}
+
 ## Scoring Framework
+
+### Pre-Scoring: Structured Debate
+
+Before scoring, explicitly consider both sides:
+
+**Bull Case**: What is the strongest argument FOR this trade? What information
+advantage exists? What catalyst could drive outsized returns?
+
+**Bear Case**: What is the strongest argument AGAINST? What could go wrong?
+What is the market already pricing in? What risks are being underweighted?
+
+Only after considering both sides should you score each dimension.
 
 Score each dimension 1-10:
 

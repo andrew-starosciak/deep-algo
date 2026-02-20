@@ -107,8 +107,21 @@ class ReviewerAgent(BaseAgent):
                     )
                 previous_reviews = "\n".join(lines)
 
-        return {
+        ctx = {
             "positions": position_text,
             "original_thesis": original_thesis,
             "previous_reviews": previous_reviews,
+            "review_patterns": "",
         }
+
+        # Cross-ticker review feedback
+        if hasattr(self.db, "pool"):
+            try:
+                from db.feedback import FeedbackAggregator
+
+                aggregator = FeedbackAggregator(self.db.pool)
+                ctx["review_patterns"] = await aggregator.build_reviewer_feedback()
+            except Exception:
+                pass
+
+        return ctx

@@ -5,3 +5,4 @@ from agents.researcher import ResearcherAgent
 from agents.analyst import AnalystAgent
 from agents.risk_checker import RiskCheckerAgent
 from agents.reviewer import ReviewerAgent
+from agents.critic import CriticAgent

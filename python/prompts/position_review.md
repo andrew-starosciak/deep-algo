@@ -18,6 +18,8 @@ You are reviewing an open options position as part of pre-market research.
 
 {input}
 
+{review_patterns}
+
 ## Review Framework
 
 Evaluate this position against the fresh research data above:

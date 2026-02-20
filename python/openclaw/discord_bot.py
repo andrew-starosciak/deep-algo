@@ -665,7 +665,8 @@ class DiscordBot:
                 await channel.send(f"Analysis for **{ticker}** — no actionable opportunity found.")
                 return
 
-            thesis = result.step_outputs.get("evaluate")
+            # Prefer critic-adjusted thesis over raw analyst thesis
+            thesis = result.step_outputs.get("critique") or result.step_outputs.get("evaluate")
             if not isinstance(thesis, Thesis):
                 await channel.send(f"Analysis for **{ticker}** — did not pass evaluation gate.")
                 return
