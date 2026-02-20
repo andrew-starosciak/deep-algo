@@ -57,7 +57,9 @@ async def workflows(request: Request):
 
     total = len(runs)
     completed = sum(1 for r in runs if r["status"] == "completed")
-    failed = sum(1 for r in runs if r["status"] == "failed")
+    rejected = sum(1 for r in runs if r.get("fail_category") == "rejected")
+    filtered = sum(1 for r in runs if r.get("fail_category") == "filtered")
+    errors = sum(1 for r in runs if r.get("fail_category") == "error")
     durations = [r["duration_ms"] for r in runs if r["duration_ms"] is not None]
     avg_duration = int(sum(durations) / len(durations)) if durations else 0
 
@@ -92,7 +94,10 @@ async def workflows(request: Request):
         "stats": {
             "total_runs": total,
             "completed": completed,
-            "failed": failed,
+            "failed": rejected + filtered + errors,
+            "rejected": rejected,
+            "filtered": filtered,
+            "errors": errors,
             "avg_duration_ms": avg_duration,
             "runs_today": runs_today,
         },

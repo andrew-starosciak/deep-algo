@@ -6,6 +6,7 @@ const steps = [
   { label: "Watchlist", agent: null, gate: "tickers" },
   { label: "Research Agent", agent: "researcher", gate: "score \u2265 3" },
   { label: "Analyst Agent", agent: "analyst", gate: "score \u2265 6.0", feedback: true },
+  { label: "Critic Agent", agent: "critic", gate: "score \u2265 6.0", feedback: true },
   { label: "Risk Checker", agent: "risk_checker", gate: "size \u2264 2%" },
   { label: "Contract Select", agent: null, gate: "IB live data" },
   { label: "Recommendation", agent: null, gate: "pending" },

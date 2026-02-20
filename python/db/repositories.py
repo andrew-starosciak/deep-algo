@@ -409,7 +409,11 @@ class Database:
                 r.id, r.workflow_id, r.trigger, r.status,
                 r.started_at, r.completed_at,
                 s.step_id, s.agent, s.passed_gate, s.duration_ms AS step_duration_ms,
-                s.attempt
+                s.attempt,
+                CASE
+                    WHEN s.passed_gate = FALSE AND s.agent = 'risk_checker'
+                    THEN s.output->>'rejection_reason'
+                END AS failure_reason
             FROM workflow_runs r
             LEFT JOIN workflow_step_logs s ON s.run_id = r.id
             ORDER BY r.started_at DESC, s.id ASC
@@ -442,7 +446,21 @@ class Database:
                     "passed_gate": row["passed_gate"],
                     "duration_ms": int(row["step_duration_ms"]) if row["step_duration_ms"] is not None else None,
                     "attempt": row["attempt"],
+                    "failure_reason": row["failure_reason"],
                 })
+
+        # Classify failed runs: "filtered" (low score) vs "rejected" (risk block)
+        for run in runs_map.values():
+            if run["status"] != "failed":
+                run["fail_category"] = None
+                continue
+            failed_steps = [s for s in run["steps"] if not s["passed_gate"]]
+            if any(s["agent"] == "risk_checker" for s in failed_steps):
+                run["fail_category"] = "rejected"
+            elif any(s["step_id"] in ("evaluate", "critique") for s in failed_steps):
+                run["fail_category"] = "filtered"
+            else:
+                run["fail_category"] = "error"
 
         result = list(runs_map.values())
         if len(result) > limit:

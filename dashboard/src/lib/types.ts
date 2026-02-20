@@ -107,11 +107,13 @@ export interface WorkflowStep {
   passed_gate: boolean;
   duration_ms: number;
   attempt: number;
+  failure_reason: string | null;
 }
 
 export interface WorkflowRunWithSteps extends WorkflowRun {
   duration_ms: number | null;
   steps: WorkflowStep[];
+  fail_category: "filtered" | "rejected" | "error" | null;
 }
 
 export interface WorkflowStats {

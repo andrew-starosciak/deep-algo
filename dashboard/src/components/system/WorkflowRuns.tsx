@@ -5,7 +5,21 @@ import Card from "@/components/ui/Card";
 import { formatDateTime } from "@/lib/utils";
 import type { WorkflowRunWithSteps, WorkflowStats } from "@/lib/types";
 
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({ status, failCategory }: { status: string; failCategory?: string | null }) {
+  if (status === "failed" && failCategory === "filtered") {
+    return (
+      <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-bg-hover text-text-secondary">
+        filtered
+      </span>
+    );
+  }
+  if (status === "failed" && failCategory === "rejected") {
+    return (
+      <span className="text-[10px] px-1.5 py-0.5 rounded font-medium bg-yellow-500/20 text-yellow-500">
+        rejected
+      </span>
+    );
+  }
   const colors: Record<string, string> = {
     completed: "bg-profit/20 text-profit",
     running: "bg-accent/20 text-accent",
@@ -28,23 +42,30 @@ function formatDuration(ms: number | null): string {
   return `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
-function StepBar({ step }: { step: { step_id: string; agent: string; passed_gate: boolean; duration_ms: number; attempt: number } }) {
+function StepBar({ step }: { step: { step_id: string; agent: string; passed_gate: boolean; duration_ms: number; attempt: number; failure_reason: string | null } }) {
   return (
-    <div className="flex items-center gap-2 text-xs py-1">
-      <span className={`w-3 h-3 rounded-full shrink-0 ${step.passed_gate ? "bg-profit" : "bg-loss"}`} />
-      <span className="text-text-primary font-medium w-24 shrink-0">{step.step_id}</span>
-      <span className="text-text-secondary w-24 shrink-0">{step.agent}</span>
-      <div className="flex-1 h-1.5 bg-bg-hover rounded-full overflow-hidden">
-        <div
-          className={`h-full rounded-full ${step.passed_gate ? "bg-profit/60" : "bg-loss/60"}`}
-          style={{ width: `${Math.min((step.duration_ms / 30000) * 100, 100)}%` }}
-        />
+    <div>
+      <div className="flex items-center gap-2 text-xs py-1">
+        <span className={`w-3 h-3 rounded-full shrink-0 ${step.passed_gate ? "bg-profit" : "bg-loss"}`} />
+        <span className="text-text-primary font-medium w-24 shrink-0">{step.step_id}</span>
+        <span className="text-text-secondary w-24 shrink-0">{step.agent}</span>
+        <div className="flex-1 h-1.5 bg-bg-hover rounded-full overflow-hidden">
+          <div
+            className={`h-full rounded-full ${step.passed_gate ? "bg-profit/60" : "bg-loss/60"}`}
+            style={{ width: `${Math.min((step.duration_ms / 30000) * 100, 100)}%` }}
+          />
+        </div>
+        <span className="text-text-secondary w-12 text-right shrink-0">
+          {formatDuration(step.duration_ms)}
+        </span>
+        {step.attempt > 0 && (
+          <span className="text-[10px] text-loss">retry {step.attempt}</span>
+        )}
       </div>
-      <span className="text-text-secondary w-12 text-right shrink-0">
-        {formatDuration(step.duration_ms)}
-      </span>
-      {step.attempt > 0 && (
-        <span className="text-[10px] text-loss">retry {step.attempt}</span>
+      {step.failure_reason && (
+        <div className="ml-5 pl-4 pb-1 text-[11px] text-yellow-500 border-l-2 border-yellow-500/30">
+          {step.failure_reason}
+        </div>
       )}
     </div>
   );
@@ -57,6 +78,14 @@ interface Props {
 
 export default function WorkflowRuns({ runs, stats }: Props) {
   const [expanded, setExpanded] = useState<number | null>(null);
+  const [hideFiltered, setHideFiltered] = useState(true);
+
+  const visibleRuns = hideFiltered
+    ? runs.filter((r) => r.fail_category !== "filtered")
+    : runs;
+
+  const filteredCount = runs.filter((r) => r.fail_category === "filtered").length;
+  const rejectedCount = runs.filter((r) => r.fail_category === "rejected").length;
 
   return (
     <Card>
@@ -67,19 +96,29 @@ export default function WorkflowRuns({ runs, stats }: Props) {
         <div className="flex gap-3 text-xs text-text-secondary">
           <span>{stats.total_runs} total</span>
           <span className="text-profit">{stats.completed} ok</span>
-          <span className="text-loss">{stats.failed} failed</span>
+          {rejectedCount > 0 && (
+            <span className="text-yellow-500">{rejectedCount} rejected</span>
+          )}
+          {filteredCount > 0 && (
+            <button
+              onClick={() => setHideFiltered(!hideFiltered)}
+              className="text-text-secondary hover:text-text-primary transition-colors"
+            >
+              {filteredCount} filtered {hideFiltered ? "(show)" : "(hide)"}
+            </button>
+          )}
           <span>avg {formatDuration(stats.avg_duration_ms)}</span>
           <span>{stats.runs_today} today</span>
         </div>
       </div>
       <div className="space-y-1">
-        {runs.length === 0 && (
+        {visibleRuns.length === 0 && (
           <div className="text-text-secondary text-sm text-center py-4">
             No workflow runs yet
           </div>
         )}
-        {runs.map((run) => (
-          <div key={run.id}>
+        {visibleRuns.map((run) => (
+          <div key={run.id} className={run.fail_category === "filtered" ? "opacity-50" : ""}>
             <button
               onClick={() => setExpanded(expanded === run.id ? null : run.id)}
               className="w-full flex items-center gap-3 px-3 py-2 rounded hover:bg-bg-hover text-sm text-left"
@@ -90,7 +129,7 @@ export default function WorkflowRuns({ runs, stats }: Props) {
               <span className="text-text-secondary text-xs w-16 shrink-0">
                 {run.trigger}
               </span>
-              <StatusBadge status={run.status} />
+              <StatusBadge status={run.status} failCategory={run.fail_category} />
               <span className="text-text-secondary text-xs flex-1 text-right">
                 {formatDuration(run.duration_ms)}
               </span>
